@@ -18,15 +18,14 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getLlmModel, llmClient } from '@/lib/llm';
-import { fetchFileContents, formatTreeForPrompt, getFileTree } from '@/lib/github';
+import { fetchFileContents, formatTreeForPrompt, getBranchHead, getFileTree } from '@/lib/github';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
 
 const REPO_OWNER = 'SonicDMG';
 const REPO_NAME = 'walfly';
-const REPO_BRANCH = 'main';
-const GITHUB_BASE = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${REPO_BRANCH}`;
+const DEFAULT_BRANCH = 'main';
 
 const MAX_FILES_TO_FETCH = 15;
 const MAX_FILE_CHARS = 8_000; // per-file content cap to stay within context budget
@@ -38,6 +37,7 @@ interface ChatMessage {
 }
 
 interface WikiChatRequest {
+  branch?: string;
   messages: ChatMessage[];
 }
 
@@ -82,10 +82,30 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // ── Resolve the branch head commit ONCE; the whole request stays anchored to it ──
+  const branch = typeof body.branch === 'string' && body.branch.trim() ? body.branch.trim() : DEFAULT_BRANCH;
+  let commitSha: string;
+  try {
+    const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch);
+    if (head.status === 'rate-limited') {
+      return NextResponse.json({ error: 'GitHub rate limit reached — try again shortly' }, { status: 503 });
+    }
+    if (head.status !== 'ok') {
+      return NextResponse.json({ error: `Could not resolve branch "${branch}"` }, { status: 502 });
+    }
+    commitSha = head.sha;
+  } catch (err) {
+    console.error('[wiki/chat] branch head resolution failed:', err instanceof Error ? err.message : err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Failed to resolve branch head' },
+      { status: 502 },
+    );
+  }
+
   // ── Stage 1: fetch file tree + select relevant files ──────────────────────
   let systemPrompt: string;
   try {
-    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model);
+    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model, commitSha);
   } catch (err) {
     console.error('[wiki/chat] context build failed:', err instanceof Error ? err.message : err);
     return NextResponse.json(
@@ -144,9 +164,12 @@ async function buildSystemPrompt(
   question: string,
   client: ReturnType<typeof llmClient>,
   model: string,
+  commitSha: string,
 ): Promise<string> {
+  const githubBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${commitSha}`;
+
   // 1. File tree
-  const entries = await getFileTree(REPO_OWNER, REPO_NAME);
+  const entries = await getFileTree(REPO_OWNER, REPO_NAME, commitSha);
   const treeText = formatTreeForPrompt(entries);
   console.log(`[wiki/chat] tree has ${entries.length} files after filtering`);
 
@@ -188,7 +211,7 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
   }
 
   // 3. Fetch file contents live from GitHub
-  const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, selectedPaths, REPO_BRANCH);
+  const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, selectedPaths, commitSha);
   const fetchedPaths = Object.keys(contents);
   console.log(`[wiki/chat] fetched ${fetchedPaths.length}/${selectedPaths.length} files`);
 
@@ -205,15 +228,15 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
     })
     .join('\n\n');
 
-  return `You are a live documentation assistant for the Walfly codebase (${REPO_OWNER}/${REPO_NAME}).
+  return `You are a live documentation assistant for the Walfly codebase (${REPO_OWNER}/${REPO_NAME}) at commit ${commitSha}.
 Answer developer questions using ONLY the file contents below.
 If the answer is not in the provided files, say so and suggest which part of the codebase might have the answer.
 
 CITATION RULES — follow these exactly, they drive the UI:
 1. Every time you mention a specific function, type, constant, or block of code, you MUST cite it.
-   Citation format: [filename:LINE](FULL_GITHUB_URL_WITH_LINE_ANCHOR)
-   The URL MUST include the file path and #LLINE anchor so it links to the exact line.
-   Example: [llm.ts:24](${GITHUB_BASE}/packages/api/lib/llm.ts#L24)
+   Citation format: [filename:LINE](COMMIT_PERMALINK_WITH_LINE_ANCHOR)
+   The URL MUST be a commit permalink of the form ${githubBase}/<path>#L<line> — use exactly this commit SHA (${commitSha}), never a branch name.
+   Example: [llm.ts:24](${githubBase}/packages/api/lib/llm.ts#L24)
 
 2. The citation MUST come BEFORE the code block — always in this exact order:
    prose text mentioning the function → [filename:LINE](url) → \`\`\`lang\\ncode\\n\`\`\`

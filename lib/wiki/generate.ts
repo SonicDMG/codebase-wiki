@@ -6,7 +6,7 @@
  */
 
 import { getLlmModel, llmClient } from '@/lib/llm';
-import { formatTreeForPrompt, getFileTree } from '@/lib/github';
+import { formatTreeForPrompt, getBranchHead, getFileTreeResult } from '@/lib/github';
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import type { WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
@@ -31,11 +31,20 @@ export async function generateTopics(branch: string): Promise<{
   result: SyncResult;
   snapshotEntries: SnapshotEntry[];
   unclassifiedPaths: string[];
+  treeSha: string;
 }> {
   const client = llmClient();
   const model = getLlmModel();
 
-  const entries = await getFileTree(REPO_OWNER, REPO_NAME);
+  const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch);
+  if (head.status !== 'ok') {
+    throw new Error(
+      head.status === 'rate-limited'
+        ? 'GitHub rate limit reached while resolving branch head'
+        : `Could not resolve head of branch "${branch}"`,
+    );
+  }
+  const { entries, treeSha } = await getFileTreeResult(REPO_OWNER, REPO_NAME, head.sha);
   const treeText = formatTreeForPrompt(entries);
   const allPaths = entries.filter((e) => e.type === 'blob').map((e) => e.path);
 
@@ -145,30 +154,30 @@ Rules:
   return {
     result: {
       topics: repairedTopics,
-      headSha: '',
+      headSha: head.sha,
       branch,
     },
     snapshotEntries,
     unclassifiedPaths,
+    treeSha,
   };
 }
 
-/**
- * Build a WikiSnapshotDoc from generation output.
- * headSha and treeSha are empty strings in Phase 1 (Phase 2 fills them in).
- */
+/** Build a WikiSnapshotDoc from generation output. */
 export function buildSnapshotDoc(
   branch: string,
   snapshotEntries: SnapshotEntry[],
   unclassifiedPaths: string[],
+  headSha = '',
+  treeSha = '',
 ): WikiSnapshotDoc {
   const now = new Date().toISOString();
   return {
     _id: `${branch}:snapshot`,
     kind: 'snapshot',
     branch,
-    headSha: '',
-    treeSha: '',
+    headSha,
+    treeSha,
     fileListText: encodeFileList(snapshotEntries),
     unclassifiedPaths,
     lastEtag: null,

@@ -49,13 +49,13 @@ export async function GET(req: NextRequest) {
 
   // ── 2. Generate (first load for this branch) ──────────────────────────────
   try {
-    const { result, snapshotEntries, unclassifiedPaths } = await generateTopics(branch);
+    const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
 
     // Persist topics.
     await saveTopics(result.topics);
 
     // Persist snapshot.
-    const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths);
+    const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
     await saveSnapshot(snapshot);
 
     console.log(
