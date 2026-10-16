@@ -11,8 +11,8 @@ import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import type { WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
 
-const REPO_OWNER = 'SonicDMG';
-const REPO_NAME = 'walfly';
+export const REPO_OWNER = 'SonicDMG';
+export const REPO_NAME = 'walfly';
 
 function slugify(title: string): string {
   return title

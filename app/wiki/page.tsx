@@ -65,6 +65,10 @@ interface TocTopic {
   suggestedQuery: string;
 }
 
+type SyncState = 'idle' | 'syncing' | 'up-to-date' | 'updated' | 'error';
+
+const SYNC_POLL_MS = 45_000;
+
 // ── Main component ─────────────────────────────────────────────────────────
 
 export default function WikiPage() {
@@ -83,6 +87,10 @@ export default function WikiPage() {
   const [tocTopics, setTocTopics] = useState<TocTopic[]>([]);
   const [tocLoading, setTocLoading] = useState(true);
   const [activeTopic, setActiveTopic] = useState<number | null>(null);
+  const [wikiBranch, setWikiBranch] = useState<string | null>(null);
+  const [headSha, setHeadSha] = useState<string | null>(null);
+  const [syncState, setSyncState] = useState<SyncState>('idle');
+  const [syncNote, setSyncNote] = useState<string | null>(null);
 
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -98,8 +106,13 @@ export default function WikiPage() {
       try {
         const res = await fetch('/api/wiki/toc');
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as { topics?: TocTopic[] };
+        const data = (await res.json()) as { topics?: TocTopic[]; branch?: string; headSha?: string };
         if (!cancelled && Array.isArray(data.topics)) setTocTopics(data.topics);
+        if (!cancelled && data.branch) {
+          setWikiBranch(data.branch);
+          setHeadSha(data.headSha ?? null);
+          setSyncState('up-to-date');
+        }
       } catch (err) {
         console.warn('[wiki] TOC load failed:', err);
       } finally {
@@ -108,6 +121,58 @@ export default function WikiPage() {
     })();
     return () => { cancelled = true; };
   }, []);
+
+  // ── Poll for new commits (only while the tab is visible and focused) ─────
+  useEffect(() => {
+    if (!wikiBranch) return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const tick = async () => {
+      if (inFlight || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+      inFlight = true;
+      setSyncState('syncing');
+      try {
+        const res = await fetch('/api/wiki/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ branch: wikiBranch }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as {
+          status: 'synced' | 'unmodified' | 'locked';
+          headSha?: string;
+          topics?: TocTopic[];
+          changeSummary?: string;
+        };
+        if (cancelled) return;
+        if (data.headSha) setHeadSha(data.headSha);
+        if (data.status === 'synced') {
+          if (Array.isArray(data.topics)) setTocTopics(data.topics);
+          setSyncNote(data.changeSummary ?? null);
+          setSyncState('updated');
+        } else {
+          setSyncState('up-to-date');
+        }
+      } catch (err) {
+        console.warn('[wiki] sync failed:', err);
+        if (!cancelled) setSyncState('error');
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const onWake = () => { void tick(); };
+    const interval = setInterval(() => { void tick(); }, SYNC_POLL_MS);
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('focus', onWake);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('focus', onWake);
+    };
+  }, [wikiBranch]);
 
   // ── highlight.js + Mermaid from CDN ──────────────────────────────────────
   useEffect(() => {
@@ -278,6 +343,25 @@ export default function WikiPage() {
       <header style={styles.header}>
         <span style={styles.title}>Walfly Wiki</span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
+        {wikiBranch && headSha && (
+          <span
+            style={{
+              ...styles.syncPill,
+              ...(syncState === 'updated' ? styles.syncPillUpdated : {}),
+              ...(syncState === 'error' ? styles.syncPillError : {}),
+            }}
+            title={syncNote ?? undefined}
+          >
+            {wikiBranch} @ {headSha.slice(0, 7)} ·{' '}
+            {syncState === 'syncing'
+              ? 'syncing…'
+              : syncState === 'updated'
+                ? `updated${syncNote ? ` (${syncNote})` : ''}`
+                : syncState === 'error'
+                  ? 'sync failed'
+                  : 'up to date'}
+          </span>
+        )}
         <a href={REPO_URL} target="_blank" rel="noreferrer" style={styles.repoLink}>
           SonicDMG/walfly ↗
         </a>
@@ -815,6 +899,19 @@ const styles = {
   },
   subtitle: { color: w.textMuted, fontSize: '13px', flex: 1 },
   repoLink:  { color: w.amber, textDecoration: 'none', fontSize: '12px' },
+  syncPill: {
+    fontSize: '11px',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    color: w.textMuted,
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '999px',
+    padding: '2px 10px',
+    marginRight: '10px',
+    whiteSpace: 'nowrap' as const,
+  },
+  syncPillUpdated: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
+  syncPillError: { color: '#b3261e', borderColor: '#f0b4af' },
   body: { flex: 1, display: 'flex', overflow: 'hidden' },
 
   // TOC
