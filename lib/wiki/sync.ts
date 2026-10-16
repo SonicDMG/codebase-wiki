@@ -15,6 +15,7 @@ import {
   acquireLease,
   deleteTopicsByIds,
   getSnapshot,
+  getStoredBranches,
   getStoredTopics,
   releaseLease,
   saveSnapshot,
@@ -76,8 +77,13 @@ export async function ensureTopics(
 
 // ── syncBranch ────────────────────────────────────────────────────────────────
 
-function unmodified(topics: WikiTopicDoc[], headSha: string, branch: string): SyncOutcome {
-  return { status: 'unmodified', headSha, branch, topics };
+function unmodified(
+  topics: WikiTopicDoc[],
+  headSha: string,
+  branch: string,
+  extra?: { rateLimited?: boolean; retryAfterSeconds?: number | null; warning?: string },
+): SyncOutcome {
+  return { status: 'unmodified', headSha, branch, topics, ...extra };
 }
 
 export async function syncBranch(branch: string): Promise<SyncOutcome> {
@@ -86,8 +92,15 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
 
   // ── 1. Cheap head check (conditional request) ──────────────────────────────
   const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch, snapshot.lastEtag);
-  if (head.status === 'not-modified' || head.status === 'rate-limited') {
+  if (head.status === 'not-modified') {
     return unmodified(storedTopics, snapshot.headSha, branch);
+  }
+  if (head.status === 'rate-limited') {
+    // Treat as no change — serve stored topics with a backoff hint.
+    return unmodified(storedTopics, snapshot.headSha, branch, {
+      rateLimited: true,
+      retryAfterSeconds: head.retryAfterSeconds,
+    });
   }
   if (head.sha === snapshot.headSha) {
     // Same commit but a new/changed ETag — remember it so later checks return 304.
@@ -121,7 +134,9 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
     if (tree.truncated) {
       // A truncated tree would look like mass deletions — keep stored state.
       console.warn(`[wiki/sync] truncated tree for "${branch}" — skipping incremental sync`);
-      return unmodified(topics, base.headSha, branch);
+      return unmodified(topics, base.headSha, branch, {
+        warning: 'GitHub returned a truncated file tree — incremental sync skipped; stored topics served.',
+      });
     }
     const newEntries: SnapshotEntry[] = tree.entries
       .filter((e) => e.type === 'blob')

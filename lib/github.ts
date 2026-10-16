@@ -55,6 +55,11 @@ const TREE_CACHE_MAX = 20;
 const FILE_TTL_MS = 5 * 60_000; // 5 minutes
 const FILE_CACHE_MAX = 50;      // max cached files; evicts oldest on overflow
 
+/** Short cache for branch lists — avoids burning calls on repeated branch-picker opens. */
+const BRANCHES_TTL_MS = 30_000;
+interface BranchListCache { branches: string[]; defaultBranch: string; expiresAt: number }
+const branchesCache = new Map<string, BranchListCache>();
+
 // Tree cache — keyed by "<owner>/<repo>/<ref>" (ref is a commit SHA, or 'HEAD').
 const treeCache = new Map<string, FileTreeResult & { expiresAt: number }>();
 
@@ -228,6 +233,48 @@ export async function fetchFileContents(
   }
 
   return contents;
+}
+
+/**
+ * Returns the list of branches for a repo plus the repo's default branch.
+ * Paginates up to 10 pages (300 branches) with a 30-second in-memory cache.
+ */
+export async function listBranches(
+  owner: string,
+  repo: string,
+): Promise<{ branches: string[]; defaultBranch: string }> {
+  const now = Date.now();
+  const cacheKey = `${owner}/${repo}`;
+  const cached = branchesCache.get(cacheKey);
+  if (cached && now < cached.expiresAt) return { branches: cached.branches, defaultBranch: cached.defaultBranch };
+
+  // Fetch default branch cheaply from the repo API.
+  let defaultBranch = 'main';
+  try {
+    const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: githubHeaders() });
+    if (repoRes.ok) {
+      const repoData = (await repoRes.json()) as { default_branch?: string };
+      if (repoData.default_branch) defaultBranch = repoData.default_branch;
+    }
+  } catch { /* ignore — fall back to 'main' */ }
+
+  // Paginate branch list (30 per page, up to 10 pages = 300 branches).
+  const branches: string[] = [];
+  const PER_PAGE = 30;
+  for (let page = 1; page <= 10; page++) {
+    const url = `https://api.github.com/repos/${owner}/${repo}/branches?per_page=${PER_PAGE}&page=${page}`;
+    const res = await fetch(url, { headers: githubHeaders() });
+    if (!res.ok) break;
+    const data = (await res.json()) as Array<{ name?: string }>;
+    for (const b of data) {
+      if (b.name) branches.push(b.name);
+    }
+    if (data.length < PER_PAGE) break; // last page
+  }
+
+  const result = { branches, defaultBranch };
+  branchesCache.set(cacheKey, { ...result, expiresAt: now + BRANCHES_TTL_MS });
+  return result;
 }
 
 /**

@@ -142,6 +142,21 @@ export async function saveTopics(topics: WikiTopicDoc[]): Promise<void> {
 }
 
 /**
+ * Return the set of branch names that have at least one stored snapshot.
+ * Used by branch seeding in sync.ts to find a donor branch.
+ */
+export async function getStoredBranches(): Promise<string[]> {
+  const col = await ensureWikiTocCollection();
+  const cursor = col.find({ kind: 'snapshot' } as any, { projection: { branch: 1 } as any });
+  const branches: string[] = [];
+  for await (const doc of cursor) {
+    const snap = doc as unknown as { branch?: string };
+    if (snap.branch) branches.push(snap.branch);
+  }
+  return branches;
+}
+
+/**
  * Delete all topic documents for a branch (used by "Rebuild all" in Phase 4).
  */
 export async function deleteTopicsForBranch(branch: string): Promise<void> {
