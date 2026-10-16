@@ -1,102 +1,78 @@
 /**
  * GET /api/wiki/toc
  *
- * Generates a table of contents for the Walfly codebase by:
- *   1. Fetching the repo file tree (60 s in-memory cache shared with /api/wiki/chat)
- *   2. Calling the LLM once (non-streaming) to produce a JSON array of topic objects
+ * Returns wiki topics for a given branch. On first call:
+ *   1. Checks Astra for stored topics — returns immediately if found.
+ *   2. If none exist, generates topics via LLM, stores them in Astra, then returns.
  *
- * The result is cached server-side for 5 minutes so repeated page loads are fast.
+ * Query params:
+ *   ?branch=<branch>  — defaults to "main"
+ *
+ * Response shape (unchanged from previous version, plus new fields):
+ *   { topics: TocTopic[], branch: string }
  */
 
-import { NextResponse } from 'next/server';
-import { getLlmModel, llmClient } from '@/lib/llm';
-import { formatTreeForPrompt, getFileTree } from '@/lib/github';
+import { NextRequest, NextResponse } from 'next/server';
+import { getStoredTopics, saveTopics, saveSnapshot } from '@/lib/wiki/store';
+import { generateTopics, buildSnapshotDoc } from '@/lib/wiki/generate';
 
 export const runtime = 'nodejs';
 export const maxDuration = 60;
 
-const REPO_OWNER = 'SonicDMG';
-const REPO_NAME = 'walfly';
+const DEFAULT_BRANCH = 'main';
 
+/** Minimal shape the wiki page consumes (backwards-compatible). */
 export interface TocTopic {
   title: string;
   description: string;
   suggestedQuery: string;
 }
 
-// Server-side cache so the LLM isn't called on every page load.
-let tocCache: { topics: TocTopic[]; expiresAt: number } | null = null;
-const TOC_TTL_MS = 5 * 60_000; // 5 minutes
+export async function GET(req: NextRequest) {
+  const branch = req.nextUrl.searchParams.get('branch')?.trim() || DEFAULT_BRANCH;
 
-export async function GET() {
-  // Serve from cache if still fresh.
-  if (tocCache && Date.now() < tocCache.expiresAt) {
-    return NextResponse.json({ topics: tocCache.topics });
-  }
-
-  let client: ReturnType<typeof llmClient>;
-  let model: string;
+  // ── 1. Try stored topics ──────────────────────────────────────────────────
   try {
-    client = llmClient();
-    model = getLlmModel();
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'LLM is not configured' },
-      { status: 500 },
-    );
-  }
-
-  let treeText: string;
-  try {
-    const entries = await getFileTree(REPO_OWNER, REPO_NAME);
-    treeText = formatTreeForPrompt(entries);
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to fetch file tree' },
-      { status: 500 },
-    );
-  }
-
-  const response = await client.chat.completions.create({
-    model,
-    stream: false,
-    messages: [
-      {
-        role: 'system',
-        content: `You are a technical documentation assistant for the Walfly monorepo.
-Given the file tree below, produce a table of contents for a developer wiki.
-Output ONLY a JSON array of exactly 10–14 topic objects with these fields:
-  - "title": short section title (3–6 words, e.g. "Backend API Overview")
-  - "description": one sentence describing what a developer will learn from this section (max 120 chars)
-  - "suggestedQuery": a natural-language question a developer would ask to explore this topic (max 100 chars)
-
-Order topics from high-level (architecture, getting started) to low-level (data layer, infra).
-No markdown fences, no prose — only the raw JSON array.`,
-      },
-      {
-        role: 'user',
-        content: `File tree for ${REPO_OWNER}/${REPO_NAME}:\n\n${treeText}`,
-      },
-    ],
-  });
-
-  const raw = response.choices[0]?.message?.content?.trim() ?? '[]';
-  let topics: TocTopic[] = [];
-  try {
-    const cleaned = raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-    const parsed = JSON.parse(cleaned);
-    if (Array.isArray(parsed)) {
-      topics = parsed.filter(
-        (t): t is TocTopic =>
-          typeof t?.title === 'string' &&
-          typeof t?.description === 'string' &&
-          typeof t?.suggestedQuery === 'string',
-      );
+    const stored = await getStoredTopics(branch);
+    if (stored.length > 0) {
+      console.log(`[wiki/toc] serving ${stored.length} stored topics for branch "${branch}"`);
+      const topics: TocTopic[] = stored.map((t) => ({
+        title: t.title,
+        description: t.description,
+        suggestedQuery: t.suggestedQuery,
+      }));
+      return NextResponse.json({ topics, branch });
     }
-  } catch {
-    console.warn('[wiki/toc] JSON parse failed, raw:', raw.slice(0, 300));
+  } catch (err) {
+    console.warn('[wiki/toc] Astra read failed, will try generation:', err);
   }
 
-  tocCache = { topics, expiresAt: Date.now() + TOC_TTL_MS };
-  return NextResponse.json({ topics });
+  // ── 2. Generate (first load for this branch) ──────────────────────────────
+  try {
+    const { result, snapshotEntries, unclassifiedPaths } = await generateTopics(branch);
+
+    // Persist topics.
+    await saveTopics(result.topics);
+
+    // Persist snapshot.
+    const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths);
+    await saveSnapshot(snapshot);
+
+    console.log(
+      `[wiki/toc] generated and stored ${result.topics.length} topics for branch "${branch}"`,
+    );
+
+    const topics: TocTopic[] = result.topics.map((t) => ({
+      title: t.title,
+      description: t.description,
+      suggestedQuery: t.suggestedQuery,
+    }));
+    return NextResponse.json({ topics, branch });
+  } catch (err) {
+    console.error('[wiki/toc] generation failed:', err);
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Failed to generate wiki topics' },
+      { status: 500 },
+    );
+  }
 }

@@ -26,10 +26,12 @@ export interface TreeEntry {
   path: string;
   type: 'blob' | 'tree';
   size?: number;
+  /** Git blob SHA — populated from the GitHub tree API response. */
+  sha?: string;
 }
 
 interface GitHubTreeResponse {
-  tree: Array<{ path?: string; type?: string; size?: number }>;
+  tree: Array<{ path?: string; type?: string; size?: number; sha?: string }>;
   truncated: boolean;
 }
 
@@ -79,7 +81,7 @@ export async function getFileTree(owner: string, repo: string): Promise<TreeEntr
 
   const entries: TreeEntry[] = data.tree
     .filter((e) => e.type === 'blob' && typeof e.path === 'string')
-    .map((e) => ({ path: e.path as string, type: 'blob', size: e.size }));
+    .map((e) => ({ path: e.path as string, type: 'blob', size: e.size, sha: e.sha }));
 
   treeCache = { entries, expiresAt: now + TREE_TTL_MS };
   console.log(`[github] file tree fetched: ${entries.length} files (cached for 60 s)`);
