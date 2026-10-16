@@ -65,9 +65,10 @@ interface TocTopic {
   suggestedQuery: string;
 }
 
-type SyncState = 'idle' | 'syncing' | 'up-to-date' | 'updated' | 'error';
+type SyncState = 'idle' | 'syncing' | 'up-to-date' | 'updated' | 'error' | 'rate-limited';
 
 const SYNC_POLL_MS = 45_000;
+const SYNC_POLL_CAP_MS = 300_000;
 
 // ── Main component ─────────────────────────────────────────────────────────
 
@@ -88,9 +89,11 @@ export default function WikiPage() {
   const [tocLoading, setTocLoading] = useState(true);
   const [activeTopic, setActiveTopic] = useState<number | null>(null);
   const [wikiBranch, setWikiBranch] = useState<string | null>(null);
+  const [branches, setBranches] = useState<string[]>([]);
   const [headSha, setHeadSha] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('idle');
   const [syncNote, setSyncNote] = useState<string | null>(null);
+  const [syncWarning, setSyncWarning] = useState<string | null>(null);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
 
@@ -101,6 +104,9 @@ export default function WikiPage() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const statusMenuRef = useRef<HTMLDivElement>(null);
+  const tocReqIdRef = useRef(0);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const currentDelayRef = useRef(SYNC_POLL_MS);
 
   // ── Close status menu on outside click or Escape ─────────────────────────
   useEffect(() => {
@@ -121,76 +127,170 @@ export default function WikiPage() {
     };
   }, [statusMenuOpen]);
 
-  // ── Load TOC on mount ─────────────────────────────────────────────────────
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch('/api/wiki/toc');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = (await res.json()) as { topics?: TocTopic[]; branch?: string; headSha?: string };
-        if (!cancelled && Array.isArray(data.topics)) setTocTopics(data.topics);
-        if (!cancelled && data.branch) {
-          setWikiBranch(data.branch);
-          setHeadSha(data.headSha ?? null);
-          setSyncState('up-to-date');
-        }
-      } catch (err) {
-        console.warn('[wiki] TOC load failed:', err);
-      } finally {
-        if (!cancelled) setTocLoading(false);
+  // ── Fetch branches ────────────────────────────────────────────────────────
+  const fetchBranches = useCallback(async () => {
+    if (branches.length > 0) return;
+    try {
+      const res = await fetch('/api/wiki/branches');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { branches?: string[]; defaultBranch?: string };
+      if (Array.isArray(data.branches) && data.branches.length > 0) {
+        setBranches(data.branches);
       }
-    })();
-    return () => { cancelled = true; };
+    } catch (err) {
+      console.warn('[wiki] branches load failed:', err);
+    }
+  }, [branches.length]);
+
+  // ── Load TOC for a branch ─────────────────────────────────────────────────
+  const loadToc = useCallback(async (branch?: string) => {
+    const reqId = ++tocReqIdRef.current;
+    setTocLoading(true);
+    try {
+      const url = branch ? `/api/wiki/toc?branch=${encodeURIComponent(branch)}` : '/api/wiki/toc';
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { topics?: TocTopic[]; branch?: string; headSha?: string };
+      if (reqId !== tocReqIdRef.current) return;
+      if (Array.isArray(data.topics)) setTocTopics(data.topics);
+      if (data.branch) {
+        setWikiBranch(data.branch);
+        setHeadSha(data.headSha ?? null);
+        setSyncState('up-to-date');
+      }
+    } catch (err) {
+      if (reqId === tocReqIdRef.current) {
+        console.warn('[wiki] TOC load failed:', err);
+        setSyncState('error');
+      }
+    } finally {
+      if (reqId === tocReqIdRef.current) {
+        setTocLoading(false);
+      }
+    }
   }, []);
 
-  // ── Poll for new commits (only while the tab is visible and focused) ─────
+  // ── Load branches and TOC on mount ─────────────────────────────────────────
+  useEffect(() => {
+    void fetchBranches();
+    void loadToc();
+  }, [fetchBranches, loadToc]);
+
+  // ── Branch switcher ───────────────────────────────────────────────────────
+  const handleBranchSelect = (newBranch: string) => {
+    if (newBranch === wikiBranch) return;
+    setWikiBranch(newBranch);
+    setHeadSha(null);
+    setSyncNote(null);
+    setSyncWarning(null);
+    setActiveTopic(null);
+    void loadToc(newBranch);
+  };
+
+  // ── Poll for new commits (with exponential backoff & tab visibility check) ─
   useEffect(() => {
     if (!wikiBranch) return;
     let cancelled = false;
     let inFlight = false;
+    currentDelayRef.current = SYNC_POLL_MS;
+
+    const scheduleNext = (delayMs: number) => {
+      if (cancelled) return;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        void tick();
+      }, delayMs);
+    };
 
     const tick = async () => {
-      if (inFlight || document.visibilityState !== 'visible' || !document.hasFocus()) return;
+      if (cancelled || inFlight) return;
+      if (document.visibilityState !== 'visible' || !document.hasFocus()) {
+        scheduleNext(currentDelayRef.current);
+        return;
+      }
+
       inFlight = true;
       setSyncState('syncing');
+
       try {
         const res = await fetch('/api/wiki/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ branch: wikiBranch }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
         const data = (await res.json()) as {
           status: 'synced' | 'unmodified' | 'locked';
           headSha?: string;
           topics?: TocTopic[];
           changeSummary?: string;
+          rateLimited?: boolean;
+          retryAfterSeconds?: number;
+          warning?: string;
         };
+
         if (cancelled) return;
-        if (data.headSha) setHeadSha(data.headSha);
-        if (data.status === 'synced') {
-          if (Array.isArray(data.topics)) setTocTopics(data.topics);
-          setSyncNote(data.changeSummary ?? null);
-          setSyncState('updated');
+
+        if (data.warning) {
+          setSyncWarning(data.warning);
         } else {
-          setSyncState('up-to-date');
+          setSyncWarning(null);
+        }
+
+        if (data.rateLimited) {
+          const retryMs =
+            typeof data.retryAfterSeconds === 'number' && data.retryAfterSeconds > 0
+              ? data.retryAfterSeconds * 1000
+              : 0;
+          currentDelayRef.current = Math.min(
+            SYNC_POLL_CAP_MS,
+            Math.max(currentDelayRef.current * 2, retryMs),
+          );
+          setSyncState('rate-limited');
+        } else {
+          currentDelayRef.current = SYNC_POLL_MS;
+          if (data.headSha) setHeadSha(data.headSha);
+          if (data.status === 'synced') {
+            if (Array.isArray(data.topics)) setTocTopics(data.topics);
+            setSyncNote(data.changeSummary ?? null);
+            setSyncState('updated');
+          } else {
+            setSyncState('up-to-date');
+          }
         }
       } catch (err) {
         console.warn('[wiki] sync failed:', err);
-        if (!cancelled) setSyncState('error');
+        if (!cancelled) {
+          currentDelayRef.current = Math.min(SYNC_POLL_CAP_MS, currentDelayRef.current * 2);
+          setSyncState('error');
+        }
       } finally {
         inFlight = false;
+        if (!cancelled) {
+          scheduleNext(currentDelayRef.current);
+        }
       }
     };
 
-    const onWake = () => { void tick(); };
-    const interval = setInterval(() => { void tick(); }, SYNC_POLL_MS);
+    const onWake = () => {
+      if (!cancelled && !inFlight && document.visibilityState === 'visible' && document.hasFocus()) {
+        if (timerRef.current) clearTimeout(timerRef.current);
+        void tick();
+      }
+    };
+
     document.addEventListener('visibilitychange', onWake);
     window.addEventListener('focus', onWake);
+
+    scheduleNext(currentDelayRef.current);
+
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timerRef.current) clearTimeout(timerRef.current);
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('focus', onWake);
     };
@@ -276,7 +376,10 @@ export default function WikiPage() {
       const res = await fetch('/api/wiki/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history }),
+        body: JSON.stringify({
+          branch: wikiBranch ?? undefined,
+          messages: history,
+        }),
       });
 
       if (!res.ok) {
@@ -342,7 +445,7 @@ export default function WikiPage() {
       setLoading(false);
       inputRef.current?.focus();
     }
-  }, [input, loading, messages]);
+  }, [input, loading, messages, wikiBranch]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -395,35 +498,69 @@ export default function WikiPage() {
       <header style={styles.header}>
         <span style={styles.title}>Walfly Wiki</span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
-        {wikiBranch && headSha && (
+        {wikiBranch && (
           <div ref={statusMenuRef} style={{ position: 'relative', display: 'inline-block' }}>
             <button
               type="button"
               aria-expanded={statusMenuOpen}
               aria-haspopup="true"
-              onClick={() => setStatusMenuOpen((prev) => !prev)}
+              onClick={() => {
+                setStatusMenuOpen((prev) => {
+                  const next = !prev;
+                  if (next) void fetchBranches();
+                  return next;
+                });
+              }}
               style={{
                 ...styles.syncPill,
                 ...(syncState === 'updated' ? styles.syncPillUpdated : {}),
                 ...(syncState === 'error' ? styles.syncPillError : {}),
+                ...(syncState === 'rate-limited' ? styles.syncPillRateLimited : {}),
                 cursor: 'pointer',
               }}
               title={syncNote ?? undefined}
             >
-              {wikiBranch} @ {headSha.slice(0, 7)} ·{' '}
+              {wikiBranch} @ {headSha ? headSha.slice(0, 7) : '…'} ·{' '}
               {rebuilding
                 ? 'rebuilding…'
                 : syncState === 'syncing'
                   ? 'syncing…'
                   : syncState === 'updated'
                     ? `updated${syncNote ? ` (${syncNote})` : ''}`
-                    : syncState === 'error'
-                      ? 'sync failed'
-                      : 'up to date'}{' '}
+                    : syncState === 'rate-limited'
+                      ? 'rate-limited · retrying'
+                      : syncState === 'error'
+                        ? 'sync failed'
+                        : 'up to date'}{' '}
               ▾
             </button>
             {statusMenuOpen && (
               <div style={styles.statusDropdown}>
+                <div style={styles.dropdownSection}>
+                  <label htmlFor="wiki-branch-select" style={styles.branchLabel}>
+                    Branch
+                  </label>
+                  <select
+                    id="wiki-branch-select"
+                    value={wikiBranch}
+                    onChange={(e) => handleBranchSelect(e.target.value)}
+                    style={styles.branchSelect}
+                    aria-label="Select branch"
+                  >
+                    {branches.map((b) => (
+                      <option key={b} value={b}>
+                        {b}
+                      </option>
+                    ))}
+                    {branches.length === 0 && (
+                      <option value={wikiBranch}>{wikiBranch}</option>
+                    )}
+                    {branches.length > 0 && !branches.includes(wikiBranch) && (
+                      <option value={wikiBranch}>{wikiBranch}</option>
+                    )}
+                  </select>
+                </div>
+                <div style={styles.dropdownDivider} />
                 <button
                   type="button"
                   style={{
@@ -438,6 +575,16 @@ export default function WikiPage() {
               </div>
             )}
           </div>
+        )}
+        {syncWarning && (
+          <span
+            role="status"
+            aria-label={`Warning: ${syncWarning}`}
+            title={syncWarning}
+            style={styles.syncWarning}
+          >
+            ⚠ {syncWarning}
+          </span>
         )}
         <a href={REPO_URL} target="_blank" rel="noreferrer" style={styles.repoLink}>
           SonicDMG/walfly ↗
@@ -989,6 +1136,23 @@ const styles = {
   },
   syncPillUpdated: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
   syncPillError: { color: '#b3261e', borderColor: '#f0b4af' },
+  syncPillRateLimited: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
+  syncWarning: {
+    fontSize: '11px',
+    color: '#92600a',
+    background: w.amberLight,
+    border: `1px solid ${w.amberBorder}`,
+    borderRadius: '4px',
+    padding: '2px 8px',
+    marginRight: '8px',
+    maxWidth: '240px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap' as const,
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '4px',
+  },
   statusDropdown: {
     position: 'absolute' as const,
     top: 'calc(100% + 4px)',
@@ -997,9 +1161,39 @@ const styles = {
     border: `1px solid ${w.border}`,
     borderRadius: '6px',
     boxShadow: '0 4px 12px rgba(0, 0, 0, 0.08)',
-    padding: '4px',
+    padding: '6px',
     zIndex: 100,
-    minWidth: '130px',
+    minWidth: '170px',
+  },
+  dropdownSection: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '4px',
+    padding: '4px',
+  },
+  branchLabel: {
+    fontSize: '11px',
+    fontWeight: 600,
+    color: w.textMuted,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.05em',
+  },
+  branchSelect: {
+    width: '100%',
+    padding: '4px 8px',
+    fontSize: '12px',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    color: w.text,
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '4px',
+    outline: 'none',
+    cursor: 'pointer',
+  },
+  dropdownDivider: {
+    height: '1px',
+    background: w.border,
+    margin: '4px 0',
   },
   rebuildButton: {
     display: 'block',
