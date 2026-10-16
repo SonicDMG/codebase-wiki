@@ -2,16 +2,15 @@
  * sync.ts — Diff-driven incremental sync of stored wiki topics.
  *
  *   ensureTopics(branch)  — stored topics + snapshot, or initial generation.
- *   syncBranch(branch)    — checks branch head (conditional ETag), diffs the stored
- *                           snapshot against the new commit tree and updates the
- *                           snapshot/topics without any LLM calls. Added files that
- *                           match no topic scope are queued in `unclassifiedPaths`
- *                           (classified in a later phase).
+ *   syncBranch(branch)    — checks branch head, diffs snapshot, absorbs matched
+ *                           files, classifies unmatched via JEV, and runs
+ *                           incremental LLM extension when the unclassified
+ *                           threshold is crossed.
  */
 
 import { getBranchHead, getFileTreeResult } from '@/lib/github';
 import { decodeFileList, diffSnapshots, encodeFileList } from './snapshot';
-import { findEmptyTopicIds, pathMatchesScope } from './scope';
+import { findEmptyTopicIds, pathMatchesScope, promoteDirectoryPrefixes } from './scope';
 import {
   acquireLease,
   deleteTopicsByIds,
@@ -22,7 +21,8 @@ import {
   saveTopics,
   deleteTopicsForBranch,
 } from './store';
-import { buildSnapshotDoc, generateTopics, REPO_NAME, REPO_OWNER } from './generate';
+import { buildSnapshotDoc, extendTopics, generateTopics, REPO_NAME, REPO_OWNER } from './generate';
+import { classifyFile } from './classify';
 import type { SnapshotEntry, SyncOutcome, WikiSnapshotDoc, WikiTopicDoc } from './types';
 
 const CATCH_ALL_SLUG = 'repo-config-tooling';
@@ -155,19 +155,139 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
     current = current.filter((t) => !emptyIds.has(t._id));
     const topicsToSave = changedTopics.filter((t) => !emptyIds.has(t._id));
 
-    // ── 5. Absorb additions (zero LLM calls); queue the rest ─────────────────
+    // ── 5. Absorb additions that match existing scopes (zero LLM calls) ──────
     const pathSet = new Set(newPaths);
     const candidates = [
       ...base.unclassifiedPaths.map((p) => renameMap.get(p) ?? p),
       ...diff.additions.map((a) => a.path),
       ...diff.renames.map((r) => r.newPath),
     ];
-    const unclassifiedPaths = [...new Set(candidates)].filter(
+    let unclassifiedPaths = [...new Set(candidates)].filter(
       (p) => pathSet.has(p) && !current.some((t) => pathMatchesScope(p, t.scope)),
     );
     const absorbed = diff.additions.filter((a) => !unclassifiedPaths.includes(a.path)).length;
 
-    // ── 6. Persist ───────────────────────────────────────────────────────────
+    // ── 6. JEV classification for each unclassified addition ─────────────────
+    if (unclassifiedPaths.length > 0 && current.length > 0) {
+      const stillUnclassified: string[] = [];
+      const BATCH_SIZE = 8;
+      const countBefore = unclassifiedPaths.length;
+      for (let i = 0; i < unclassifiedPaths.length; i += BATCH_SIZE) {
+        const batch = unclassifiedPaths.slice(i, i + BATCH_SIZE);
+        await Promise.all(
+          batch.map(async (filePath) => {
+            // Sibling context: up to 10 paths in the same directory.
+            const dir = filePath.includes('/')
+              ? filePath.slice(0, filePath.lastIndexOf('/') + 1)
+              : '';
+            const siblings = dir
+              ? newPaths.filter((p) => p.startsWith(dir) && p !== filePath).slice(0, 10)
+              : [];
+            const chosenSlug = await classifyFile(filePath, siblings, current);
+            if (!chosenSlug) {
+              stillUnclassified.push(filePath);
+              return;
+            }
+            const topicIdx = current.findIndex((t) => t.slug === chosenSlug);
+            if (topicIdx < 0) {
+              stillUnclassified.push(filePath);
+              return;
+            }
+            // Add to topic's explicit files.
+            const topic = current[topicIdx];
+            if (!topic.scope.files.includes(filePath)) {
+              current[topicIdx] = {
+                ...topic,
+                scope: { ...topic.scope, files: [...topic.scope.files, filePath] },
+                updatedAt: now,
+              };
+              const saveIdx = topicsToSave.findIndex((ts) => ts._id === current[topicIdx]._id);
+              if (saveIdx >= 0) {
+                topicsToSave[saveIdx] = current[topicIdx];
+              } else {
+                topicsToSave.push(current[topicIdx]);
+              }
+            }
+          }),
+        );
+      }
+      const classifiedCount = countBefore - stillUnclassified.length;
+      unclassifiedPaths = stillUnclassified;
+      console.log(
+        `[wiki/sync] JEV classified ${classifiedCount} paths; ${unclassifiedPaths.length} still unclassified`,
+      );
+
+      // Sibling promotion: if ≥3 newly classified files for the same topic share
+      // a directory, promote that directory to a prefix in that topic's scope.
+      for (let i = 0; i < current.length; i++) {
+        const t = current[i];
+        const newFiles = t.scope.files.filter((f) => candidates.includes(f) && !base.unclassifiedPaths.includes(f));
+        if (newFiles.length < 3) continue;
+        const maxCoverage = Math.floor(newPaths.length * 0.4);
+        const promoted = promoteDirectoryPrefixes(newFiles).filter(
+          (p) => !t.scope.prefixes.includes(p) && newPaths.filter((a) => a.startsWith(p)).length <= maxCoverage,
+        );
+        if (promoted.length > 0) {
+          const filesToRemove = new Set(newFiles.filter((f) => promoted.some((pfx) => f.startsWith(pfx))));
+          current[i] = {
+            ...t,
+            scope: {
+              prefixes: [...t.scope.prefixes, ...promoted],
+              files: t.scope.files.filter((f) => !filesToRemove.has(f)),
+            },
+            updatedAt: now,
+          };
+          const saveIdx = topicsToSave.findIndex((ts) => ts._id === current[i]._id);
+          if (saveIdx >= 0) {
+            topicsToSave[saveIdx] = current[i];
+          } else {
+            topicsToSave.push(current[i]);
+          }
+        }
+      }
+    }
+
+    // ── 7. Incremental extension: ≥3 unclassified OR new top-level dir ────────
+    const newTopLevelDirs = new Set(
+      diff.additions
+        .map((a) => (a.path.includes('/') ? a.path.split('/')[0] : null))
+        .filter((d): d is string => d !== null),
+    );
+    const existingTopLevelDirs = new Set(
+      decodeFileList(base.fileListText)
+        .map((e) => (e.path.includes('/') ? e.path.split('/')[0] : null))
+        .filter((d): d is string => d !== null),
+    );
+    const hasNewTopLevelDir = [...newTopLevelDirs].some((d) => !existingTopLevelDirs.has(d));
+
+    if (unclassifiedPaths.length >= 3 || hasNewTopLevelDir) {
+      try {
+        const { updatedTopics, remainingUnclassified } = await extendTopics(
+          branch,
+          unclassifiedPaths,
+          current,
+          newPaths,
+        );
+        // Detect which topics changed and need saving.
+        for (const updated of updatedTopics) {
+          const orig = current.find((t) => t._id === updated._id);
+          if (!orig || JSON.stringify(orig.scope) !== JSON.stringify(updated.scope)) {
+            if (!topicsToSave.some((ts) => ts._id === updated._id)) topicsToSave.push(updated);
+          }
+        }
+        // New topics not in current list.
+        const currentIds = new Set(current.map((t) => t._id));
+        for (const t of updatedTopics) {
+          if (!currentIds.has(t._id)) topicsToSave.push(t);
+        }
+        current = updatedTopics;
+        unclassifiedPaths = remainingUnclassified;
+      } catch (err) {
+        console.warn('[wiki/sync] incremental extension failed:', err);
+      }
+    }
+
+    // ── 8. Persist ───────────────────────────────────────────────────────────
     await saveTopics(topicsToSave);
     await deleteTopicsByIds([...emptyIds]);
     await saveSnapshot({

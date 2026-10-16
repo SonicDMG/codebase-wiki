@@ -91,6 +91,8 @@ export default function WikiPage() {
   const [headSha, setHeadSha] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('idle');
   const [syncNote, setSyncNote] = useState<string | null>(null);
+  const [statusMenuOpen, setStatusMenuOpen] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
 
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -98,6 +100,26 @@ export default function WikiPage() {
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const statusMenuRef = useRef<HTMLDivElement>(null);
+
+  // ── Close status menu on outside click or Escape ─────────────────────────
+  useEffect(() => {
+    if (!statusMenuOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setStatusMenuOpen(false);
+    };
+    const handleClickOutside = (e: MouseEvent) => {
+      if (statusMenuRef.current && !statusMenuRef.current.contains(e.target as Node)) {
+        setStatusMenuOpen(false);
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [statusMenuOpen]);
 
   // ── Load TOC on mount ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -334,6 +356,36 @@ export default function WikiPage() {
     void send(topic.suggestedQuery);
   };
 
+  const handleRebuild = async () => {
+    if (!wikiBranch || rebuilding) return;
+    setRebuilding(true);
+    try {
+      const res = await fetch('/api/wiki/rebuild', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ branch: wikiBranch }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as {
+        status: 'synced' | 'locked';
+        headSha?: string;
+        topics?: TocTopic[];
+        changeSummary?: string;
+      };
+      if (data.headSha) setHeadSha(data.headSha);
+      if (Array.isArray(data.topics)) setTocTopics(data.topics);
+      setSyncNote(data.changeSummary ?? 'rebuilt all topics');
+      setSyncState('updated');
+      setStatusMenuOpen(false);
+    } catch (err) {
+      console.warn('[wiki] rebuild failed:', err);
+      setSyncState('error');
+      setSyncNote('rebuild failed');
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
   const parsedLatest = latestAssistantMsg ? parseMessage(latestAssistantMsg.content) : null;
 
   return (
@@ -344,23 +396,48 @@ export default function WikiPage() {
         <span style={styles.title}>Walfly Wiki</span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
         {wikiBranch && headSha && (
-          <span
-            style={{
-              ...styles.syncPill,
-              ...(syncState === 'updated' ? styles.syncPillUpdated : {}),
-              ...(syncState === 'error' ? styles.syncPillError : {}),
-            }}
-            title={syncNote ?? undefined}
-          >
-            {wikiBranch} @ {headSha.slice(0, 7)} ·{' '}
-            {syncState === 'syncing'
-              ? 'syncing…'
-              : syncState === 'updated'
-                ? `updated${syncNote ? ` (${syncNote})` : ''}`
-                : syncState === 'error'
-                  ? 'sync failed'
-                  : 'up to date'}
-          </span>
+          <div ref={statusMenuRef} style={{ position: 'relative', display: 'inline-block' }}>
+            <button
+              type="button"
+              aria-expanded={statusMenuOpen}
+              aria-haspopup="true"
+              onClick={() => setStatusMenuOpen((prev) => !prev)}
+              style={{
+                ...styles.syncPill,
+                ...(syncState === 'updated' ? styles.syncPillUpdated : {}),
+                ...(syncState === 'error' ? styles.syncPillError : {}),
+                cursor: 'pointer',
+              }}
+              title={syncNote ?? undefined}
+            >
+              {wikiBranch} @ {headSha.slice(0, 7)} ·{' '}
+              {rebuilding
+                ? 'rebuilding…'
+                : syncState === 'syncing'
+                  ? 'syncing…'
+                  : syncState === 'updated'
+                    ? `updated${syncNote ? ` (${syncNote})` : ''}`
+                    : syncState === 'error'
+                      ? 'sync failed'
+                      : 'up to date'}{' '}
+              ▾
+            </button>
+            {statusMenuOpen && (
+              <div style={styles.statusDropdown}>
+                <button
+                  type="button"
+                  style={{
+                    ...styles.rebuildButton,
+                    ...(rebuilding ? styles.rebuildButtonDisabled : {}),
+                  }}
+                  onClick={handleRebuild}
+                  disabled={rebuilding}
+                >
+                  {rebuilding ? 'Rebuilding…' : 'Rebuild all'}
+                </button>
+              </div>
+            )}
+          </div>
         )}
         <a href={REPO_URL} target="_blank" rel="noreferrer" style={styles.repoLink}>
           SonicDMG/walfly ↗
@@ -912,6 +989,35 @@ const styles = {
   },
   syncPillUpdated: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
   syncPillError: { color: '#b3261e', borderColor: '#f0b4af' },
+  statusDropdown: {
+    position: 'absolute' as const,
+    top: 'calc(100% + 4px)',
+    left: 0,
+    background: w.bg,
+    border: `1px solid ${w.border}`,
+    borderRadius: '6px',
+    boxShadow: '0 4px 12px rgba(0, 0, 0, 0.08)',
+    padding: '4px',
+    zIndex: 100,
+    minWidth: '130px',
+  },
+  rebuildButton: {
+    display: 'block',
+    width: '100%',
+    padding: '6px 12px',
+    fontSize: '12px',
+    fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+    color: w.text,
+    background: 'none',
+    border: 'none',
+    borderRadius: '4px',
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+  },
+  rebuildButtonDisabled: {
+    color: w.textFaint,
+    cursor: 'not-allowed',
+  },
   body: { flex: 1, display: 'flex', overflow: 'hidden' },
 
   // TOC
