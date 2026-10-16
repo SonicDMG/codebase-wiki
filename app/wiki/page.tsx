@@ -393,7 +393,7 @@ function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, on
           onCitationClick={onCitationClick}
         />
       ) : (
-        <MarkdownContent content={stripCodeFences(message.content)} />
+        <MarkdownContent content={message.content} />
       )}
     </div>
   );
@@ -681,10 +681,12 @@ function extractLines(src: string, url: string): string {
 
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
-// Separates fenced code blocks (→ sidebar RefBlocks) from the prose markdown.
-// The prose is returned as a plain markdown string ready for react-markdown.
-// Citations ([label](github-url#Lnn)) remain as standard markdown links —
-// ProseContent's custom <a> renderer turns them into interactive spans.
+// Scans for citation+fence pairs: [label](github-url#Lnn) immediately followed
+// (with only whitespace between) by a fenced code block. Only those pairs are
+// extracted — the code goes to the sidebar RefBlock, the citation stays as a
+// markdown link in the prose. Everything else — bare code blocks, mermaid
+// diagrams, code inside lists — is left completely verbatim so react-markdown
+// receives intact, well-formed markdown.
 
 function parseMessage(rawContent: string): ParsedMessage {
   const refs: RefBlock[] = [];
@@ -693,96 +695,45 @@ function parseMessage(rawContent: string): ParsedMessage {
   const outerFenceMatch = rawContent.match(/^```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n?```\s*$/);
   const content = outerFenceMatch ? outerFenceMatch[1] : rawContent;
 
-  const tokenRe = /(\[([^\]]+)\]\((https?:\/\/[^)]+)\))|(`{3}([a-zA-Z0-9_+-]*)\n?([\s\S]*?)`{3})/g;
+  // Match: [label](github-url#Lnn)  <optional whitespace>  ```lang\ncode\n```
+  // The code block part is optional — a citation with no fence still creates a
+  // sidebar card that lazy-fetches its lines.
+  const pairRe =
+    /\[([^\]]+)\]\((https?:\/\/github\.com[^)]+[:#]L?\d+[^)]*)\)(\s*```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```)?/g;
 
   let lastIndex = 0;
   let match: RegExpExecArray | null;
-  // A citation we've seen but haven't yet paired with a code block.
-  let pendingCitation: { label: string; url: string; proseInsertPos: number } | null = null;
   let prose = '';
 
-  while ((match = tokenRe.exec(content)) !== null) {
+  while ((match = pairRe.exec(content)) !== null) {
+    // Keep everything before this match verbatim.
     prose += content.slice(lastIndex, match.index);
     lastIndex = match.index + match[0].length;
 
-    const isCitation = Boolean(match[1]);
-    const isCodeBlock = Boolean(match[4]);
+    const label = match[1];
+    const url   = match[2];
+    const lang  = (match[4] ?? '').toLowerCase();
+    const text  = (match[5] ?? '').trimEnd();
 
-    if (isCitation) {
-      const label = match[2];
-      const url = match[3];
-      const isFileRef = url.includes('github.com') && /[:#]L?\d+/.test(url);
-
-      if (isFileRef) {
-        // Flush any previous pending citation that never got a code block —
-        // create the ref card immediately (RefCard will lazy-fetch lines).
-        if (pendingCitation) {
-          const refIndex = refs.length;
-          refs.push({ index: refIndex, lang: '', text: '', label: pendingCitation.label, url: pendingCitation.url });
-          prose =
-            prose.slice(0, pendingCitation.proseInsertPos) +
-            `[${pendingCitation.label}](${pendingCitation.url})` +
-            prose.slice(pendingCitation.proseInsertPos);
-          pendingCitation = null;
-        }
-        // Record where in `prose` the citation marker should go, but defer
-        // creating the ref until we know if a code block follows.
-        pendingCitation = { label, url, proseInsertPos: prose.length };
-      } else {
-        // Non-file link — plain markdown link.
-        prose += `[${label}](${url})`;
-      }
-    } else if (isCodeBlock) {
-      const lang = (match[5] ?? '').toLowerCase();
-      const text = (match[6] ?? '').trimEnd();
-
-      // Mermaid fences are always rendered inline — never sent to the sidebar.
-      if (lang === 'mermaid') {
-        if (pendingCitation) {
-          // Flush pending citation as a plain link; diagram is not a code ref.
-          prose =
-            prose.slice(0, pendingCitation.proseInsertPos) +
-            `[${pendingCitation.label}](${pendingCitation.url})` +
-            prose.slice(pendingCitation.proseInsertPos);
-          pendingCitation = null;
-        }
-        prose += `\`\`\`mermaid\n${text}\n\`\`\``;
-      } else if (pendingCitation) {
-        // Create the ref card with the code block content (may be empty string).
-        const refIndex = refs.length;
-        refs.push({ index: refIndex, lang, text, label: pendingCitation.label, url: pendingCitation.url });
-        prose =
-          prose.slice(0, pendingCitation.proseInsertPos) +
-          `[${pendingCitation.label}](${pendingCitation.url})` +
-          prose.slice(pendingCitation.proseInsertPos);
-        pendingCitation = null;
-      } else if (text) {
-        // Orphan code block with no citation — render inline.
-        const langTag = lang ? lang : '';
-        prose += `\`\`\`${langTag}\n${text}\n\`\`\``;
-      }
+    // Mermaid fences paired with a citation — treat as a diagram, not a sidebar card.
+    if (lang === 'mermaid') {
+      prose += `[${label}](${url})\n\`\`\`mermaid\n${text}\n\`\`\``;
+      continue;
     }
-  }
 
-  // Flush any trailing pending citation that never got a code block —
-  // create the ref card so it appears in the sidebar (lazy-fetches lines).
-  if (pendingCitation) {
+    // Create the sidebar ref card. If there was no code block the card will
+    // lazy-fetch the lines from GitHub raw content.
     const refIndex = refs.length;
-    refs.push({ index: refIndex, lang: '', text: '', label: pendingCitation.label, url: pendingCitation.url });
-    prose =
-      prose.slice(0, pendingCitation.proseInsertPos) +
-      `[${pendingCitation.label}](${pendingCitation.url})` +
-      prose.slice(pendingCitation.proseInsertPos);
+    refs.push({ index: refIndex, lang, text, label, url });
+    // Keep the citation link in prose so ProseContent can render it as an
+    // interactive span; the code block is consumed into the sidebar.
+    prose += `[${label}](${url})`;
   }
 
+  // Append any remaining content verbatim.
   prose += content.slice(lastIndex);
 
   return { prose, refs };
-}
-
-/** Strip fenced code blocks from content for older (non-latest) messages. */
-function stripCodeFences(content: string): string {
-  return content.replace(/```[\s\S]*?```/g, '').trim();
 }
 
 // ── Global markdown styles (injected once via a <style> tag) ───────────────
