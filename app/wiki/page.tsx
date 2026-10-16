@@ -320,7 +320,13 @@ export default function WikiPage() {
       script.id = 'mermaid-script';
       script.src = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
       script.onload = () =>
-        window.mermaid?.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });
+        window.mermaid?.initialize({
+          startOnLoad: false,
+          theme: 'neutral',
+          securityLevel: 'loose',
+          // Don't inject the "Syntax error" bomb SVG into document.body.
+          suppressErrorRendering: true,
+        });
       document.head.appendChild(script);
     }
   }, []);
@@ -712,20 +718,27 @@ function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, on
 function MermaidBlock({ definition }: { definition: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const idRef = useRef(`mermaid-${Math.random().toString(36).slice(2)}`);
-
   useEffect(() => {
     let cancelled = false;
     // Poll until mermaid is loaded from CDN (usually < 1 s).
     const tryRender = async () => {
+      if (cancelled) return;
       if (!window.mermaid) {
         setTimeout(tryRender, 100);
         return;
       }
+      // Unique id per attempt: mermaid leaves temp elements keyed by id in <body>.
+      const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       try {
-        const { svg: rendered } = await window.mermaid.render(idRef.current, definition);
-        if (!cancelled) setSvg(rendered);
+        const { svg: rendered } = await window.mermaid.render(id, definition);
+        if (!cancelled) {
+          setError(null);
+          setSvg(rendered);
+        }
       } catch (err) {
+        // Remove any error/temp SVG mermaid appended to the page body.
+        document.getElementById(id)?.remove();
+        document.getElementById(`d${id}`)?.remove();
         if (!cancelled) setError(err instanceof Error ? err.message : 'Diagram error');
       }
     };
