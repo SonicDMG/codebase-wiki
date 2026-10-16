@@ -1,0 +1,986 @@
+'use client';
+
+/**
+ * /wiki — Live Walfly Codebase Q&A
+ *
+ * Three-column layout:
+ *   Left   — persistent TOC nav (auto-generated topics)
+ *   Center — prose answers rendered with react-markdown + remark-gfm
+ *   Right  — code reference sidebar; clicking a citation highlights the card
+ */
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+// ── Window extension for highlight.js CDN global ───────────────────────────
+declare global {
+  interface Window {
+    hljs?: {
+      highlightElement: (el: HTMLElement) => void;
+      configure: (opts: Record<string, unknown>) => void;
+    };
+  }
+}
+
+const REPO_URL = 'https://github.com/SonicDMG/walfly';
+
+// ── Walfly design tokens ───────────────────────────────────────────────────
+const c = {
+  amber:     '#F5A623',
+  amberGlow: '#F5A62326',
+} as const;
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  pending?: boolean;
+}
+
+/** A code block extracted from the LLM response, shown in the sidebar. */
+interface RefBlock {
+  index: number;
+  lang: string;
+  text: string;
+  label: string; // e.g. "llm.ts:24"
+  url: string;   // github link
+}
+
+interface ParsedMessage {
+  /** Raw markdown with code fences stripped out (they live in the sidebar). */
+  prose: string;
+  refs: RefBlock[];
+}
+
+interface TocTopic {
+  title: string;
+  description: string;
+  suggestedQuery: string;
+}
+
+// ── Main component ─────────────────────────────────────────────────────────
+
+export default function WikiPage() {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: 'welcome',
+      role: 'assistant',
+      content:
+        'Hi! Ask me anything about the Walfly codebase. I read the current source directly from GitHub, so my answers always reflect the latest code.\n\nClick any topic in the left panel to get started, or type your own question below.',
+    },
+  ]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [activeRef, setActiveRef] = useState<number | null>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(380);
+  const [tocTopics, setTocTopics] = useState<TocTopic[]>([]);
+  const [tocLoading, setTocLoading] = useState(true);
+  const [activeTopic, setActiveTopic] = useState<number | null>(null);
+
+  const isDragging = useRef(false);
+  const dragStartX = useRef(0);
+  const dragStartWidth = useRef(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // ── Load TOC on mount ─────────────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/wiki/toc');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { topics?: TocTopic[] };
+        if (!cancelled && Array.isArray(data.topics)) setTocTopics(data.topics);
+      } catch (err) {
+        console.warn('[wiki] TOC load failed:', err);
+      } finally {
+        if (!cancelled) setTocLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── highlight.js from CDN ─────────────────────────────────────────────────
+  useEffect(() => {
+    let link = document.getElementById('hljs-css') as HTMLLinkElement | null;
+    if (!link) {
+      link = document.createElement('link');
+      link.id = 'hljs-css';
+      link.rel = 'stylesheet';
+      document.head.appendChild(link);
+    }
+    link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/tokyo-night-dark.min.css';
+
+    if (!document.getElementById('hljs-script')) {
+      const script = document.createElement('script');
+      script.id = 'hljs-script';
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js';
+      script.onload = () => window.hljs?.configure({ ignoreUnescapedHTML: true });
+      document.head.appendChild(script);
+    }
+  }, []);
+
+  // ── Drag-to-resize sidebar ────────────────────────────────────────────────
+  const onDividerMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isDragging.current = true;
+    dragStartX.current = e.clientX;
+    dragStartWidth.current = sidebarWidth;
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const containerW = containerRef.current.offsetWidth;
+      const delta = dragStartX.current - ev.clientX;
+      const next = Math.min(Math.max(dragStartWidth.current + delta, 240), containerW - 320);
+      setSidebarWidth(next);
+    };
+    const onMouseUp = () => {
+      isDragging.current = false;
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  }, [sidebarWidth]);
+
+  // Auto-scroll to bottom on new messages.
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const latestAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
+
+  // ── Send ──────────────────────────────────────────────────────────────────
+  const send = useCallback(async (overrideQuestion?: string) => {
+    const question = (overrideQuestion ?? input).trim();
+    if (!question || loading) return;
+
+    if (!overrideQuestion) setInput('');
+    setLoading(true);
+    setActiveRef(null);
+
+    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question };
+    const assistantId = crypto.randomUUID();
+    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', pending: true };
+
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+
+    const history = [...messages, userMsg].map((m) => ({ role: m.role, content: m.content }));
+
+    try {
+      const res = await fetch('/api/wiki/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? { ...m, content: `Error: ${(err as { error?: string }).error ?? 'Unknown error'}`, pending: false }
+              : m,
+          ),
+        );
+        return;
+      }
+
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder();
+      if (!reader) throw new Error('No response body');
+
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') break;
+          try {
+            const parsed = JSON.parse(data) as { token?: string; error?: string };
+            if (parsed.error) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, content: m.content + `\n\nError: ${parsed.error}`, pending: false }
+                    : m,
+                ),
+              );
+            } else if (parsed.token) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, content: m.content + parsed.token } : m,
+                ),
+              );
+            }
+          } catch { /* partial line */ }
+        }
+      }
+    } catch (err) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? { ...m, content: `Network error: ${err instanceof Error ? err.message : String(err)}`, pending: false }
+            : m,
+        ),
+      );
+    } finally {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, pending: false } : m)),
+      );
+      setLoading(false);
+      inputRef.current?.focus();
+    }
+  }, [input, loading, messages]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void send();
+    }
+  };
+
+  const handleTopicClick = (topic: TocTopic, idx: number) => {
+    setActiveTopic(idx);
+    void send(topic.suggestedQuery);
+  };
+
+  const parsedLatest = latestAssistantMsg ? parseMessage(latestAssistantMsg.content) : null;
+
+  return (
+    <div style={styles.root}>
+      <GlobalMdStyles />
+      {/* ── Header ── */}
+      <header style={styles.header}>
+        <span style={styles.title}>Walfly Wiki</span>
+        <span style={styles.subtitle}> — live codebase Q&A</span>
+        <a href={REPO_URL} target="_blank" rel="noreferrer" style={styles.repoLink}>
+          SonicDMG/walfly ↗
+        </a>
+      </header>
+
+      {/* ── Body ── */}
+      <div ref={containerRef} style={styles.body}>
+
+        {/* Left: TOC nav */}
+        <nav style={styles.tocPane}>
+          <div style={styles.tocHeading}>Topics</div>
+          {tocLoading ? (
+            <div style={styles.tocLoading}>Loading topics…</div>
+          ) : tocTopics.length === 0 ? (
+            <div style={styles.tocLoading}>No topics available.</div>
+          ) : (
+            tocTopics.map((topic, idx) => (
+              <button
+                key={idx}
+                style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
+                onClick={() => handleTopicClick(topic, idx)}
+                title={topic.description}
+                disabled={loading}
+              >
+                {topic.title}
+              </button>
+            ))
+          )}
+        </nav>
+
+        <div style={styles.tocDivider} />
+
+        {/* Center: chat */}
+        <div style={styles.chatPane}>
+          <div style={styles.messageList}>
+            {messages.map((msg) => (
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                isLatestAssistant={msg.id === latestAssistantMsg?.id}
+                parsedLatest={parsedLatest}
+                activeRef={activeRef}
+                onCitationClick={(idx) => setActiveRef(idx)}
+              />
+            ))}
+            <div ref={bottomRef} />
+          </div>
+        </div>
+
+        {/* Drag handle */}
+        <div style={styles.divider} onMouseDown={onDividerMouseDown} title="Drag to resize" />
+
+        {/* Right: code reference sidebar */}
+        <aside style={{ ...styles.sidebar, width: sidebarWidth, flexShrink: 0 }}>
+          <Sidebar
+            refs={parsedLatest?.refs ?? []}
+            activeRef={activeRef}
+            onRefClick={(idx) => setActiveRef(idx)}
+          />
+        </aside>
+      </div>
+
+      {/* ── Input ── */}
+      <footer style={styles.footer}>
+        <div style={styles.inputRow}>
+          <textarea
+            ref={inputRef}
+            style={styles.textarea}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask about any part of the codebase… (Enter to send, Shift+Enter for newline)"
+            rows={2}
+            disabled={loading}
+            autoFocus
+          />
+          <button
+            onClick={() => void send()}
+            disabled={loading || !input.trim()}
+            style={styles.sendBtn}
+          >
+            {loading ? '…' : '→'}
+          </button>
+        </div>
+        <p style={styles.hint}>Grounded in the current GitHub source — citations open in GitHub.</p>
+      </footer>
+    </div>
+  );
+}
+
+// ── MessageBubble ──────────────────────────────────────────────────────────
+
+interface MessageBubbleProps {
+  message: Message;
+  isLatestAssistant: boolean;
+  parsedLatest: ParsedMessage | null;
+  activeRef: number | null;
+  onCitationClick: (idx: number) => void;
+}
+
+function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, onCitationClick }: MessageBubbleProps) {
+  const isUser = message.role === 'user';
+  return (
+    <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant) }}>
+      <div style={styles.bubbleRole}>{isUser ? 'You' : 'Wiki'}</div>
+      {message.pending && !message.content ? (
+        <span style={styles.pending}>thinking…</span>
+      ) : isLatestAssistant && parsedLatest ? (
+        <ProseContent
+          prose={parsedLatest.prose}
+          refs={parsedLatest.refs}
+          activeRef={activeRef}
+          onCitationClick={onCitationClick}
+        />
+      ) : (
+        <MarkdownContent content={stripCodeFences(message.content)} />
+      )}
+    </div>
+  );
+}
+
+// ── MarkdownContent — plain react-markdown render (older messages) ─────────
+
+function MarkdownContent({ content }: { content: string }) {
+  return (
+    <div className="md-prose">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a({ href, children }) {
+            return (
+              <a href={href} target="_blank" rel="noreferrer">
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+// ── ProseContent — latest message with clickable citation spans ────────────
+//
+// The LLM emits citations as [label](github-url). We replace each file-ref
+// citation with a styled <span> that highlights the matching sidebar card.
+// Everything else is standard markdown rendered by react-markdown.
+
+interface ProseContentProps {
+  prose: string;
+  refs: RefBlock[];
+  activeRef: number | null;
+  onCitationClick: (idx: number) => void;
+}
+
+function ProseContent({ prose, refs, activeRef, onCitationClick }: ProseContentProps) {
+  // Build a lookup from label → refIndex so the custom link renderer can
+  // detect which markdown links are citations.
+  const citationMap = new Map(refs.map((r) => [r.label, r.index]));
+
+  return (
+    <div className="md-prose">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Replace citation links with interactive spans; leave normal links alone.
+          a({ href, children }) {
+            const label = Array.isArray(children)
+              ? children.map((ch) => (typeof ch === 'string' ? ch : '')).join('')
+              : typeof children === 'string' ? children : String(children ?? '');
+            const refIndex = citationMap.get(label);
+            if (refIndex !== undefined) {
+              const isActive = activeRef === refIndex;
+              return (
+                <span
+                  style={{ ...styles.citationSpan, ...(isActive ? styles.citationActive : {}) }}
+                  onClick={() => onCitationClick(refIndex)}
+                  title={`View ${label} in sidebar`}
+                >
+                  {label}
+                </span>
+              );
+            }
+            return (
+              <a href={href} target="_blank" rel="noreferrer" style={styles.link}>
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {prose}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+// ── Sidebar ────────────────────────────────────────────────────────────────
+
+interface SidebarProps {
+  refs: RefBlock[];
+  activeRef: number | null;
+  onRefClick: (idx: number) => void;
+}
+
+function Sidebar({ refs, activeRef, onRefClick }: SidebarProps) {
+  const cardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  useEffect(() => {
+    if (activeRef === null) return;
+    const el = cardRefs.current.get(activeRef);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [activeRef]);
+
+  if (refs.length === 0) {
+    return (
+      <div style={styles.sidebarEmpty}>
+        <p style={styles.sidebarEmptyText}>
+          Code references from the current answer will appear here.
+          <br /><br />
+          Click any citation in the answer to jump to it.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.sidebarContent}>
+      <div style={styles.sidebarHeading}>References</div>
+      {refs.map((ref) => (
+        <RefCard
+          key={ref.index}
+          ref_={ref}
+          isActive={activeRef === ref.index}
+          onClick={() => onRefClick(ref.index)}
+          cardRef={(el) => {
+            if (el) cardRefs.current.set(ref.index, el);
+            else cardRefs.current.delete(ref.index);
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+// ── RefCard ────────────────────────────────────────────────────────────────
+
+interface RefCardProps {
+  ref_: RefBlock;
+  isActive: boolean;
+  onClick: () => void;
+  cardRef: (el: HTMLDivElement | null) => void;
+}
+
+function RefCard({ ref_, isActive, onClick, cardRef }: RefCardProps) {
+  const codeRef = useRef<HTMLElement>(null);
+  const [fetchedText, setFetchedText] = useState<string | null>(null);
+  const [fetching, setFetching] = useState(false);
+
+  // If the LLM cited this file without providing a code block, fetch the
+  // relevant lines directly from GitHub raw content.
+  useEffect(() => {
+    if (ref_.text || fetchedText !== null || fetching) return;
+    const rawUrl = githubBlobToRaw(ref_.url);
+    if (!rawUrl) return;
+    setFetching(true);
+    fetch(rawUrl)
+      .then((r) => r.text())
+      .then((src) => {
+        const lines = extractLines(src, ref_.url);
+        setFetchedText(lines);
+      })
+      .catch(() => setFetchedText(''))
+      .finally(() => setFetching(false));
+  }, [ref_.url, ref_.text, fetchedText, fetching]);
+
+  const displayText = ref_.text || fetchedText || '';
+
+  useEffect(() => {
+    if (displayText && codeRef.current && window.hljs) {
+      window.hljs.highlightElement(codeRef.current);
+    }
+  }, [displayText]);
+
+  const filename = ref_.label.replace(/:\d+$/, '');
+
+  return (
+    <div
+      ref={cardRef}
+      style={{ ...styles.refCard, ...(isActive ? styles.refCardActive : {}) }}
+      onClick={onClick}
+    >
+      <div style={styles.refCardHeader}>
+        <a
+          href={ref_.url}
+          target="_blank"
+          rel="noreferrer"
+          style={styles.refCardFilenameLink}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {filename}
+        </a>
+        <a
+          href={ref_.url}
+          target="_blank"
+          rel="noreferrer"
+          style={styles.refCardLink}
+          onClick={(e) => e.stopPropagation()}
+        >
+          ↗
+        </a>
+      </div>
+      <pre style={styles.refCodeBlock}>
+        {fetching && !displayText ? (
+          <code style={{ color: w.textFaint, fontStyle: 'italic' }}>loading…</code>
+        ) : (
+          <code ref={codeRef} className={ref_.lang ? `language-${ref_.lang}` : undefined}>
+            {displayText}
+          </code>
+        )}
+      </pre>
+    </div>
+  );
+}
+
+/** Convert a github.com blob URL to a raw.githubusercontent.com URL. */
+function githubBlobToRaw(url: string): string | null {
+  // https://github.com/owner/repo/blob/branch/path/file.ext#L10-L20
+  const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+?)(?:#.*)?$/);
+  if (!m) return null;
+  const [, owner, repo, branch, path] = m;
+  return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
+}
+
+/** Extract the lines referenced by the #L<n> or #L<n>-L<m> anchor from source text. */
+function extractLines(src: string, url: string): string {
+  const lines = src.split('\n');
+  const anchor = url.match(/#L(\d+)(?:-L(\d+))?$/);
+  if (!anchor) return src.slice(0, 3000); // no anchor — show first ~100 lines
+  const start = Math.max(1, parseInt(anchor[1], 10)) - 1;
+  const end = anchor[2] ? Math.min(lines.length, parseInt(anchor[2], 10)) : start + 1;
+  return lines.slice(start, end).join('\n');
+}
+
+// ── Parser ─────────────────────────────────────────────────────────────────
+//
+// Separates fenced code blocks (→ sidebar RefBlocks) from the prose markdown.
+// The prose is returned as a plain markdown string ready for react-markdown.
+// Citations ([label](github-url#Lnn)) remain as standard markdown links —
+// ProseContent's custom <a> renderer turns them into interactive spans.
+
+function parseMessage(rawContent: string): ParsedMessage {
+  const refs: RefBlock[] = [];
+
+  // If the LLM wrapped its entire response in a single outer fence, unwrap it.
+  const outerFenceMatch = rawContent.match(/^```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n?```\s*$/);
+  const content = outerFenceMatch ? outerFenceMatch[1] : rawContent;
+
+  const tokenRe = /(\[([^\]]+)\]\((https?:\/\/[^)]+)\))|(`{3}([a-zA-Z0-9_+-]*)\n?([\s\S]*?)`{3})/g;
+
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  // A citation we've seen but haven't yet paired with a code block.
+  let pendingCitation: { label: string; url: string; proseInsertPos: number } | null = null;
+  let prose = '';
+
+  while ((match = tokenRe.exec(content)) !== null) {
+    prose += content.slice(lastIndex, match.index);
+    lastIndex = match.index + match[0].length;
+
+    const isCitation = Boolean(match[1]);
+    const isCodeBlock = Boolean(match[4]);
+
+    if (isCitation) {
+      const label = match[2];
+      const url = match[3];
+      const isFileRef = url.includes('github.com') && /[:#]L?\d+/.test(url);
+
+      if (isFileRef) {
+        // Flush any previous pending citation that never got a code block —
+        // create the ref card immediately (RefCard will lazy-fetch lines).
+        if (pendingCitation) {
+          const refIndex = refs.length;
+          refs.push({ index: refIndex, lang: '', text: '', label: pendingCitation.label, url: pendingCitation.url });
+          prose =
+            prose.slice(0, pendingCitation.proseInsertPos) +
+            `[${pendingCitation.label}](${pendingCitation.url})` +
+            prose.slice(pendingCitation.proseInsertPos);
+          pendingCitation = null;
+        }
+        // Record where in `prose` the citation marker should go, but defer
+        // creating the ref until we know if a code block follows.
+        pendingCitation = { label, url, proseInsertPos: prose.length };
+      } else {
+        // Non-file link — plain markdown link.
+        prose += `[${label}](${url})`;
+      }
+    } else if (isCodeBlock) {
+      const lang = (match[5] ?? '').toLowerCase();
+      const text = (match[6] ?? '').trimEnd();
+
+      if (pendingCitation) {
+        // Create the ref card with the code block content (may be empty string).
+        const refIndex = refs.length;
+        refs.push({ index: refIndex, lang, text, label: pendingCitation.label, url: pendingCitation.url });
+        prose =
+          prose.slice(0, pendingCitation.proseInsertPos) +
+          `[${pendingCitation.label}](${pendingCitation.url})` +
+          prose.slice(pendingCitation.proseInsertPos);
+        pendingCitation = null;
+      } else if (text) {
+        // Orphan code block with no citation — render inline.
+        const langTag = lang ? lang : '';
+        prose += `\`\`\`${langTag}\n${text}\n\`\`\``;
+      }
+    }
+  }
+
+  // Flush any trailing pending citation that never got a code block —
+  // create the ref card so it appears in the sidebar (lazy-fetches lines).
+  if (pendingCitation) {
+    const refIndex = refs.length;
+    refs.push({ index: refIndex, lang: '', text: '', label: pendingCitation.label, url: pendingCitation.url });
+    prose =
+      prose.slice(0, pendingCitation.proseInsertPos) +
+      `[${pendingCitation.label}](${pendingCitation.url})` +
+      prose.slice(pendingCitation.proseInsertPos);
+  }
+
+  prose += content.slice(lastIndex);
+
+  return { prose, refs };
+}
+
+/** Strip fenced code blocks from content for older (non-latest) messages. */
+function stripCodeFences(content: string): string {
+  return content.replace(/```[\s\S]*?```/g, '').trim();
+}
+
+// ── Global markdown styles (injected once via a <style> tag) ───────────────
+//
+// react-markdown renders real HTML elements (p, h1, table, etc.) so we style
+// them with a scoped CSS class rather than inline style objects.
+
+const MD_CSS = `
+.md-prose { color: #1a1a1f; line-height: 1.7; }
+.md-prose p  { margin: 0 0 0.75em; }
+.md-prose p:last-child { margin-bottom: 0; }
+.md-prose h1 { font-family: Georgia, serif; font-size: 20px; font-weight: 700; margin: 0.8em 0 0.3em; border-bottom: 1px solid #e2e4e8; padding-bottom: 4px; }
+.md-prose h2 { font-family: Georgia, serif; font-size: 17px; font-weight: 700; margin: 0.8em 0 0.3em; }
+.md-prose h3 { font-size: 15px; font-weight: 600; color: #57606a; margin: 0.6em 0 0.2em; }
+.md-prose ul, .md-prose ol { margin: 0 0 0.75em; padding-left: 22px; }
+.md-prose li { margin-bottom: 4px; }
+.md-prose hr { border: none; border-top: 1px solid #e2e4e8; margin: 12px 0; }
+.md-prose code { background: #f7f8fa; border: 1px solid #e2e4e8; border-radius: 3px; padding: 1px 5px; font-size: 13px; font-family: ui-monospace,"SF Mono",Consolas,monospace; color: #c2185b; }
+.md-prose pre  { margin: 0 0 0.75em; border-radius: 6px; overflow-x: auto; }
+.md-prose pre code { background: none; border: none; padding: 0; color: inherit; font-size: 12px; }
+.md-prose blockquote { border-left: 3px solid #e2e4e8; margin: 0 0 0.75em; padding: 2px 0 2px 14px; color: #57606a; }
+.md-prose strong { font-weight: 600; }
+.md-prose em { font-style: italic; }
+.md-prose table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-bottom: 0.75em; }
+.md-prose th { padding: 7px 12px; text-align: left; font-weight: 600; font-size: 12px; color: #57606a; background: #f7f8fa; border-bottom: 2px solid #e2e4e8; white-space: nowrap; }
+.md-prose td { padding: 7px 12px; border-bottom: 1px solid #e2e4e8; vertical-align: top; }
+.md-prose tr:nth-child(even) td { background: #f7f8fa; }
+.md-prose a { color: #F5A623; text-decoration: none; }
+.md-prose a:hover { text-decoration: underline; }
+`;
+
+function GlobalMdStyles() {
+  return <style dangerouslySetInnerHTML={{ __html: MD_CSS }} />;
+}
+
+// ── Styles ─────────────────────────────────────────────────────────────────
+
+const w = {
+  bg:          '#ffffff',
+  surface:     '#f7f8fa',
+  border:      '#e2e4e8',
+  text:        '#1a1a1f',
+  textMuted:   '#57606a',
+  textFaint:   '#8b949e',
+  amber:       c.amber,
+  amberLight:  '#fff7e6',
+  amberBorder: '#fcd389',
+  codeBg:      '#1E1E22',
+  codeBorder:  '#2A2A2F',
+  codeText:    '#e2e4e8',
+} as const;
+
+const styles = {
+  root: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    height: '100dvh',
+    fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+    fontSize: '15px',
+    lineHeight: 1.65,
+    color: w.text,
+    background: w.bg,
+  },
+  header: {
+    borderBottom: `1px solid ${w.border}`,
+    padding: '10px 20px',
+    flexShrink: 0,
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    background: w.bg,
+  },
+  title: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontWeight: 700,
+    fontSize: '17px',
+    color: w.text,
+    letterSpacing: '0.5px',
+  },
+  subtitle: { color: w.textMuted, fontSize: '13px', flex: 1 },
+  repoLink:  { color: w.amber, textDecoration: 'none', fontSize: '12px' },
+  body: { flex: 1, display: 'flex', overflow: 'hidden' },
+
+  // TOC
+  tocPane: {
+    width: '220px',
+    flexShrink: 0,
+    overflowY: 'auto' as const,
+    background: w.surface,
+    borderRight: `1px solid ${w.border}`,
+    padding: '16px 0',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '2px',
+  },
+  tocHeading: {
+    fontSize: '10px',
+    fontWeight: 600,
+    color: w.textFaint,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.1em',
+    padding: '0 16px 8px',
+  },
+  tocLoading: { padding: '8px 16px', fontSize: '13px', color: w.textFaint, fontStyle: 'italic' as const },
+  tocItem: {
+    display: 'block',
+    width: '100%',
+    textAlign: 'left' as const,
+    paddingTop: '7px',
+    paddingBottom: '7px',
+    paddingLeft: '16px',
+    paddingRight: '16px',
+    background: 'none',
+    borderTop: 'none',
+    borderRight: 'none',
+    borderBottom: 'none',
+    borderLeft: 'none',
+    fontSize: '13px',
+    color: w.textMuted,
+    cursor: 'pointer',
+    lineHeight: 1.4,
+  },
+  tocItemActive: {
+    background: w.amberLight,
+    color: '#92600a',
+    fontWeight: 600,
+    borderLeft: `3px solid ${w.amber}`,
+    paddingLeft: '13px',
+  },
+  tocDivider: { width: '1px', flexShrink: 0, background: w.border },
+
+  // Chat
+  chatPane: {
+    flex: 1,
+    overflowY: 'auto' as const,
+    padding: '20px 24px',
+    minWidth: 0,
+    background: w.bg,
+  },
+  messageList: { display: 'flex', flexDirection: 'column' as const, gap: '20px' },
+  divider: { width: '4px', flexShrink: 0, cursor: 'col-resize', background: w.border },
+
+  // Bubbles
+  bubble: { borderRadius: '8px', padding: '12px 16px' },
+  bubbleUser: {
+    background: w.amberLight,
+    border: `1px solid ${w.amberBorder}`,
+    alignSelf: 'flex-end' as const,
+    maxWidth: '80%',
+    borderBottomRightRadius: '3px',
+  },
+  bubbleAssistant: {
+    background: w.bg,
+    border: `1px solid ${w.border}`,
+    width: '100%',
+    borderBottomLeftRadius: '3px',
+  },
+  bubbleRole: {
+    fontSize: '10px',
+    fontWeight: 600,
+    color: w.textFaint,
+    marginBottom: '6px',
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.08em',
+  },
+  pending: { color: w.textMuted, fontStyle: 'italic' as const },
+
+  // Citation pills
+  citationSpan: {
+    display: 'inline-block',
+    padding: '1px 7px',
+    borderRadius: '4px',
+    background: w.amberLight,
+    border: `1px solid ${w.amberBorder}`,
+    color: '#92600a',
+    fontSize: '12px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    cursor: 'pointer',
+    userSelect: 'none' as const,
+    whiteSpace: 'nowrap' as const,
+    verticalAlign: 'middle' as const,
+    margin: '0 2px',
+  },
+  citationActive: {
+    background: w.amber,
+    border: `1px solid ${w.amber}`,
+    color: '#1a1a1f',
+  },
+  link: { color: w.amber, textDecoration: 'none' },
+
+  // Sidebar
+  sidebar: { overflowY: 'auto' as const, background: w.surface, borderLeft: `1px solid ${w.border}` },
+  sidebarEmpty: { height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '32px' },
+  sidebarEmptyText: { color: w.textFaint, fontSize: '13px', textAlign: 'center' as const, lineHeight: 1.7, margin: 0 },
+  sidebarContent: { padding: '16px', display: 'flex', flexDirection: 'column' as const, gap: '12px' },
+  sidebarHeading: {
+    fontSize: '10px',
+    fontWeight: 600,
+    color: w.textFaint,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.1em',
+  },
+
+  // Ref cards
+  refCard: {
+    borderRadius: '8px',
+    border: `1px solid ${w.border}`,
+    background: w.bg,
+    overflow: 'hidden',
+    cursor: 'pointer',
+    transition: 'border-color 0.15s',
+  },
+  refCardActive: { border: `2px solid ${w.amber}`, boxShadow: `0 0 0 3px ${c.amberGlow}` },
+  refCardHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '7px 12px',
+    borderBottom: `1px solid ${w.codeBorder}`,
+    background: w.codeBg,
+  },
+  refCardFilename: {
+    fontSize: '12px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    color: w.codeText,
+    fontWeight: 500,
+  },
+  refCardFilenameLink: {
+    fontSize: '12px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    color: w.codeText,
+    fontWeight: 500,
+    textDecoration: 'none',
+  },
+  refCardLink: { fontSize: '11px', color: w.amber, textDecoration: 'none' },
+  refCodeBlock: {
+    margin: 0,
+    padding: '12px',
+    fontSize: '12px',
+    lineHeight: 1.5,
+    overflowX: 'auto' as const,
+    maxHeight: '320px',
+    overflowY: 'auto' as const,
+    background: w.codeBg,
+    borderRadius: '0 0 8px 8px',
+  },
+
+  // Footer
+  footer: { borderTop: `1px solid ${w.border}`, padding: '12px 20px', flexShrink: 0, background: w.bg },
+  inputRow: { display: 'flex', gap: '8px' },
+  textarea: {
+    flex: 1,
+    padding: '10px 14px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '20px',
+    fontSize: '14px',
+    lineHeight: 1.5,
+    fontFamily: 'inherit',
+    resize: 'none' as const,
+    outline: 'none',
+    background: w.surface,
+    color: w.text,
+  },
+  sendBtn: {
+    width: '38px',
+    height: '38px',
+    borderRadius: '50%',
+    background: w.amber,
+    color: '#1a1a1f',
+    border: 'none',
+    fontSize: '18px',
+    fontWeight: 700,
+    cursor: 'pointer',
+    flexShrink: 0,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hint: { margin: '6px 0 0', fontSize: '11px', color: w.textFaint },
+} as const;
