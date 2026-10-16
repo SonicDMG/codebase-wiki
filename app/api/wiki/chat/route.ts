@@ -260,6 +260,9 @@ DIAGRAM RULES:
 7. Prefer diagrams for: call flows, pipeline stages, database relationships, state transitions,
    class/module dependencies, and request/response sequences.
 8. Keep diagrams focused — 5 to 15 nodes. Use descriptive labels.
+   SYNTAX: ALWAYS wrap node labels and edge labels in double quotes, e.g. A["Local Buffer (OPFS)"] and
+   A -->|"HTTPS (session, segments)"| B. Unquoted parentheses, slashes or colons inside labels break the parser.
+   Use ASCII hyphens only (never non-breaking hyphens such as ‑) and <br> for line breaks.
 9. Mermaid diagrams are rendered visually in the UI — do NOT wrap them in citation links.
    Place the diagram after the explanatory prose, before or after code citations.
 

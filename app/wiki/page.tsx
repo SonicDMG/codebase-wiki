@@ -715,6 +715,17 @@ function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, on
 
 // ── MermaidBlock — renders a mermaid fence as an inline SVG diagram ────────
 
+/**
+ * Best-effort repair for common LLM mistakes: unquoted labels containing
+ * parentheses etc. inside [...] nodes or |...| edge labels, and non-ASCII hyphens.
+ */
+function repairMermaid(def: string): string {
+  return def
+    .replace(/[\u2010\u2011\u2012\u2013]/g, '-')
+    .replace(/\[([^\]"\n]*[(){}:/][^\]"\n]*)\]/g, '["$1"]')
+    .replace(/\|([^|"\n]*[(){}:/][^|"\n]*)\|/g, '|"$1"|');
+}
+
 function MermaidBlock({ definition }: { definition: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -728,17 +739,30 @@ function MermaidBlock({ definition }: { definition: string }) {
         return;
       }
       // Unique id per attempt: mermaid leaves temp elements keyed by id in <body>.
-      const id = `mermaid-${Math.random().toString(36).slice(2)}`;
+      const attempt = async (src: string) => {
+        const id = `mermaid-${Math.random().toString(36).slice(2)}`;
+        try {
+          return await window.mermaid!.render(id, src);
+        } finally {
+          // Remove any temp/error SVG mermaid appended to the page body.
+          document.getElementById(id)?.remove();
+          document.getElementById(`d${id}`)?.remove();
+        }
+      };
       try {
-        const { svg: rendered } = await window.mermaid.render(id, definition);
+        let result;
+        try {
+          result = await attempt(definition);
+        } catch (firstErr) {
+          const repaired = repairMermaid(definition);
+          if (repaired === definition) throw firstErr;
+          result = await attempt(repaired);
+        }
         if (!cancelled) {
           setError(null);
-          setSvg(rendered);
+          setSvg(result.svg);
         }
       } catch (err) {
-        // Remove any error/temp SVG mermaid appended to the page body.
-        document.getElementById(id)?.remove();
-        document.getElementById(`d${id}`)?.remove();
         if (!cancelled) setError(err instanceof Error ? err.message : 'Diagram error');
       }
     };
