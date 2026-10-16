@@ -89,4 +89,7 @@ export interface SyncOutcome extends SyncResult {
   status: 'synced' | 'unmodified' | 'locked';
   /** Human-readable summary of what changed (only for status 'synced'). */
   changeSummary?: string;
+  rateLimited?: boolean;
+  retryAfterSeconds?: number | null;
+  warning?: string;
 }

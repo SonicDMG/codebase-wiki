@@ -25,6 +25,9 @@ export async function POST(req: NextRequest) {
       headSha: outcome.headSha,
       topics: toPublicTopics(outcome.topics),
       ...(outcome.changeSummary ? { changeSummary: outcome.changeSummary } : {}),
+      ...(outcome.rateLimited !== undefined ? { rateLimited: outcome.rateLimited } : {}),
+      ...(outcome.retryAfterSeconds !== undefined ? { retryAfterSeconds: outcome.retryAfterSeconds } : {}),
+      ...(outcome.warning !== undefined ? { warning: outcome.warning } : {}),
     });
   } catch (err) {
     console.error('[wiki/sync] failed:', err);

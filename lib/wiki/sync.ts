@@ -45,11 +45,15 @@ export function toPublicTopics(topics: WikiTopicDoc[]): PublicTopic[] {
   }));
 }
 
+const seedingBranches = new Set<string>();
+
 // ── ensureTopics ──────────────────────────────────────────────────────────────
 
 /**
  * Returns stored topics + snapshot for a branch. If either is missing,
- * runs initial generation and persists the result.
+ * attempts branch seeding from the nearest stored branch (e.g. main)
+ * followed by an incremental sync against the branch head. If no stored
+ * branches exist, runs initial generation and persists the result.
  */
 export async function ensureTopics(
   branch: string,
@@ -63,6 +67,55 @@ export async function ensureTopics(
     hadTopics = stored.length > 0;
   } catch (err) {
     console.warn('[wiki] Astra read failed, will try generation:', err);
+  }
+
+  // Branch seeding: when branch has no stored topics/snapshot, copy from nearest stored branch
+  if (!seedingBranches.has(branch)) {
+    seedingBranches.add(branch);
+    try {
+      const storedBranches = (await getStoredBranches()).filter((b) => b !== branch);
+      const donor = storedBranches.includes('main') ? 'main' : storedBranches[0];
+      if (donor) {
+        const [donorTopics, donorSnapshot] = await Promise.all([
+          getStoredTopics(donor),
+          getSnapshot(donor),
+        ]);
+        if (donorTopics.length > 0 && donorSnapshot) {
+          const now = new Date().toISOString();
+          const seededTopics: WikiTopicDoc[] = donorTopics.map((t) => ({
+            ...t,
+            _id: `${branch}:${t.slug}`,
+            branch,
+          }));
+          const seededSnapshot: WikiSnapshotDoc = {
+            ...donorSnapshot,
+            _id: `${branch}:snapshot`,
+            branch,
+            lastEtag: null,
+            leaseUntil: null,
+            lastCheckedAt: now,
+          };
+          if (hadTopics) await deleteTopicsForBranch(branch);
+          await saveTopics(seededTopics);
+          await saveSnapshot(seededSnapshot);
+          console.log(`[wiki] seeded branch "${branch}" from "${donor}" (${seededTopics.length} topics)`);
+
+          // Run syncBranch to diff against the new branch head
+          try {
+            const outcome = await syncBranch(branch);
+            const finalSnapshot = (await getSnapshot(branch)) ?? seededSnapshot;
+            return { topics: outcome.topics, snapshot: finalSnapshot, generated: false };
+          } catch (syncErr) {
+            console.warn(`[wiki] syncBranch after seeding failed for "${branch}", returning seeded topics:`, syncErr);
+            return { topics: seededTopics, snapshot: seededSnapshot, generated: false };
+          }
+        }
+      }
+    } catch (seedErr) {
+      console.warn('[wiki] branch seeding failed, falling back to full generation:', seedErr);
+    } finally {
+      seedingBranches.delete(branch);
+    }
   }
 
   const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
