@@ -13,12 +13,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-// ── Window extension for highlight.js CDN global ───────────────────────────
+// ── Window extensions for CDN globals ─────────────────────────────────────
 declare global {
   interface Window {
     hljs?: {
       highlightElement: (el: HTMLElement) => void;
       configure: (opts: Record<string, unknown>) => void;
+    };
+    mermaid?: {
+      initialize: (config: Record<string, unknown>) => void;
+      render: (id: string, definition: string) => Promise<{ svg: string }>;
     };
   }
 }
@@ -105,7 +109,7 @@ export default function WikiPage() {
     return () => { cancelled = true; };
   }, []);
 
-  // ── highlight.js from CDN ─────────────────────────────────────────────────
+  // ── highlight.js + Mermaid from CDN ──────────────────────────────────────
   useEffect(() => {
     let link = document.getElementById('hljs-css') as HTMLLinkElement | null;
     if (!link) {
@@ -121,6 +125,15 @@ export default function WikiPage() {
       script.id = 'hljs-script';
       script.src = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/highlight.min.js';
       script.onload = () => window.hljs?.configure({ ignoreUnescapedHTML: true });
+      document.head.appendChild(script);
+    }
+
+    if (!document.getElementById('mermaid-script')) {
+      const script = document.createElement('script');
+      script.id = 'mermaid-script';
+      script.src = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
+      script.onload = () =>
+        window.mermaid?.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });
       document.head.appendChild(script);
     }
   }, []);
@@ -386,23 +399,84 @@ function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, on
   );
 }
 
+// ── MermaidBlock — renders a mermaid fence as an inline SVG diagram ────────
+
+function MermaidBlock({ definition }: { definition: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const idRef = useRef(`mermaid-${Math.random().toString(36).slice(2)}`);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Poll until mermaid is loaded from CDN (usually < 1 s).
+    const tryRender = async () => {
+      if (!window.mermaid) {
+        setTimeout(tryRender, 100);
+        return;
+      }
+      try {
+        const { svg: rendered } = await window.mermaid.render(idRef.current, definition);
+        if (!cancelled) setSvg(rendered);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Diagram error');
+      }
+    };
+    void tryRender();
+    return () => { cancelled = true; };
+  }, [definition]);
+
+  if (error) {
+    return (
+      <pre style={styles.diagramError}>
+        <code>{definition}</code>
+        <span style={styles.diagramErrorMsg}>⚠ {error}</span>
+      </pre>
+    );
+  }
+  if (!svg) {
+    return <div style={styles.diagramLoading}>rendering diagram…</div>;
+  }
+  return (
+    <div
+      style={styles.diagramWrapper}
+      // mermaid returns a sanitised SVG string — safe to set as innerHTML
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
+  );
+}
+
+// ── Shared component overrides for react-markdown ─────────────────────────
+//
+// Handles mermaid fences (→ diagram) and all other code fences (→ hljs block).
+// Receives an optional citation/link override for ProseContent.
+
+type AnchorOverride = (props: { href?: string; children?: React.ReactNode }) => React.ReactElement;
+
+function buildComponents(anchorOverride?: AnchorOverride) {
+  const anchorFn: AnchorOverride = anchorOverride ?? (({ href, children }) => (
+    <a href={href} target="_blank" rel="noreferrer">{children}</a>
+  ));
+  return {
+    a: anchorFn,
+    code({ className, children, ...rest }: React.HTMLAttributes<HTMLElement> & { children?: React.ReactNode }) {
+      const lang = /language-(\w+)/.exec(className ?? '')?.[1] ?? '';
+      const isBlock = !('inline' in rest);
+      const text = String(children ?? '').replace(/\n$/, '');
+
+      if (lang === 'mermaid' && isBlock) {
+        return <MermaidBlock definition={text} />;
+      }
+      return <code className={className} {...rest}>{children}</code>;
+    },
+  };
+}
+
 // ── MarkdownContent — plain react-markdown render (older messages) ─────────
 
 function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="md-prose">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a({ href, children }) {
-            return (
-              <a href={href} target="_blank" rel="noreferrer">
-                {children}
-              </a>
-            );
-          },
-        }}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents()}>
         {content}
       </ReactMarkdown>
     </div>
@@ -423,41 +497,35 @@ interface ProseContentProps {
 }
 
 function ProseContent({ prose, refs, activeRef, onCitationClick }: ProseContentProps) {
-  // Build a lookup from label → refIndex so the custom link renderer can
-  // detect which markdown links are citations.
   const citationMap = new Map(refs.map((r) => [r.label, r.index]));
+
+  const anchorOverride: AnchorOverride = ({ href, children = null }) => {
+    const label = Array.isArray(children)
+      ? children.map((ch) => (typeof ch === 'string' ? ch : '')).join('')
+      : typeof children === 'string' ? children : String(children ?? '');
+    const refIndex = citationMap.get(label);
+    if (refIndex !== undefined) {
+      const isActive = activeRef === refIndex;
+      return (
+        <span
+          style={{ ...styles.citationSpan, ...(isActive ? styles.citationActive : {}) }}
+          onClick={() => onCitationClick(refIndex)}
+          title={`View ${label} in sidebar`}
+        >
+          {label}
+        </span>
+      );
+    }
+    return (
+      <a href={href} target="_blank" rel="noreferrer" style={styles.link}>
+        {children}
+      </a>
+    );
+  };
 
   return (
     <div className="md-prose">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          // Replace citation links with interactive spans; leave normal links alone.
-          a({ href, children }) {
-            const label = Array.isArray(children)
-              ? children.map((ch) => (typeof ch === 'string' ? ch : '')).join('')
-              : typeof children === 'string' ? children : String(children ?? '');
-            const refIndex = citationMap.get(label);
-            if (refIndex !== undefined) {
-              const isActive = activeRef === refIndex;
-              return (
-                <span
-                  style={{ ...styles.citationSpan, ...(isActive ? styles.citationActive : {}) }}
-                  onClick={() => onCitationClick(refIndex)}
-                  title={`View ${label} in sidebar`}
-                >
-                  {label}
-                </span>
-              );
-            }
-            return (
-              <a href={href} target="_blank" rel="noreferrer" style={styles.link}>
-                {children}
-              </a>
-            );
-          },
-        }}
-      >
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents(anchorOverride)}>
         {prose}
       </ReactMarkdown>
     </div>
@@ -668,7 +736,18 @@ function parseMessage(rawContent: string): ParsedMessage {
       const lang = (match[5] ?? '').toLowerCase();
       const text = (match[6] ?? '').trimEnd();
 
-      if (pendingCitation) {
+      // Mermaid fences are always rendered inline — never sent to the sidebar.
+      if (lang === 'mermaid') {
+        if (pendingCitation) {
+          // Flush pending citation as a plain link; diagram is not a code ref.
+          prose =
+            prose.slice(0, pendingCitation.proseInsertPos) +
+            `[${pendingCitation.label}](${pendingCitation.url})` +
+            prose.slice(pendingCitation.proseInsertPos);
+          pendingCitation = null;
+        }
+        prose += `\`\`\`mermaid\n${text}\n\`\`\``;
+      } else if (pendingCitation) {
         // Create the ref card with the code block content (may be empty string).
         const refIndex = refs.length;
         refs.push({ index: refIndex, lang, text, label: pendingCitation.label, url: pendingCitation.url });
@@ -983,4 +1062,36 @@ const styles = {
     justifyContent: 'center',
   },
   hint: { margin: '6px 0 0', fontSize: '11px', color: w.textFaint },
+
+  // ── Mermaid diagrams ──
+  diagramWrapper: {
+    margin: '8px 0',
+    padding: '16px',
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '8px',
+    overflowX: 'auto' as const,
+    textAlign: 'center' as const,
+  },
+  diagramLoading: {
+    padding: '16px',
+    color: w.textFaint,
+    fontStyle: 'italic' as const,
+    fontSize: '13px',
+  },
+  diagramError: {
+    margin: '8px 0',
+    padding: '12px',
+    background: '#fff5f5',
+    border: '1px solid #fca5a5',
+    borderRadius: '6px',
+    fontSize: '12px',
+    color: '#7f1d1d',
+    overflowX: 'auto' as const,
+  },
+  diagramErrorMsg: {
+    display: 'block',
+    marginTop: '6px',
+    fontStyle: 'italic' as const,
+  },
 } as const;

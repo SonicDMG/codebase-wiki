@@ -227,6 +227,19 @@ CITATION RULES — follow these exactly, they drive the UI:
 4. Cite every file you draw on. Multiple functions in the same file each get their own citation + code block.
 5. Keep prose concise. Avoid filler phrases. Code blocks go to a sidebar — write as if the reader sees the code alongside the text.
 
+DIAGRAM RULES:
+6. When a question involves architecture, data flow, state machines, sequences, or component relationships,
+   include a Mermaid diagram inline in your answer using a fenced code block:
+   \`\`\`mermaid
+   graph TD
+     A[Client] --> B[API]
+   \`\`\`
+7. Prefer diagrams for: call flows, pipeline stages, database relationships, state transitions,
+   class/module dependencies, and request/response sequences.
+8. Keep diagrams focused — 5 to 15 nodes. Use descriptive labels.
+9. Mermaid diagrams are rendered visually in the UI — do NOT wrap them in citation links.
+   Place the diagram after the explanatory prose, before or after code citations.
+
 ---
 
 ${filesBlock}`;
