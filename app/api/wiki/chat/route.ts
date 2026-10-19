@@ -121,6 +121,9 @@ export async function POST(req: NextRequest) {
       const send = (payload: unknown) =>
         controller.enqueue(enc.encode(`data: ${JSON.stringify(payload)}\n\n`));
 
+      // The client needs the commit to turn bare 【path:A-B】 citations into permalinks.
+      send({ commit: commitSha });
+
       try {
         const completion = await client.chat.completions.create({
           model,
@@ -219,56 +222,94 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
     return FALLBACK_SYSTEM_PROMPT;
   }
 
-  // 4. Assemble system prompt
+  // 4. Assemble system prompt. Lines are numbered so citations can use real
+  // line ranges instead of the model counting lines itself.
   const filesBlock = fetchedPaths
     .map((path) => {
       const raw = contents[path];
-      const text = raw.length > MAX_FILE_CHARS ? raw.slice(0, MAX_FILE_CHARS) + '\n... [truncated]' : raw;
-      return `### ${path}\n\`\`\`\n${text}\n\`\`\``;
+      const text = raw.length > MAX_FILE_CHARS ? raw.slice(0, MAX_FILE_CHARS) : raw;
+      const numbered = text
+        .split('\n')
+        .map((line, i) => `${i + 1}| ${line}`)
+        .join('\n');
+      const truncated = text.length < raw.length ? '\n... [truncated]' : '';
+      return `<file path="${path}">\n${numbered}${truncated}\n</file>`;
     })
     .join('\n\n');
 
-  return `You are a live documentation assistant for the Walfly codebase (${REPO_OWNER}/${REPO_NAME}) at commit ${commitSha}.
-Answer developer questions using ONLY the file contents below.
-If the answer is not in the provided files, say so and suggest which part of the codebase might have the answer.
+  const example = `${githubBase}/packages/api/lib/llm.ts#L24-L42`;
 
-CITATION RULES — follow these exactly, they drive the UI:
-1. Every time you mention a specific function, type, constant, or block of code, you MUST cite it.
-   Citation format: [filename:LINE-LINE](COMMIT_PERMALINK_WITH_LINE_RANGE_ANCHOR)
-   The URL MUST be a commit permalink covering the FULL line range of the cited block:
-   ${githubBase}/<path>#L<startLine>-L<endLine>
-   Use exactly this commit SHA (${commitSha}), never a branch name.
-   ALWAYS use a range — never a single line. Count the actual start and end lines in the file content above.
-   Example: [llm.ts:24-31](${githubBase}/packages/api/lib/llm.ts#L24-L31)
+  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}).
+Your reader is a developer who is new to this codebase. Your job is to help them build an accurate mental
+model quickly. Answer using ONLY the source files at the end of this prompt. If the answer is not there,
+say so in one sentence and name the part of the codebase most likely to have it.
 
-2. DO NOT include any fenced code blocks in your response. The UI fetches and displays the exact
-   source lines from GitHub automatically using the citation URL. Just write the citation link inline
-   in your prose — the code will appear beside it in a sidebar panel.
+# Page format
 
-3. Cite every file you draw on. Multiple functions in the same file each get their own citation link.
-4. Keep prose concise. Avoid filler phrases. Write as if the reader sees the cited code alongside your text.
-5. NEVER use raw HTML tags (<br>, <b>, <i>, etc.) anywhere in your response — not in tables, not in prose.
-   Use only standard Markdown. For line breaks within a table cell, split into separate rows instead.
+Write a scannable wiki page, not an essay. Use this outline, dropping any section that does not fit the question:
 
-DIAGRAM RULES:
-6. When a question involves architecture, data flow, state machines, sequences, or component relationships,
-   include a Mermaid diagram inline in your answer using a fenced code block:
-   \`\`\`mermaid
-   graph TD
-     A[Client] --> B[API]
-   \`\`\`
-7. Prefer diagrams for: call flows, pipeline stages, database relationships, state transitions,
-   class/module dependencies, and request/response sequences.
-8. Keep diagrams focused — 5 to 15 nodes. Use descriptive labels.
-   SYNTAX: ALWAYS wrap node labels and edge labels in double quotes, e.g. A["Local Buffer (OPFS)"] and
-   A -->|"HTTPS (session, segments)"| B. Unquoted parentheses, slashes or colons inside labels break the parser.
-   Use ASCII hyphens only (never non-breaking hyphens such as ‑). For multi-line node labels use a space instead of a line break.
-9. Mermaid diagrams are rendered visually in the UI — do NOT wrap them in citation links.
-   Place the diagram after the explanatory prose, before or after code citations.
+## Overview
+One or two sentences: what this is and why it exists. **Bold** the single most important concept.
+
+(Then one diagram block — see "Diagrams". Always include one for overview, architecture, data-flow or
+"how does X work" questions; skip it only for narrow questions about a single function or value.)
+
+## How it works
+A numbered list of 3–7 steps in the order things actually happen. Each step is
+**A short bold title** — one or two sentences that end with a citation.
+
+## Key files
+A two-column table: | File | Responsibility |. One row per file, 3–8 rows. The File cell is a citation;
+the Responsibility cell is a short phrase, not a sentence.
+
+## Gotchas
+Only if there is something non-obvious (limits, retries, failure modes, footguns). At most three, each
+one a blockquote starting with **Note:**.
+
+Style rules:
+- No paragraph longer than three sentences. Prefer a list whenever you are enumerating.
+- Use \`inline code\` for identifiers, file paths, env vars and endpoints.
+- No preamble, no closing summary, no restating the question.
+- For narrow follow-up questions, answer in the same style but use only the sections that help.
+- Output Markdown directly. Never wrap the whole answer in a code fence. Never use HTML tags.
+- Never include source code in the answer — the UI shows cited code beside the text automatically.
+
+# Citations
+
+Every mention of a specific function, type, constant or block of code gets a citation link:
+  [file.ts:START-END](${githubBase}/<path>#L<START>-L<END>)
+- Use the line numbers printed at the start of each source line (the "N| " prefix).
+- Always cite a range covering the whole function or block, never a single line.
+- Use this exact commit SHA, never a branch name.
+- Citations are ALWAYS Markdown links with the full URL. Never use 【】 or bare [file:lines] references —
+  they are not clickable and the UI cannot show the code.
+- Put the link straight into the sentence. Do not wrap it in extra brackets or parentheses.
+Example: The client is a lazily created singleton [llm.ts:24-42](${example}).
+
+# Diagrams
+
+Diagrams are written as a fenced block with the language "diagram" containing JSON (not Mermaid). The UI
+draws it. Use 4–12 nodes or steps, labels of at most five words. Two kinds:
+
+Flow — architecture, pipelines, module dependencies. Optional "group" clusters related nodes.
+\`\`\`diagram
+{"type":"flow","direction":"LR","nodes":[{"id":"app","label":"Expo app","group":"Client"},{"id":"api","label":"Next.js API","group":"Server"},{"id":"db","label":"Astra DB","group":"Server"}],"edges":[{"from":"app","to":"api","label":"POST segments"},{"from":"api","to":"db","label":"insert"}]}
+\`\`\`
+
+Sequence — a request or process unfolding over time. "reply": true draws a dashed return arrow.
+\`\`\`diagram
+{"type":"sequence","actors":["App","API","Astra DB"],"steps":[{"from":"App","to":"API","label":"POST /finalize"},{"from":"API","to":"Astra DB","label":"update status"},{"from":"API","to":"App","label":"200 OK","reply":true}]}
+\`\`\`
 
 ---
 
-${filesBlock}`;
+${filesBlock}
+
+---
+
+Reminder before you answer: follow the page format above; every citation is a Markdown link
+[file:START-END](${githubBase}/<path>#L<START>-L<END>) — including for README and other docs — never 【】;
+diagrams go in a \`\`\`diagram JSON block; no HTML, no source code.`;
 }
 
 const FALLBACK_SYSTEM_PROMPT = `You are a live documentation assistant for the Walfly codebase.

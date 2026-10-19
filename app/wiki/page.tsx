@@ -5,16 +5,23 @@
  *
  * Three-column layout:
  *   Left   — persistent TOC nav (auto-generated topics)
- *   Center — prose answers rendered with react-markdown + remark-gfm
+ *   Center — wiki-style article answers rendered with react-markdown + remark-gfm
  *   Right  — code reference sidebar; clicking a citation highlights the card
+ *
+ * The model writes plain Markdown plus ```diagram fences holding a small JSON
+ * spec, which we compile to Mermaid ourselves so diagrams can't have syntax
+ * errors. Raw HTML from the model is dropped by react-markdown (skipHtml).
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import DOMPurify from 'dompurify';
+import { isValidElement, useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
+import { visit } from 'unist-util-visit';
+import type { Root } from 'mdast';
 
-const purify = typeof window !== 'undefined' ? DOMPurify(window) : null;
+const mdParser = unified().use(remarkParse).use(remarkGfm);
 
 // ── Window extensions for CDN globals ─────────────────────────────────────
 declare global {
@@ -45,6 +52,8 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   pending?: boolean;
+  /** Commit the answer was grounded in (sent by the server before the first token). */
+  commit?: string;
 }
 
 /** A code block extracted from the LLM response, shown in the sidebar. */
@@ -64,6 +73,8 @@ interface TocTopic {
   title: string;
   description: string;
   suggestedQuery: string;
+  /** Nav group heading; absent on topics generated before sections existed. */
+  section?: string;
 }
 
 type SyncState = 'idle' | 'syncing' | 'up-to-date' | 'updated' | 'error' | 'rate-limited';
@@ -79,7 +90,7 @@ export default function WikiPage() {
       id: 'welcome',
       role: 'assistant',
       content:
-        'Hi! Ask me anything about the Walfly codebase. I read the current source directly from GitHub, so my answers always reflect the latest code.\n\nClick any topic in the left panel to get started, or type your own question below.',
+        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Click a citation chip to see the exact code in the references panel',
     },
   ]);
   const [input, setInput] = useState('');
@@ -104,7 +115,6 @@ export default function WikiPage() {
   const dragStartX = useRef(0);
   const dragStartWidth = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const statusMenuRef = useRef<HTMLDivElement>(null);
   const tocReqIdRef = useRef(0);
@@ -325,10 +335,25 @@ export default function WikiPage() {
       script.onload = () =>
         window.mermaid?.initialize({
           startOnLoad: false,
-          theme: 'neutral',
-          securityLevel: 'loose',
+          theme: 'base',
+          securityLevel: 'strict',
           // Don't inject the "Syntax error" bomb SVG into document.body.
           suppressErrorRendering: true,
+          fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+          flowchart: { curve: 'basis', padding: 12 },
+          themeVariables: {
+            primaryColor: w.amberLight,
+            primaryBorderColor: w.amberBorder,
+            primaryTextColor: w.text,
+            lineColor: w.textFaint,
+            clusterBkg: w.surface,
+            clusterBorder: w.border,
+            edgeLabelBackground: w.bg,
+            actorBkg: w.amberLight,
+            actorBorder: w.amberBorder,
+            noteBkgColor: w.surface,
+            fontSize: '13px',
+          },
         });
       document.head.appendChild(script);
     }
@@ -357,10 +382,18 @@ export default function WikiPage() {
     window.addEventListener('mouseup', onMouseUp);
   }, [sidebarWidth]);
 
-  // Auto-scroll to bottom on new messages.
+  // When a new question is asked, bring it to the top of the reading pane.
+  // Don't follow streaming tokens — the reader starts at the top of the answer.
+  const lastQuestionId = [...messages].reverse().find((m) => m.role === 'user')?.id;
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (!lastQuestionId) return;
+    document.getElementById(`msg-${lastQuestionId}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [lastQuestionId]);
+
+  const handleCitationClick = (idx: number) => {
+    setActiveRef(idx);
+    setSidebarCollapsed(false);
+  };
 
   const latestAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
 
@@ -420,8 +453,11 @@ export default function WikiPage() {
           const data = line.slice(6);
           if (data === '[DONE]') break;
           try {
-            const parsed = JSON.parse(data) as { token?: string; error?: string };
-            if (parsed.error) {
+            const parsed = JSON.parse(data) as { token?: string; error?: string; commit?: string };
+            if (parsed.commit) {
+              const commit = parsed.commit;
+              setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, commit } : m)));
+            } else if (parsed.error) {
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
@@ -498,7 +534,7 @@ export default function WikiPage() {
     }
   };
 
-  const parsedLatest = latestAssistantMsg ? parseMessage(latestAssistantMsg.content) : null;
+  const parsedLatest = latestAssistantMsg ? parseMessage(latestAssistantMsg.content, latestAssistantMsg.commit) : null;
 
   return (
     <div style={styles.root}>
@@ -624,15 +660,19 @@ export default function WikiPage() {
               <div style={styles.tocLoading}>No topics available.</div>
             ) : (
               tocTopics.map((topic, idx) => (
-                <button
-                  key={idx}
-                  style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
-                  onClick={() => handleTopicClick(topic, idx)}
-                  title={topic.description}
-                  disabled={loading}
-                >
-                  {topic.title}
-                </button>
+                <div key={idx}>
+                  {topic.section && topic.section !== tocTopics[idx - 1]?.section && (
+                    <div style={styles.tocSection}>{topic.section}</div>
+                  )}
+                  <button
+                    style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
+                    onClick={() => handleTopicClick(topic, idx)}
+                    title={topic.description}
+                    disabled={loading}
+                  >
+                    {topic.title}
+                  </button>
+                </div>
               ))
             )
           )}
@@ -644,16 +684,15 @@ export default function WikiPage() {
         <div style={styles.chatPane}>
           <div style={styles.messageList}>
             {messages.map((msg) => (
-              <MessageBubble
+              <MessageBlock
                 key={msg.id}
                 message={msg}
                 isLatestAssistant={msg.id === latestAssistantMsg?.id}
                 parsedLatest={parsedLatest}
                 activeRef={activeRef}
-                onCitationClick={(idx) => setActiveRef(idx)}
+                onCitationClick={handleCitationClick}
               />
             ))}
-            <div ref={bottomRef} />
           </div>
         </div>
 
@@ -714,9 +753,12 @@ export default function WikiPage() {
   );
 }
 
-// ── MessageBubble ──────────────────────────────────────────────────────────
+// ── MessageBlock ───────────────────────────────────────────────────────────
+//
+// Wiki-style: a user question is a page title, the answer is the article
+// beneath it. No chat bubbles.
 
-interface MessageBubbleProps {
+interface MessageBlockProps {
   message: Message;
   isLatestAssistant: boolean;
   parsedLatest: ParsedMessage | null;
@@ -724,44 +766,130 @@ interface MessageBubbleProps {
   onCitationClick: (idx: number) => void;
 }
 
-function MessageBubble({ message, isLatestAssistant, parsedLatest, activeRef, onCitationClick }: MessageBubbleProps) {
-  const isUser = message.role === 'user';
+function MessageBlock({ message, isLatestAssistant, parsedLatest, activeRef, onCitationClick }: MessageBlockProps) {
+  if (message.role === 'user') {
+    return <h1 id={`msg-${message.id}`} style={styles.question}>{message.content}</h1>;
+  }
+  const streaming = !!message.pending;
   return (
-    <div style={{ ...styles.bubble, ...(isUser ? styles.bubbleUser : styles.bubbleAssistant) }}>
-      <div style={styles.bubbleRole}>{isUser ? 'You' : 'Wiki'}</div>
-      {message.pending && !message.content ? (
-        <span style={styles.pending}>thinking…</span>
+    <article style={styles.answer}>
+      {streaming && !message.content ? (
+        <span style={styles.pending}>Reading the source…</span>
       ) : isLatestAssistant && parsedLatest ? (
         <ProseContent
           prose={parsedLatest.prose}
           refs={parsedLatest.refs}
+          streaming={streaming}
           activeRef={activeRef}
           onCitationClick={onCitationClick}
         />
       ) : (
-        <MarkdownContent content={message.content} />
+        <MarkdownContent content={parseMessage(message.content, message.commit).prose} />
       )}
-    </div>
+    </article>
   );
 }
 
-// ── MermaidBlock — renders a mermaid fence as an inline SVG diagram ────────
+// ── Diagrams ───────────────────────────────────────────────────────────────
+//
+// The model describes diagrams as JSON (see the wiki chat prompt); we emit the
+// Mermaid source. Every label is quoted/escaped and every id is generated here,
+// so model output can't produce a Mermaid syntax error.
 
-/**
- * Best-effort repair for common LLM mistakes: unquoted labels containing
- * parentheses etc. inside [...] nodes or |...| edge labels, and non-ASCII hyphens.
- */
-function repairMermaid(def: string): string {
-  return def
-    .replace(/[\u2010\u2011\u2012\u2013]/g, '-')
-    .replace(/\[([^\]"\n]*[(){}:/][^\]"\n]*)\]/g, '["$1"]')
-    .replace(/\|([^|"\n]*[(){}:/][^|"\n]*)\|/g, '|"$1"|');
+interface FlowNode { id: string; label?: string; group?: string }
+interface FlowEdge { from: string; to: string; label?: string }
+interface SequenceStep { from: string; to: string; label?: string; reply?: boolean }
+
+const FLOW_DIRECTIONS = new Set(['LR', 'RL', 'TD', 'TB', 'BT']);
+
+/** Escape text for use inside a quoted Mermaid label or message. */
+function mmText(value: unknown): string {
+  return String(value ?? '')
+    .replaceAll('\n', ' ')
+    .replaceAll(';', '#59;')
+    .replaceAll('"', '#quot;');
 }
 
-function MermaidBlock({ definition }: { definition: string }) {
+function diagramToMermaid(spec: unknown): string | null {
+  if (!spec || typeof spec !== 'object') return null;
+  const d = spec as Record<string, unknown>;
+  if (d.type === 'sequence' && Array.isArray(d.steps)) return sequenceToMermaid(d.actors, d.steps);
+  if (Array.isArray(d.nodes)) return flowToMermaid(d.direction, d.nodes, d.edges);
+  return null;
+}
+
+function flowToMermaid(direction: unknown, nodes: unknown[], edges: unknown): string {
+  const ids = new Map<string, string>();
+  const ungrouped: string[] = [];
+  const groups = new Map<string, string[]>();
+
+  const declare = (rawId: string, label: string, group?: string) => {
+    if (ids.has(rawId)) return ids.get(rawId)!;
+    const id = `n${ids.size}`;
+    ids.set(rawId, id);
+    const line = `${id}["${mmText(label)}"]`;
+    if (group) {
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group)!.push(line);
+    } else {
+      ungrouped.push(line);
+    }
+    return id;
+  };
+
+  for (const n of nodes as FlowNode[]) {
+    if (typeof n?.id !== 'string') continue;
+    declare(n.id, n.label || n.id, typeof n.group === 'string' ? n.group : undefined);
+  }
+
+  const edgeLines: string[] = [];
+  for (const e of (Array.isArray(edges) ? edges : []) as FlowEdge[]) {
+    if (typeof e?.from !== 'string' || typeof e?.to !== 'string') continue;
+    const from = declare(e.from, e.from);
+    const to = declare(e.to, e.to);
+    edgeLines.push(e.label ? `${from} -->|"${mmText(e.label)}"| ${to}` : `${from} --> ${to}`);
+  }
+
+  const dir = FLOW_DIRECTIONS.has(String(direction)) ? String(direction) : 'LR';
+  return [
+    `flowchart ${dir}`,
+    ...ungrouped,
+    ...[...groups].flatMap(([name, members], i) => [`subgraph g${i}["${mmText(name)}"]`, ...members, 'end']),
+    ...edgeLines,
+  ].join('\n');
+}
+
+function sequenceToMermaid(actors: unknown, steps: unknown[]): string {
+  const ids = new Map<string, string>();
+  const participants: string[] = [];
+  const declare = (name: string) => {
+    if (ids.has(name)) return ids.get(name)!;
+    const id = `p${ids.size}`;
+    ids.set(name, id);
+    participants.push(`participant ${id} as ${mmText(name)}`);
+    return id;
+  };
+
+  for (const a of Array.isArray(actors) ? actors : []) {
+    if (typeof a === 'string') declare(a);
+  }
+  const stepLines: string[] = [];
+  for (const s of steps as SequenceStep[]) {
+    if (typeof s?.from !== 'string' || typeof s?.to !== 'string') continue;
+    const arrow = s.reply ? '-->>' : '->>';
+    stepLines.push(`${declare(s.from)}${arrow}${declare(s.to)}: ${mmText(s.label ?? ' ')}`);
+  }
+
+  return ['sequenceDiagram', 'autonumber', ...participants, ...stepLines].join('\n');
+}
+
+/** Renders Mermaid source to an inline SVG. Waits until the answer has finished streaming. */
+function MermaidBlock({ definition, streaming }: { definition: string | null; streaming: boolean }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
   useEffect(() => {
+    if (streaming || !definition) return;
     let cancelled = false;
     // Poll until mermaid is loaded from CDN (usually < 1 s).
     const tryRender = async () => {
@@ -770,80 +898,83 @@ function MermaidBlock({ definition }: { definition: string }) {
         setTimeout(tryRender, 100);
         return;
       }
-      // Unique id per attempt: mermaid leaves temp elements keyed by id in <body>.
-      const attempt = async (src: string) => {
-        const id = `mermaid-${Math.random().toString(36).slice(2)}`;
-        try {
-          return await window.mermaid!.render(id, src);
-        } finally {
-          // Remove any temp/error SVG mermaid appended to the page body.
-          document.getElementById(id)?.remove();
-          document.getElementById(`d${id}`)?.remove();
-        }
-      };
+      // Unique id per render: mermaid leaves temp elements keyed by id in <body>.
+      const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       try {
-        let result;
-        try {
-          result = await attempt(definition);
-        } catch (firstErr) {
-          const repaired = repairMermaid(definition);
-          if (repaired === definition) throw firstErr;
-          result = await attempt(repaired);
-        }
+        const result = await window.mermaid.render(id, definition);
         if (!cancelled) {
           setError(null);
           setSvg(result.svg);
         }
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Diagram error');
+      } finally {
+        document.getElementById(id)?.remove();
+        document.getElementById(`d${id}`)?.remove();
       }
     };
     void tryRender();
     return () => { cancelled = true; };
-  }, [definition]);
+  }, [definition, streaming]);
 
-  if (error) {
+  if (streaming || (!svg && !error && definition)) {
+    return <div style={styles.diagramLoading}>drawing diagram…</div>;
+  }
+  if (error || !definition) {
     return (
-      <pre style={styles.diagramError}>
-        <code>{definition}</code>
-        <span style={styles.diagramErrorMsg}>⚠ {error}</span>
-      </pre>
+      <details style={styles.diagramError}>
+        <summary>Diagram couldn&apos;t be drawn{error ? ` — ${error}` : ''}</summary>
+        {definition && <pre><code>{definition}</code></pre>}
+      </details>
     );
   }
-  if (!svg) {
-    return <div style={styles.diagramLoading}>rendering diagram…</div>;
-  }
   return (
-    <div
+    <figure
       style={styles.diagramWrapper}
-      // mermaid returns a sanitised SVG string — safe to set as innerHTML
-      dangerouslySetInnerHTML={{ __html: svg }}
+      // mermaid output with securityLevel 'strict' — safe to set as innerHTML
+      dangerouslySetInnerHTML={{ __html: svg! }}
     />
   );
 }
 
+/** A ```diagram fence: parse the JSON spec (incomplete while streaming) and draw it. */
+function DiagramBlock({ source, streaming }: { source: string; streaming: boolean }) {
+  let definition: string | null = null;
+  try {
+    definition = diagramToMermaid(JSON.parse(source));
+  } catch {
+    // Partial JSON mid-stream, or malformed — MermaidBlock shows the right state.
+  }
+  return <MermaidBlock definition={definition} streaming={streaming} />;
+}
+
 // ── Shared component overrides for react-markdown ─────────────────────────
-//
-// Handles mermaid fences (→ diagram) and all other code fences (→ hljs block).
-// Receives an optional citation/link override for ProseContent.
 
 type AnchorOverride = (props: { href?: string; children?: React.ReactNode }) => React.ReactElement;
 
-function buildComponents(anchorOverride?: AnchorOverride) {
+const DIAGRAM_LANGS = new Set(['language-diagram', 'language-mermaid']);
+
+function buildComponents(streaming: boolean, anchorOverride?: AnchorOverride) {
   const anchorFn: AnchorOverride = anchorOverride ?? (({ href, children }) => (
     <a href={href} target="_blank" rel="noreferrer">{children}</a>
   ));
   return {
     a: anchorFn,
-    code({ className, children, ...rest }: React.HTMLAttributes<HTMLElement> & { children?: React.ReactNode }) {
-      const lang = /language-(\w+)/.exec(className ?? '')?.[1] ?? '';
-      const isBlock = !('inline' in rest);
-      const text = String(children ?? '').replace(/\n$/, '');
-
-      if (lang === 'mermaid' && isBlock) {
-        return <MermaidBlock definition={text} />;
+    // Diagrams render as figures, so drop the <pre> react-markdown wraps fences in.
+    pre({ children, ...rest }: React.HTMLAttributes<HTMLPreElement>) {
+      if (isValidElement<{ className?: string }>(children) && DIAGRAM_LANGS.has(children.props.className ?? '')) {
+        return <>{children}</>;
       }
+      return <pre {...rest}>{children}</pre>;
+    },
+    code({ className, children, ...rest }: React.HTMLAttributes<HTMLElement>) {
+      const text = String(children ?? '').trimEnd();
+      if (className === 'language-diagram') return <DiagramBlock source={text} streaming={streaming} />;
+      if (className === 'language-mermaid') return <MermaidBlock definition={text} streaming={streaming} />;
       return <code className={className} {...rest}>{children}</code>;
+    },
+    table({ children }: { children?: React.ReactNode }) {
+      return <div className="md-table-wrap"><table>{children}</table></div>;
     },
   };
 }
@@ -853,44 +984,42 @@ function buildComponents(anchorOverride?: AnchorOverride) {
 function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="md-prose">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents()}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(false)}>
         {content}
       </ReactMarkdown>
     </div>
   );
 }
 
-// ── ProseContent — latest message with clickable citation spans ────────────
+// ── ProseContent — latest message with clickable citation chips ────────────
 //
-// The LLM emits citations as [label](github-url). We replace each file-ref
-// citation with a styled <span> that highlights the matching sidebar card.
-// Everything else is standard markdown rendered by react-markdown.
+// Citation links (GitHub line-range permalinks) render as chips that highlight
+// the matching sidebar card. Other links render normally.
 
 interface ProseContentProps {
   prose: string;
   refs: RefBlock[];
+  streaming: boolean;
   activeRef: number | null;
   onCitationClick: (idx: number) => void;
 }
 
-function ProseContent({ prose, refs, activeRef, onCitationClick }: ProseContentProps) {
-  const citationMap = new Map(refs.map((r) => [r.label, r.index]));
+function ProseContent({ prose, refs, streaming, activeRef, onCitationClick }: ProseContentProps) {
+  const refByUrl = new Map(refs.map((r) => [r.url, r]));
 
   const anchorOverride: AnchorOverride = ({ href, children = null }) => {
-    const label = Array.isArray(children)
-      ? children.map((ch) => (typeof ch === 'string' ? ch : '')).join('')
-      : typeof children === 'string' ? children : String(children ?? '');
-    const refIndex = citationMap.get(label);
-    if (refIndex !== undefined) {
-      const isActive = activeRef === refIndex;
+    const ref = href ? refByUrl.get(href) : undefined;
+    if (ref) {
+      const isActive = activeRef === ref.index;
       return (
-        <span
+        <button
+          type="button"
           style={{ ...styles.citationSpan, ...(isActive ? styles.citationActive : {}) }}
-          onClick={() => onCitationClick(refIndex)}
-          title={`View ${label} in sidebar`}
+          onClick={() => onCitationClick(ref.index)}
+          title={`Show ${ref.label} in the references panel`}
         >
-          {label}
-        </span>
+          {ref.label}
+        </button>
       );
     }
     return (
@@ -902,7 +1031,7 @@ function ProseContent({ prose, refs, activeRef, onCitationClick }: ProseContentP
 
   return (
     <div className="md-prose">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={buildComponents(anchorOverride)}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(streaming, anchorOverride)}>
         {prose}
       </ReactMarkdown>
     </div>
@@ -1062,61 +1191,55 @@ function extractLines(src: string, url: string): string {
 
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
-// Finds every GitHub citation link [label](github-url#L<n>-L<m>) in the
-// response and registers it as a sidebar RefBlock. The model no longer emits
-// code blocks — lines are fetched live from GitHub raw content by RefCard.
-// Everything else (prose, mermaid diagrams, bare code blocks) passes through
-// verbatim to react-markdown.
+// Uses the same Markdown parser react-markdown does, so we never disagree with
+// the renderer about what is a link or a fence. Collects every GitHub line-range
+// link as a sidebar RefBlock (deduped by URL); RefCard fetches the lines live.
 
-function parseMessage(rawContent: string): ParsedMessage {
-  const refs: RefBlock[] = [];
+/** A GitHub permalink with a #L line anchor — i.e. a code citation. */
+function isCodeCitation(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.hostname === 'github.com' && u.hash.startsWith('#L');
+  } catch {
+    return false;
+  }
+}
 
-  // If the LLM wrapped its entire response in a single outer fence, unwrap it —
-  // but only when the inner content itself contains additional fences or prose,
-  // i.e. the outer fence is wrapping a multi-block response, not a single diagram.
-  const outerFenceMatch = rawContent.match(/^```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n?```\s*$/);
-  const inner = outerFenceMatch?.[1] ?? '';
-  const unwrapped =
-    outerFenceMatch && (inner.includes('```') || inner.includes('\n\n'))
-      ? inner
-      : rawContent;
+/**
+ * gpt-oss sometimes cites in its native browsing style, 【path/to/file.ts:12-30】,
+ * instead of a Markdown link — mostly when citing docs. Rewrite those to links.
+ */
+const NATIVE_CITATION = /【([^】\s]+?):(\d+)(?:-(\d+))?】/g;
 
-  // Strip any HTML the model emits from prose segments, leaving fenced code
-  // blocks completely untouched. DOMPurify with ALLOWED_TAGS:[] removes all
-  // tags but keeps their text content, handling malformed markup, nested tags,
-  // and injection attempts that a regex would miss. <br> is converted to a
-  // newline first so the line break intent is preserved.
-  const content = unwrapped
-    .split(/(```[\s\S]*?```)/g)
-    .map((seg, i) => {
-      if (i % 2 !== 0) return seg; // inside a code fence — pass through unchanged
-      const withNewlines = seg.replace(/<br\s*\/?>/gi, '\n');
-      if (!purify) return withNewlines;
-      return purify.sanitize(withNewlines, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
-    })
-    .join('');
+function linkNativeCitations(markdown: string, commit: string | undefined): string {
+  if (!commit) return markdown;
+  const base = `${REPO_URL}/blob/${commit}`;
+  return markdown.replace(NATIVE_CITATION, (_, path: string, start: string, end: string = start) => {
+    const file = path.split('/').pop();
+    return ` [${file}:${start}-${end}](${base}/${path}#L${start}-L${end})`;
+  });
+}
 
-  // Match any GitHub citation link with a line anchor.
-  const citationRe =
-    /\[([^\]]+)\]\((https?:\/\/github\.com[^)]+#L\d+[^)]*)\)/g;
+function parseMessage(rawContent: string, commit?: string): ParsedMessage {
+  let prose = linkNativeCitations(rawContent, commit);
+  let tree = mdParser.parse(prose) as Root;
 
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  let prose = '';
-
-  while ((match = citationRe.exec(content)) !== null) {
-    prose += content.slice(lastIndex, match.index);
-    lastIndex = match.index + match[0].length;
-
-    const label = match[1];
-    const url   = match[2];
-
-    const refIndex = refs.length;
-    refs.push({ index: refIndex, label, url });
-    prose += `[${label}](${url})`;
+  // Despite instructions, models sometimes wrap the whole answer in one
+  // ```markdown fence. If that's the only node, render its contents instead.
+  const only = tree.children.length === 1 ? tree.children[0] : null;
+  if (only?.type === 'code' && (only.lang === 'markdown' || only.lang === 'md')) {
+    prose = linkNativeCitations(only.value, commit);
+    tree = mdParser.parse(prose) as Root;
   }
 
-  prose += content.slice(lastIndex);
+  const refs: RefBlock[] = [];
+  const seen = new Set<string>();
+  visit(tree, 'link', (node) => {
+    if (!isCodeCitation(node.url) || seen.has(node.url)) return;
+    seen.add(node.url);
+    const label = node.children.map((ch) => ('value' in ch ? ch.value : '')).join('');
+    refs.push({ index: refs.length, label, url: node.url });
+  });
 
   return { prose, refs };
 }
@@ -1127,27 +1250,53 @@ function parseMessage(rawContent: string): ParsedMessage {
 // them with a scoped CSS class rather than inline style objects.
 
 const MD_CSS = `
-.md-prose { color: #1a1a1f; line-height: 1.7; }
-.md-prose p  { margin: 0 0 0.75em; }
-.md-prose p:last-child { margin-bottom: 0; }
-.md-prose h1 { font-family: Georgia, serif; font-size: 20px; font-weight: 700; margin: 0.8em 0 0.3em; border-bottom: 1px solid #e2e4e8; padding-bottom: 4px; }
-.md-prose h2 { font-family: Georgia, serif; font-size: 17px; font-weight: 700; margin: 0.8em 0 0.3em; }
-.md-prose h3 { font-size: 15px; font-weight: 600; color: #57606a; margin: 0.6em 0 0.2em; }
-.md-prose ul, .md-prose ol { margin: 0 0 0.75em; padding-left: 22px; }
-.md-prose li { margin-bottom: 4px; }
-.md-prose hr { border: none; border-top: 1px solid #e2e4e8; margin: 12px 0; }
-.md-prose code { background: #f7f8fa; border: 1px solid #e2e4e8; border-radius: 3px; padding: 1px 5px; font-size: 13px; font-family: ui-monospace,"SF Mono",Consolas,monospace; color: #c2185b; }
-.md-prose pre  { margin: 0 0 0.75em; border-radius: 6px; overflow-x: auto; }
-.md-prose pre code { background: none; border: none; padding: 0; color: inherit; font-size: 12px; }
-.md-prose blockquote { border-left: 3px solid #e2e4e8; margin: 0 0 0.75em; padding: 2px 0 2px 14px; color: #57606a; }
+.md-prose { color: #1a1a1f; font-size: 15.5px; line-height: 1.75; }
+.md-prose > :first-child { margin-top: 0; }
+.md-prose > :last-child { margin-bottom: 0; }
+.md-prose p { margin: 0 0 1em; }
+.md-prose h1, .md-prose h2 { font-family: Georgia, serif; font-weight: 700; color: #1a1a1f; }
+.md-prose h1 { font-size: 22px; margin: 1.6em 0 0.5em; }
+.md-prose h2 { font-size: 19px; margin: 1.8em 0 0.6em; padding-bottom: 6px; border-bottom: 1px solid #e2e4e8; }
+.md-prose h3 { font-size: 15.5px; font-weight: 600; margin: 1.4em 0 0.4em; }
 .md-prose strong { font-weight: 600; }
-.md-prose em { font-style: italic; }
-.md-prose table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-bottom: 0.75em; }
-.md-prose th { padding: 7px 12px; text-align: left; font-weight: 600; font-size: 12px; color: #57606a; background: #f7f8fa; border-bottom: 2px solid #e2e4e8; white-space: nowrap; }
-.md-prose td { padding: 7px 12px; border-bottom: 1px solid #e2e4e8; vertical-align: top; }
-.md-prose tr:nth-child(even) td { background: #f7f8fa; }
-.md-prose a { color: #F5A623; text-decoration: none; }
-.md-prose a:hover { text-decoration: underline; }
+
+/* Bulleted lists: small amber dots */
+.md-prose ul { list-style: none; margin: 0 0 1em; padding-left: 0; }
+.md-prose ul > li { position: relative; padding-left: 20px; margin-bottom: 6px; }
+.md-prose ul > li::before { content: ''; position: absolute; left: 4px; top: 0.7em; width: 6px; height: 6px; border-radius: 50%; background: #F5A623; }
+
+/* Numbered lists: a step timeline */
+.md-prose ol { list-style: none; counter-reset: step; margin: 0 0 1em; padding-left: 0; }
+.md-prose ol > li { counter-increment: step; position: relative; padding: 0 0 18px 42px; }
+.md-prose ol > li::before {
+  content: counter(step); position: absolute; left: 0; top: 0.1em;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: #fff7e6; border: 1px solid #fcd389; color: #92600a;
+  font-size: 12.5px; font-weight: 700; line-height: 24px; text-align: center;
+}
+.md-prose ol > li::after { content: ''; position: absolute; left: 13px; top: 32px; bottom: 4px; width: 1px; background: #e2e4e8; }
+.md-prose ol > li:last-child { padding-bottom: 4px; }
+.md-prose ol > li:last-child::after { display: none; }
+.md-prose li > p { margin: 0 0 0.4em; }
+
+/* Blockquotes are callouts ("> **Note:** ...") */
+.md-prose blockquote { margin: 0 0 12px; padding: 10px 14px; background: #fff7e6; border: 1px solid #fcd389; border-left: 4px solid #F5A623; border-radius: 6px; color: #3d3020; }
+.md-prose blockquote p { margin: 0; }
+
+.md-prose hr { border: none; border-top: 1px solid #e2e4e8; margin: 1.5em 0; }
+.md-prose code { background: #f3f4f6; border-radius: 4px; padding: 1.5px 5px; font-size: 0.86em; font-family: ui-monospace,"SF Mono",Consolas,monospace; color: #1a1a1f; }
+.md-prose pre { margin: 0 0 1em; padding: 12px 14px; background: #1E1E22; color: #e2e4e8; border-radius: 8px; overflow-x: auto; }
+.md-prose pre code { background: none; padding: 0; color: inherit; font-size: 12.5px; }
+
+.md-prose .md-table-wrap { overflow-x: auto; margin: 0 0 1em; border: 1px solid #e2e4e8; border-radius: 8px; }
+.md-prose table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.5; }
+.md-prose th { padding: 8px 14px; text-align: left; font-weight: 600; font-size: 11.5px; letter-spacing: 0.04em; text-transform: uppercase; color: #57606a; background: #f7f8fa; border-bottom: 1px solid #e2e4e8; }
+.md-prose td { padding: 9px 14px; border-top: 1px solid #eef0f2; vertical-align: top; }
+.md-prose td:first-child { white-space: nowrap; }
+
+.md-prose a { color: #b7791f; text-decoration: none; border-bottom: 1px solid #fcd389; }
+.md-prose a:hover { border-bottom-color: #F5A623; }
+.md-prose figure svg { max-width: 100%; height: auto; }
 `;
 
 function GlobalMdStyles() {
@@ -1334,6 +1483,14 @@ const styles = {
     letterSpacing: '0.1em',
     padding: '0 16px 8px',
   },
+  tocSection: {
+    fontSize: '10px',
+    fontWeight: 600,
+    color: w.textFaint,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.1em',
+    padding: '14px 16px 4px',
+  },
   tocLoading: { padding: '8px 16px', fontSize: '13px', color: w.textFaint, fontStyle: 'italic' as const },
   tocItem: {
     display: 'block',
@@ -1385,56 +1542,51 @@ const styles = {
     flexShrink: 0,
   },
 
-  // Chat
+  // Reading pane — a centred article column keeps line length readable.
   chatPane: {
     flex: 1,
     overflowY: 'auto' as const,
-    padding: '20px 24px',
+    padding: '32px 40px 64px',
     minWidth: 0,
     background: w.bg,
   },
-  messageList: { display: 'flex', flexDirection: 'column' as const, gap: '20px' },
+  messageList: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    maxWidth: '760px',
+    margin: '0 auto',
+  },
   divider: { width: '4px', flexShrink: 0, cursor: 'col-resize', background: w.border },
 
-  // Bubbles
-  bubble: { borderRadius: '8px', padding: '12px 16px' },
-  bubbleUser: {
-    background: w.amberLight,
-    border: `1px solid ${w.amberBorder}`,
-    alignSelf: 'flex-end' as const,
-    maxWidth: '80%',
-    borderBottomRightRadius: '3px',
+  // Questions read as page titles; answers as the article beneath.
+  question: {
+    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontSize: '26px',
+    fontWeight: 700,
+    lineHeight: 1.3,
+    color: w.text,
+    margin: '48px 0 20px',
+    paddingTop: '32px',
+    borderTop: `1px solid ${w.border}`,
+    scrollMarginTop: '16px',
   },
-  bubbleAssistant: {
-    background: w.bg,
-    border: `1px solid ${w.border}`,
-    width: '100%',
-    borderBottomLeftRadius: '3px',
-  },
-  bubbleRole: {
-    fontSize: '10px',
-    fontWeight: 600,
-    color: w.textFaint,
-    marginBottom: '6px',
-    textTransform: 'uppercase' as const,
-    letterSpacing: '0.08em',
-  },
+  answer: { minWidth: 0 },
   pending: { color: w.textMuted, fontStyle: 'italic' as const },
 
-  // Citation pills
+  // Citation chips
   citationSpan: {
     display: 'inline-block',
-    padding: '1px 7px',
+    padding: '0 6px',
     borderRadius: '4px',
-    background: w.amberLight,
-    border: `1px solid ${w.amberBorder}`,
+    background: w.surface,
+    border: `1px solid ${w.border}`,
     color: '#92600a',
-    fontSize: '12px',
+    fontSize: '11.5px',
+    lineHeight: '18px',
     fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
     cursor: 'pointer',
-    userSelect: 'none' as const,
     whiteSpace: 'nowrap' as const,
-    verticalAlign: 'middle' as const,
+    verticalAlign: 'baseline' as const,
     margin: '0 2px',
   },
   citationActive: {
@@ -1547,35 +1699,34 @@ const styles = {
   },
   hint: { margin: '6px 0 0', fontSize: '11px', color: w.textFaint },
 
-  // ── Mermaid diagrams ──
+  // ── Diagrams ──
   diagramWrapper: {
-    margin: '8px 0',
-    padding: '16px',
-    background: w.surface,
+    margin: '4px 0 20px',
+    padding: '20px',
+    background: w.bg,
     border: `1px solid ${w.border}`,
-    borderRadius: '8px',
+    borderRadius: '10px',
     overflowX: 'auto' as const,
     textAlign: 'center' as const,
   },
   diagramLoading: {
-    padding: '16px',
+    margin: '4px 0 20px',
+    padding: '28px',
     color: w.textFaint,
     fontStyle: 'italic' as const,
     fontSize: '13px',
+    textAlign: 'center' as const,
+    background: w.surface,
+    border: `1px dashed ${w.border}`,
+    borderRadius: '10px',
   },
   diagramError: {
-    margin: '8px 0',
-    padding: '12px',
-    background: '#fff5f5',
-    border: '1px solid #fca5a5',
-    borderRadius: '6px',
-    fontSize: '12px',
-    color: '#7f1d1d',
-    overflowX: 'auto' as const,
-  },
-  diagramErrorMsg: {
-    display: 'block',
-    marginTop: '6px',
-    fontStyle: 'italic' as const,
+    margin: '4px 0 20px',
+    padding: '10px 14px',
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '8px',
+    fontSize: '12.5px',
+    color: w.textMuted,
   },
 } as const;
