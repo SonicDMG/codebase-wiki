@@ -10,8 +10,11 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import DOMPurify from 'dompurify';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+
+const purify = typeof window !== 'undefined' ? DOMPurify(window) : null;
 
 // ── Window extensions for CDN globals ─────────────────────────────────────
 declare global {
@@ -1068,9 +1071,30 @@ function extractLines(src: string, url: string): string {
 function parseMessage(rawContent: string): ParsedMessage {
   const refs: RefBlock[] = [];
 
-  // If the LLM wrapped its entire response in a single outer fence, unwrap it.
+  // If the LLM wrapped its entire response in a single outer fence, unwrap it —
+  // but only when the inner content itself contains additional fences or prose,
+  // i.e. the outer fence is wrapping a multi-block response, not a single diagram.
   const outerFenceMatch = rawContent.match(/^```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n?```\s*$/);
-  const content = outerFenceMatch ? outerFenceMatch[1] : rawContent;
+  const inner = outerFenceMatch?.[1] ?? '';
+  const unwrapped =
+    outerFenceMatch && (inner.includes('```') || inner.includes('\n\n'))
+      ? inner
+      : rawContent;
+
+  // Strip any HTML the model emits from prose segments, leaving fenced code
+  // blocks completely untouched. DOMPurify with ALLOWED_TAGS:[] removes all
+  // tags but keeps their text content, handling malformed markup, nested tags,
+  // and injection attempts that a regex would miss. <br> is converted to a
+  // newline first so the line break intent is preserved.
+  const content = unwrapped
+    .split(/(```[\s\S]*?```)/g)
+    .map((seg, i) => {
+      if (i % 2 !== 0) return seg; // inside a code fence — pass through unchanged
+      const withNewlines = seg.replace(/<br\s*\/?>/gi, '\n');
+      if (!purify) return withNewlines;
+      return purify.sanitize(withNewlines, { ALLOWED_TAGS: [], ALLOWED_ATTR: [] });
+    })
+    .join('');
 
   // Match any GitHub citation link with a line anchor.
   const citationRe =

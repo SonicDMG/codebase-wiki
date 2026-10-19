@@ -247,6 +247,8 @@ CITATION RULES — follow these exactly, they drive the UI:
 
 3. Cite every file you draw on. Multiple functions in the same file each get their own citation link.
 4. Keep prose concise. Avoid filler phrases. Write as if the reader sees the cited code alongside your text.
+5. NEVER use raw HTML tags (<br>, <b>, <i>, etc.) anywhere in your response — not in tables, not in prose.
+   Use only standard Markdown. For line breaks within a table cell, split into separate rows instead.
 
 DIAGRAM RULES:
 6. When a question involves architecture, data flow, state machines, sequences, or component relationships,
@@ -260,7 +262,7 @@ DIAGRAM RULES:
 8. Keep diagrams focused — 5 to 15 nodes. Use descriptive labels.
    SYNTAX: ALWAYS wrap node labels and edge labels in double quotes, e.g. A["Local Buffer (OPFS)"] and
    A -->|"HTTPS (session, segments)"| B. Unquoted parentheses, slashes or colons inside labels break the parser.
-   Use ASCII hyphens only (never non-breaking hyphens such as ‑) and <br> for line breaks.
+   Use ASCII hyphens only (never non-breaking hyphens such as ‑). For multi-line node labels use a space instead of a line break.
 9. Mermaid diagrams are rendered visually in the UI — do NOT wrap them in citation links.
    Place the diagram after the explanatory prose, before or after code citations.
 
