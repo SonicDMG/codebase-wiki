@@ -234,21 +234,19 @@ If the answer is not in the provided files, say so and suggest which part of the
 
 CITATION RULES — follow these exactly, they drive the UI:
 1. Every time you mention a specific function, type, constant, or block of code, you MUST cite it.
-   Citation format: [filename:LINE](COMMIT_PERMALINK_WITH_LINE_ANCHOR)
-   The URL MUST be a commit permalink of the form ${githubBase}/<path>#L<line> — use exactly this commit SHA (${commitSha}), never a branch name.
-   Example: [llm.ts:24](${githubBase}/packages/api/lib/llm.ts#L24)
+   Citation format: [filename:LINE-LINE](COMMIT_PERMALINK_WITH_LINE_RANGE_ANCHOR)
+   The URL MUST be a commit permalink covering the FULL line range of the cited block:
+   ${githubBase}/<path>#L<startLine>-L<endLine>
+   Use exactly this commit SHA (${commitSha}), never a branch name.
+   ALWAYS use a range — never a single line. Count the actual start and end lines in the file content above.
+   Example: [llm.ts:24-31](${githubBase}/packages/api/lib/llm.ts#L24-L31)
 
-2. The citation MUST come BEFORE the code block — always in this exact order:
-   prose text mentioning the function → [filename:LINE](url) → \`\`\`lang\\ncode\\n\`\`\`
-   NEVER put the code block before the citation. NEVER put the citation after the code block.
+2. DO NOT include any fenced code blocks in your response. The UI fetches and displays the exact
+   source lines from GitHub automatically using the citation URL. Just write the citation link inline
+   in your prose — the code will appear beside it in a sidebar panel.
 
-3. Immediately after each citation, include a fenced code block with the relevant lines:
-   \`\`\`typescript
-   export function llmClient(): OpenAI { ... }
-   \`\`\`
-
-4. Cite every file you draw on. Multiple functions in the same file each get their own citation + code block.
-5. Keep prose concise. Avoid filler phrases. Code blocks go to a sidebar — write as if the reader sees the code alongside the text.
+3. Cite every file you draw on. Multiple functions in the same file each get their own citation link.
+4. Keep prose concise. Avoid filler phrases. Write as if the reader sees the cited code alongside your text.
 
 DIAGRAM RULES:
 6. When a question involves architecture, data flow, state machines, sequences, or component relationships,

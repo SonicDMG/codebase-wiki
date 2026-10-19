@@ -47,9 +47,7 @@ interface Message {
 /** A code block extracted from the LLM response, shown in the sidebar. */
 interface RefBlock {
   index: number;
-  lang: string;
-  text: string;
-  label: string; // e.g. "llm.ts:24"
+  label: string; // e.g. "llm.ts:24-31"
   url: string;   // github link
 }
 
@@ -969,24 +967,25 @@ function RefCard({ ref_, isActive, onClick, cardRef }: RefCardProps) {
   const [fetchedText, setFetchedText] = useState<string | null>(null);
   const [fetching, setFetching] = useState(false);
 
-  // If the LLM cited this file without providing a code block, fetch the
-  // relevant lines directly from GitHub raw content.
+  // Always fetch the exact lines from GitHub raw content using the citation URL.
   useEffect(() => {
-    if (ref_.text || fetchedText !== null || fetching) return;
+    if (fetchedText !== null || fetching) return;
     const rawUrl = githubBlobToRaw(ref_.url);
     if (!rawUrl) return;
     setFetching(true);
     fetch(rawUrl)
       .then((r) => r.text())
-      .then((src) => {
-        const lines = extractLines(src, ref_.url);
-        setFetchedText(lines);
-      })
+      .then((src) => setFetchedText(extractLines(src, ref_.url)))
       .catch(() => setFetchedText(''))
       .finally(() => setFetching(false));
-  }, [ref_.url, ref_.text, fetchedText, fetching]);
+  }, [ref_.url, fetchedText, fetching]);
 
-  const displayText = ref_.text || fetchedText || '';
+  const displayText = fetchedText ?? '';
+
+  // Detect language from the file extension for syntax highlighting.
+  const ext = ref_.url.split('?')[0].split('#')[0].split('.').pop() ?? '';
+  const lang = { ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
+                 py: 'python', rs: 'rust', go: 'go', json: 'json', md: 'markdown' }[ext] ?? ext;
 
   useEffect(() => {
     if (displayText && codeRef.current && window.hljs) {
@@ -994,7 +993,7 @@ function RefCard({ ref_, isActive, onClick, cardRef }: RefCardProps) {
     }
   }, [displayText]);
 
-  const filename = ref_.label.replace(/:\d+$/, '');
+  const filename = ref_.label.replace(/[:\d-]+$/, '');
 
   return (
     <div
@@ -1023,10 +1022,10 @@ function RefCard({ ref_, isActive, onClick, cardRef }: RefCardProps) {
         </a>
       </div>
       <pre style={styles.refCodeBlock}>
-        {fetching && !displayText ? (
+        {fetching ? (
           <code style={{ color: w.textFaint, fontStyle: 'italic' }}>loading…</code>
         ) : (
-          <code ref={codeRef} className={ref_.lang ? `language-${ref_.lang}` : undefined}>
+          <code ref={codeRef} className={lang ? `language-${lang}` : undefined}>
             {displayText}
           </code>
         )}
@@ -1037,11 +1036,15 @@ function RefCard({ ref_, isActive, onClick, cardRef }: RefCardProps) {
 
 /** Convert a github.com blob URL to a raw.githubusercontent.com URL. */
 function githubBlobToRaw(url: string): string | null {
-  // https://github.com/owner/repo/blob/branch/path/file.ext#L10-L20
-  const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+?)(?:#.*)?$/);
-  if (!m) return null;
-  const [, owner, repo, branch, path] = m;
-  return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
+  try {
+    const { pathname } = new URL(url);
+    // pathname: /owner/repo/blob/branch/path/to/file.ext
+    const [, owner, repo, , branch, ...rest] = pathname.split('/');
+    if (!owner || !repo || !branch || rest.length === 0) return null;
+    return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${rest.join('/')}`;
+  } catch {
+    return null;
+  }
 }
 
 /** Extract the lines referenced by the #L<n> or #L<n>-L<m> anchor from source text. */
@@ -1056,12 +1059,11 @@ function extractLines(src: string, url: string): string {
 
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
-// Scans for citation+fence pairs: [label](github-url#Lnn) immediately followed
-// (with only whitespace between) by a fenced code block. Only those pairs are
-// extracted — the code goes to the sidebar RefBlock, the citation stays as a
-// markdown link in the prose. Everything else — bare code blocks, mermaid
-// diagrams, code inside lists — is left completely verbatim so react-markdown
-// receives intact, well-formed markdown.
+// Finds every GitHub citation link [label](github-url#L<n>-L<m>) in the
+// response and registers it as a sidebar RefBlock. The model no longer emits
+// code blocks — lines are fetched live from GitHub raw content by RefCard.
+// Everything else (prose, mermaid diagrams, bare code blocks) passes through
+// verbatim to react-markdown.
 
 function parseMessage(rawContent: string): ParsedMessage {
   const refs: RefBlock[] = [];
@@ -1070,42 +1072,26 @@ function parseMessage(rawContent: string): ParsedMessage {
   const outerFenceMatch = rawContent.match(/^```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n?```\s*$/);
   const content = outerFenceMatch ? outerFenceMatch[1] : rawContent;
 
-  // Match: [label](github-url#Lnn)  <optional whitespace>  ```lang\ncode\n```
-  // The code block part is optional — a citation with no fence still creates a
-  // sidebar card that lazy-fetches its lines.
-  const pairRe =
-    /\[([^\]]+)\]\((https?:\/\/github\.com[^)]+[:#]L?\d+[^)]*)\)(\s*```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```)?/g;
+  // Match any GitHub citation link with a line anchor.
+  const citationRe =
+    /\[([^\]]+)\]\((https?:\/\/github\.com[^)]+#L\d+[^)]*)\)/g;
 
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   let prose = '';
 
-  while ((match = pairRe.exec(content)) !== null) {
-    // Keep everything before this match verbatim.
+  while ((match = citationRe.exec(content)) !== null) {
     prose += content.slice(lastIndex, match.index);
     lastIndex = match.index + match[0].length;
 
     const label = match[1];
     const url   = match[2];
-    const lang  = (match[4] ?? '').toLowerCase();
-    const text  = (match[5] ?? '').trimEnd();
 
-    // Mermaid fences paired with a citation — treat as a diagram, not a sidebar card.
-    if (lang === 'mermaid') {
-      prose += `[${label}](${url})\n\`\`\`mermaid\n${text}\n\`\`\``;
-      continue;
-    }
-
-    // Create the sidebar ref card. If there was no code block the card will
-    // lazy-fetch the lines from GitHub raw content.
     const refIndex = refs.length;
-    refs.push({ index: refIndex, lang, text, label, url });
-    // Keep the citation link in prose so ProseContent can render it as an
-    // interactive span; the code block is consumed into the sidebar.
+    refs.push({ index: refIndex, label, url });
     prose += `[${label}](${url})`;
   }
 
-  // Append any remaining content verbatim.
   prose += content.slice(lastIndex);
 
   return { prose, refs };
