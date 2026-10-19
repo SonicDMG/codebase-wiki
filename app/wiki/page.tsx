@@ -13,7 +13,7 @@
  * errors. Raw HTML from the model is dropped by react-markdown (skipHtml).
  */
 
-import { isValidElement, useCallback, useEffect, useRef, useState } from 'react';
+import { isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -943,12 +943,158 @@ function MermaidBlock({ definition, streaming }: { definition: string | null; st
       </details>
     );
   }
+  return <ZoomableDiagram svg={svg!} />;
+}
+
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 4;
+const ZOOM_STEP = 0.25;
+
+/** Inline diagram with an expand button; the overlay lets the reader zoom and scroll. */
+function ZoomableDiagram({ svg }: { svg: string }) {
+  const [open, setOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [panning, setPanning] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Drag-to-pan: move the scroll position by the mouse delta (no re-render per move).
+  const onPanStart = (e: React.MouseEvent) => {
+    const el = scrollRef.current;
+    if (!el || e.button !== 0) return;
+    // Let native scrollbar dragging work.
+    const rect = el.getBoundingClientRect();
+    if (e.clientX - rect.left >= el.clientWidth || e.clientY - rect.top >= el.clientHeight) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startLeft = el.scrollLeft;
+    const startTop = el.scrollTop;
+    setPanning(true);
+
+    const onMove = (ev: MouseEvent) => {
+      el.scrollLeft = startLeft - (ev.clientX - startX);
+      el.scrollTop = startTop - (ev.clientY - startY);
+    };
+    const onUp = () => {
+      setPanning(false);
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  const zoomBy = useCallback(
+    (delta: number) => setZoom((z) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z + delta))),
+    [],
+  );
+
+  // Wheel zoom, anchored on the cursor. Needs a native non-passive listener so
+  // preventDefault() stops the overlay from scrolling instead of zooming.
+  const zoomRef = useRef(1);
+  const anchorRef = useRef<{ x: number; y: number; ratio: number } | null>(null);
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!open || !el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const prev = zoomRef.current;
+      const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, prev * Math.exp(-e.deltaY * 0.002)));
+      if (next === prev) return;
+      const rect = el.getBoundingClientRect();
+      const ratio = next / prev;
+      const pending = anchorRef.current;
+      anchorRef.current = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+        ratio: pending ? pending.ratio * ratio : ratio,
+      };
+      zoomRef.current = next;
+      setZoom(next);
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [open]);
+
+  // After the new size is laid out, keep the point under the cursor in place.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const a = anchorRef.current;
+    if (!el || !a) return;
+    anchorRef.current = null;
+    const PAD = 20; // matches diagramScroll padding
+    el.scrollLeft = (el.scrollLeft + a.x - PAD) * a.ratio + PAD - a.x;
+    el.scrollTop = (el.scrollTop + a.y - PAD) * a.ratio + PAD - a.y;
+  }, [zoom]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+      else if (e.key === '+' || e.key === '=') zoomBy(ZOOM_STEP);
+      else if (e.key === '-') zoomBy(-ZOOM_STEP);
+      else if (e.key === '0') setZoom(1);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, zoomBy]);
+
+  const openOverlay = () => {
+    setZoom(1);
+    setOpen(true);
+  };
+
   return (
-    <figure
-      style={styles.diagramWrapper}
-      // mermaid output with securityLevel 'strict' — safe to set as innerHTML
-      dangerouslySetInnerHTML={{ __html: svg! }}
-    />
+    <div style={styles.diagramFrame}>
+      <button
+        type="button"
+        onClick={openOverlay}
+        style={styles.diagramExpandBtn}
+        title="Zoom diagram"
+        aria-label="Open diagram in zoom view"
+      >
+        ⤢
+      </button>
+      <figure
+        style={styles.diagramWrapper}
+        // mermaid output with securityLevel 'strict' — safe to set as innerHTML
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+      {open && (
+        <div
+          style={styles.diagramOverlay}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Diagram zoom view"
+          onClick={() => setOpen(false)}
+        >
+          <div style={styles.diagramModal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.diagramToolbar}>
+              <button type="button" style={styles.diagramToolBtn} onClick={() => zoomBy(-ZOOM_STEP)} disabled={zoom <= ZOOM_MIN} aria-label="Zoom out">−</button>
+              <span style={styles.diagramZoomLabel}>{Math.round(zoom * 100)}%</span>
+              <button type="button" style={styles.diagramToolBtn} onClick={() => zoomBy(ZOOM_STEP)} disabled={zoom >= ZOOM_MAX} aria-label="Zoom in">+</button>
+              <button type="button" style={styles.diagramToolBtn} onClick={() => setZoom(1)} aria-label="Reset zoom">Reset</button>
+              <button type="button" style={{ ...styles.diagramToolBtn, marginLeft: 'auto' }} onClick={() => setOpen(false)} aria-label="Close zoom view">✕</button>
+            </div>
+            <div
+              ref={scrollRef}
+              style={{ ...styles.diagramScroll, cursor: panning ? 'grabbing' : 'grab' }}
+              onMouseDown={onPanStart}
+            >
+              <div
+                className="diagram-zoom"
+                style={{ width: `${zoom * 100}%`, margin: '0 auto' }}
+                dangerouslySetInnerHTML={{ __html: svg }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1312,6 +1458,7 @@ const MD_CSS = `
 .md-prose a { color: #b7791f; text-decoration: none; border-bottom: 1px solid #fcd389; }
 .md-prose a:hover { border-bottom-color: #F5A623; }
 .md-prose figure svg { max-width: 100%; height: auto; }
+.diagram-zoom svg { width: 100%; max-width: none !important; height: auto; }
 `;
 
 function GlobalMdStyles() {
@@ -1715,6 +1862,62 @@ const styles = {
   hint: { margin: '6px 0 0', fontSize: '11px', color: w.textFaint },
 
   // ── Diagrams ──
+  diagramFrame: { position: 'relative' as const },
+  diagramExpandBtn: {
+    position: 'absolute' as const,
+    top: '8px',
+    right: '8px',
+    zIndex: 1,
+    width: '28px',
+    height: '28px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '6px',
+    background: w.surface,
+    color: w.textMuted,
+    fontSize: '15px',
+    lineHeight: 1,
+    cursor: 'pointer',
+  },
+  diagramOverlay: {
+    position: 'fixed' as const,
+    inset: 0,
+    zIndex: 1000,
+    background: 'rgba(0,0,0,0.55)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '24px',
+  },
+  diagramModal: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    width: '100%',
+    height: '100%',
+    background: w.bg,
+    borderRadius: '10px',
+    overflow: 'hidden',
+  },
+  diagramToolbar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '8px 12px',
+    borderBottom: `1px solid ${w.border}`,
+    background: w.surface,
+  },
+  diagramToolBtn: {
+    minWidth: '32px',
+    height: '28px',
+    padding: '0 10px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '6px',
+    background: w.bg,
+    color: w.text,
+    fontSize: '14px',
+    cursor: 'pointer',
+  },
+  diagramZoomLabel: { minWidth: '48px', textAlign: 'center' as const, fontSize: '13px', color: w.textMuted },
+  diagramScroll: { flex: 1, overflow: 'auto' as const, padding: '20px' },
   diagramWrapper: {
     margin: '4px 0 20px',
     padding: '20px',
