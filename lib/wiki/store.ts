@@ -157,7 +157,20 @@ export async function getStoredBranches(): Promise<string[]> {
 }
 
 /**
- * Delete all topic documents for a branch (used by "Rebuild all" in Phase 4).
+ * Make `topics` the complete topic set for a branch: upsert them, then delete
+ * every other topic stored for the branch. Writing before deleting means
+ * readers never see an empty TOC, and a generation that overlaps another can't
+ * leave both sets behind (slugs differ between generations, so upserts alone
+ * would accumulate).
+ */
+export async function replaceTopics(branch: string, topics: WikiTopicDoc[]): Promise<void> {
+  await saveTopics(topics);
+  const col = await ensureWikiTocCollection();
+  await col.deleteMany({ kind: 'topic', branch, _id: { $nin: topics.map((t) => t._id) } } as any);
+}
+
+/**
+ * Delete all topic documents for a branch.
  */
 export async function deleteTopicsForBranch(branch: string): Promise<void> {
   const col = await ensureWikiTocCollection();

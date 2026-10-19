@@ -9,7 +9,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { syncBranch, toPublicTopics } from '@/lib/wiki/sync';
 
 export const runtime = 'nodejs';
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const DEFAULT_BRANCH = 'main';
 

@@ -9,9 +9,12 @@
  *   2. Reject (widen) any single prefix that covers more than 40% of the tree —
  *      too broad a prefix is likely a hallucination or over-generalisation.
  *      When rejected, the prefix is removed from the scope; explicit files keep.
- *   3. Ensure exactly one catch-all "Repo Config & Tooling" topic exists.
- *      If none was generated, inject a minimal one.
- *   4. Re-order topics by their existing order field.
+ *   3. Drop topics that repeat an earlier topic's title or question.
+ *   4. Ensure exactly one catch-all "Repo Config & Tooling" topic exists
+ *      (injecting one if needed), and give it every config file no other
+ *      topic claimed — otherwise those files sit unclassified and trigger an
+ *      LLM topic extension on every sync.
+ *   5. Re-order topics by their existing order field.
  */
 
 import type { TopicScope, WikiTopicDoc } from './types';
@@ -22,6 +25,30 @@ const CATCH_ALL_SLUG = 'repo-config-tooling';
 
 /** Max fraction of tree a single prefix may cover before it is rejected. */
 const MAX_PREFIX_FRACTION = 0.4;
+
+/** Root-level files, CI and common config — what the catch-all topic owns. */
+function isConfigPath(p: string): boolean {
+  return (
+    !p.includes('/') ||
+    p.startsWith('.github/') ||
+    p.startsWith('.husky/') ||
+    p.endsWith('.json') ||
+    p.endsWith('.yaml') ||
+    p.endsWith('.yml') ||
+    p.endsWith('.toml') ||
+    p.endsWith('.env') ||
+    p.endsWith('.env.example') ||
+    p.endsWith('.gitignore') ||
+    p.endsWith('.eslintrc') ||
+    p.endsWith('.prettierrc') ||
+    /\.config\.[cm]?[jt]s$/.test(p)
+  );
+}
+
+/** Lowercase, punctuation-free form used to spot duplicate titles/questions. */
+function normalize(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
 
 /**
  * Given a prefix (ends with '/') and all repo paths, count how many paths
@@ -59,9 +86,17 @@ export function repairGeneratedTopics(
 ): WikiTopicDoc[] {
   const now = new Date().toISOString();
   const result: WikiTopicDoc[] = [];
-  let hasCatchAll = false;
+  const seenText = new Set<string>();
 
   for (const topic of rawTopics) {
+    // Rule 3: drop duplicates of an earlier topic.
+    const title = normalize(topic.title);
+    const query = normalize(topic.suggestedQuery);
+    if (seenText.has(title) || seenText.has(query)) {
+      console.log(`[wiki] repairGeneratedTopics: dropping duplicate topic "${topic.title}"`);
+      continue;
+    }
+
     // Rule 2: repair over-broad prefixes.
     const repairedScope = repairScope(topic.scope, allPaths);
     const repairedTopic: WikiTopicDoc = { ...topic, scope: repairedScope };
@@ -72,60 +107,41 @@ export function repairGeneratedTopics(
       continue;
     }
 
-    if (
-      topic.slug === CATCH_ALL_SLUG ||
-      topic.title.toLowerCase().includes('repo config') ||
-      topic.title.toLowerCase().includes('tooling')
-    ) {
-      hasCatchAll = true;
-    }
-
+    seenText.add(title);
+    seenText.add(query);
     result.push(repairedTopic);
   }
 
-  // Rule 3: inject catch-all if absent.
-  if (!hasCatchAll) {
-    const catchAllScope: TopicScope = {
-      prefixes: [],
-      files: allPaths.filter(
-        (p) =>
-          !p.includes('/') || // root-level files
-          p.startsWith('.github/') ||
-          p.startsWith('.husky/') ||
-          p.endsWith('.json') ||
-          p.endsWith('.yaml') ||
-          p.endsWith('.yml') ||
-          p.endsWith('.env') ||
-          p.endsWith('.env.example') ||
-          p.endsWith('.gitignore') ||
-          p.endsWith('.eslintrc') ||
-          p.endsWith('.prettierrc'),
-      ),
+  // Rule 4: one catch-all, owning every config file nobody else claimed.
+  const unclaimedConfig = findUnclassifiedPaths(allPaths, result).filter(isConfigPath);
+  const catchAllIdx = result.findIndex((t) => t.slug === CATCH_ALL_SLUG);
+  if (catchAllIdx >= 0) {
+    const catchAll = result[catchAllIdx];
+    result[catchAllIdx] = {
+      ...catchAll,
+      section: 'Reference',
+      scope: { ...catchAll.scope, files: [...catchAll.scope.files, ...unclaimedConfig] },
     };
-
-    const catchAllDoc: WikiTopicDoc = {
+  } else if (unclaimedConfig.length > 0) {
+    const description =
+      'Root-level configuration files, tooling setup, CI/CD workflows, and repository conventions.';
+    result.push({
       _id: `${branch}:${CATCH_ALL_SLUG}`,
       kind: 'topic',
       branch,
       slug: CATCH_ALL_SLUG,
       order: result.length,
       title: CATCH_ALL_TITLE,
-      description:
-        'Root-level configuration files, tooling setup, CI/CD workflows, and repository conventions.',
+      description,
       suggestedQuery: 'How is this repository configured and what tooling does it use?',
-      scope: catchAllScope,
+      section: 'Reference',
+      scope: { prefixes: [], files: unclaimedConfig },
       createdAt: now,
       updatedAt: now,
-      $vectorize: `${CATCH_ALL_TITLE} Root-level configuration files, tooling setup, CI/CD workflows, and repository conventions.`.slice(0, 750),
-    };
-
-    // Only add if it covers at least one file.
-    if (!isScopeEmpty(allPaths, catchAllScope)) {
-      result.push(catchAllDoc);
-    }
+    });
   }
 
-  // Rule 4: re-index order fields sequentially.
+  // Rule 5: re-index order fields sequentially.
   return result.map((t, i) => ({ ...t, order: i }));
 }
 

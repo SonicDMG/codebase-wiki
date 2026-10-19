@@ -15,6 +15,10 @@ export interface TopicScope {
   files: string[];
 }
 
+/** Nav groups, in display order. */
+export const TOPIC_SECTIONS = ['Start here', 'How it works', 'Codebase', 'Reference'] as const;
+export type TopicSection = (typeof TOPIC_SECTIONS)[number];
+
 /**
  * Astra document for a single wiki topic (kind = "topic").
  * _id format: `${branch}:${slug}`
@@ -28,6 +32,8 @@ export interface WikiTopicDoc {
   title: string;
   description: string;
   suggestedQuery: string;
+  /** Nav group heading — one of TOPIC_SECTIONS. Absent on topics stored before sections existed. */
+  section?: TopicSection;
   scope: TopicScope;
   createdAt: string; // ISO-8601
   updatedAt: string; // ISO-8601

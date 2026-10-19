@@ -287,7 +287,7 @@ const MAX_SIZE_BYTES = 200_000;
 
 export function formatTreeForPrompt(entries: TreeEntry[]): string {
   return entries
-    .filter((e) => !shouldExclude(e.path))
+    .filter((e) => !isIgnoredPath(e.path))
     .map((e) => {
       const size = e.size ?? 0;
       return size > MAX_SIZE_BYTES ? `${e.path}  [large: ${Math.round(size / 1024)} KB]` : e.path;
@@ -295,8 +295,13 @@ export function formatTreeForPrompt(entries: TreeEntry[]): string {
     .join('\n');
 }
 
-/** Paths that are never useful for answering developer questions. */
-function shouldExclude(path: string): boolean {
+const BINARY_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'icns', 'svg',
+  'mp3', 'wav', 'm4a', 'mp4', 'mov', 'ttf', 'otf', 'woff', 'woff2', 'pdf', 'zip',
+]);
+
+/** Paths that are never useful for answering developer questions (or for wiki topics). */
+export function isIgnoredPath(path: string): boolean {
   return (
     path.startsWith('node_modules/') ||
     path.startsWith('.git/') ||
@@ -306,6 +311,13 @@ function shouldExclude(path: string): boolean {
     path.includes('/.expo/') ||
     path.endsWith('.lock') ||
     path.endsWith('pnpm-lock.yaml') ||
-    path.endsWith('package-lock.json')
+    path.endsWith('package-lock.json') ||
+    // Agent/tool state, not project source.
+    path.startsWith('.beads/') ||
+    path.startsWith('.claude/') ||
+    path.startsWith('.devin/') ||
+    path.startsWith('.worktrees/') ||
+    // Binary assets — nothing for the model to read.
+    BINARY_EXTENSIONS.has(path.slice(path.lastIndexOf('.') + 1).toLowerCase())
   );
 }

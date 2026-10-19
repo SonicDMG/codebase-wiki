@@ -13,8 +13,7 @@ import { generateTopics, buildSnapshotDoc } from '@/lib/wiki/generate';
 import {
   acquireLease,
   releaseLease,
-  deleteTopicsForBranch,
-  saveTopics,
+  replaceTopics,
   saveSnapshot,
   getStoredTopics,
   getSnapshot,
@@ -22,7 +21,7 @@ import {
 import { toPublicTopics } from '@/lib/wiki/sync';
 
 export const runtime = 'nodejs';
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 const DEFAULT_BRANCH = 'main';
 
@@ -49,8 +48,7 @@ export async function POST(req: NextRequest) {
     const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
 
     // Replace all topic documents for this branch wholesale
-    await deleteTopicsForBranch(branch);
-    await saveTopics(result.topics);
+    await replaceTopics(branch, result.topics);
 
     // Save fresh snapshot document
     const snapshot = buildSnapshotDoc(

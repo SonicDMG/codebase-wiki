@@ -8,15 +8,26 @@
  *                           rewriting existing topic titles/descriptions.
  */
 
-import { getLlmModel, llmClient } from '@/lib/llm';
-import { formatTreeForPrompt, getBranchHead, getFileTreeResult } from '@/lib/github';
+import type OpenAI from 'openai';
+import { getLlmModel, llmClient, supportsJsonMode } from '@/lib/llm';
+import {
+  fetchFileContents,
+  formatTreeForPrompt,
+  getBranchHead,
+  getFileTreeResult,
+  isIgnoredPath,
+} from '@/lib/github';
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
-import type { WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
+import { TOPIC_SECTIONS } from './types';
+import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
 
 export const REPO_OWNER = 'SonicDMG';
 export const REPO_NAME = 'walfly';
+
+/** README excerpt given to the generator so topics follow what the system does, not the folder layout. */
+const README_CHARS = 6_000;
 
 function slugify(title: string): string {
   return title
@@ -26,10 +37,101 @@ function slugify(title: string): string {
     .slice(0, 60);
 }
 
+/** Shared definition of a topic, used by both full generation and extension. */
+const TOPIC_FIELDS = `Each topic is an object with:
+  "section": one of ${TOPIC_SECTIONS.map((s) => `"${s}"`).join(' | ')}
+      Start here   — 1–2 topics: architecture overview, running it locally.
+      How it works — end-to-end flows and features. Most topics belong here.
+      Codebase     — a tour of a package or app, only where its structure is worth explaining.
+      Reference    — data model, configuration, tooling.
+  "title": 2–5 words, distinct from every other title
+  "description": one sentence on what the reader will understand (max 120 chars)
+  "suggestedQuery": the question sent to the Q&A assistant, phrased to get an explanatory page,
+      e.g. "How does a recording travel from the phone to a searchable document?" (max 110 chars)
+  "scope": { "prefixes": [directories ending in "/"], "files": [file paths] } — the source that
+      implements this topic. Used to notice when code changes; scopes may overlap.`;
+
+/** Raw topic as the LLM returns it, before validation. */
+interface RawTopic {
+  title?: unknown;
+  description?: unknown;
+  suggestedQuery?: unknown;
+  section?: unknown;
+  scope?: { prefixes?: unknown; files?: unknown };
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+/** Map one raw LLM topic to a stored doc, or null if required fields are missing. */
+function toTopicDoc(raw: RawTopic, branch: string, order: number, now: string): WikiTopicDoc | null {
+  if (typeof raw?.title !== 'string' || typeof raw.description !== 'string') return null;
+  if (typeof raw.suggestedQuery !== 'string') return null;
+  const title = raw.title.trim();
+  const slug = slugify(title);
+  const section = TOPIC_SECTIONS.includes(raw.section as TopicSection)
+    ? (raw.section as TopicSection)
+    : 'How it works';
+  return {
+    _id: `${branch}:${slug}`,
+    kind: 'topic',
+    branch,
+    slug,
+    order,
+    title,
+    description: raw.description.trim().slice(0, 150),
+    suggestedQuery: raw.suggestedQuery.trim().slice(0, 120),
+    section,
+    scope: { prefixes: stringArray(raw.scope?.prefixes), files: stringArray(raw.scope?.files) },
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Run a completion that must return a JSON object. Tries JSON mode first and
+ * falls back to a plain request for proxies that reject `response_format`.
+ * Returns null when the reply isn't parseable.
+ */
+async function completeJsonObject(system: string, user: string): Promise<Record<string, unknown> | null> {
+  const client = llmClient();
+  const request = {
+    model: getLlmModel(),
+    stream: false as const,
+    messages: [
+      { role: 'system' as const, content: system },
+      { role: 'user' as const, content: user },
+    ],
+  };
+
+  let response: OpenAI.Chat.Completions.ChatCompletion | null = null;
+  if (supportsJsonMode()) {
+    try {
+      response = await client.chat.completions.create({ ...request, response_format: { type: 'json_object' } });
+    } catch (err) {
+      console.warn('[wiki] JSON mode request failed, retrying without it:', err instanceof Error ? err.message : err);
+    }
+  }
+  response ??= await client.chat.completions.create(request);
+
+  const raw = response.choices[0]?.message?.content?.trim() ?? '';
+  try {
+    const cleaned = raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed: unknown = JSON.parse(cleaned);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    console.warn('[wiki] JSON parse failed, raw:', raw.slice(0, 300));
+    return null;
+  }
+}
+
 /**
  * Generate topics for a branch from scratch.
- * Fetches the file tree, calls the LLM, repairs the output, and returns
- * a SyncResult plus the snapshot data needed to persist it.
+ * Fetches the file tree and README, calls the LLM, repairs the output, and
+ * returns a SyncResult plus the snapshot data needed to persist it.
  */
 export async function generateTopics(branch: string): Promise<{
   result: SyncResult;
@@ -37,9 +139,6 @@ export async function generateTopics(branch: string): Promise<{
   unclassifiedPaths: string[];
   treeSha: string;
 }> {
-  const client = llmClient();
-  const model = getLlmModel();
-
   const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch);
   if (head.status !== 'ok') {
     throw new Error(
@@ -50,104 +149,45 @@ export async function generateTopics(branch: string): Promise<{
   }
   const { entries, treeSha } = await getFileTreeResult(REPO_OWNER, REPO_NAME, head.sha);
   const treeText = formatTreeForPrompt(entries);
-  const allPaths = entries.filter((e) => e.type === 'blob').map((e) => e.path);
+  const allPaths = entries.filter((e) => e.type === 'blob' && !isIgnoredPath(e.path)).map((e) => e.path);
+  const readme = (await fetchFileContents(REPO_OWNER, REPO_NAME, ['README.md'], head.sha))['README.md'] ?? '';
 
   console.log(`[wiki] generating topics for branch "${branch}" — ${allPaths.length} files`);
 
-  const response = await client.chat.completions.create({
-    model,
-    stream: false,
-    messages: [
-      {
-        role: 'system',
-        content: `You are a technical documentation assistant for the Walfly monorepo.
-Given the file tree below, produce a developer wiki table of contents.
+  const parsed = await completeJsonObject(
+    `You design the table of contents for a developer wiki about the Walfly monorepo.
+A newcomer reads these topics top to bottom to learn the codebase. Clicking a topic sends its
+suggestedQuery to a Q&A assistant that reads the source and writes a page.
 
-Output ONLY a JSON array of 10–14 topic objects with these fields:
-  - "title": short section title (3–6 words, e.g. "Backend API Overview")
-  - "description": one sentence describing what a developer will learn (max 120 chars)
-  - "suggestedQuery": a natural-language question a developer would ask (max 100 chars)
-  - "scope": an object with:
-      - "prefixes": array of directory paths with trailing "/" that belong to this topic
-        (e.g. ["packages/api/lib/", "packages/db/src/"]) — be narrow, not broad
-      - "files": array of individual file paths that belong to this topic
+Produce 8–12 topics that explain the system — its features, flows and concepts. Do NOT make one topic
+per directory. Good titles: "Recording Lifecycle", "Live Transcription Sidecar", "Search & Chat".
+Bad titles: "Mobile Hooks", "API Core Libraries", "Mobile UI Components".
+
+${TOPIC_FIELDS}
 
 Rules:
-- Every file in the tree should be covered by at least one topic.
-- No single prefix may cover more than 30% of all files — keep scopes narrow.
-- The LAST topic in the array MUST have title "Repo Config & Tooling" with:
-    slug: "repo-config-tooling"
-    scope.prefixes: [] (no prefixes — too broad)
-    scope.files: all root-level config files, .github/, CI/CD files, dotfiles, package.json files
-- Order topics from high-level (architecture, getting started) to low-level (data, infra).
-- No markdown fences, no prose — ONLY the raw JSON array.`,
-      },
-      {
-        role: 'user',
-        content: `File tree for ${REPO_OWNER}/${REPO_NAME} (branch: ${branch}):\n\n${treeText}`,
-      },
-    ],
-  });
-
-  const raw = response.choices[0]?.message?.content?.trim() ?? '[]';
-  let rawTopics: Array<{
-    title?: string;
-    description?: string;
-    suggestedQuery?: string;
-    scope?: { prefixes?: string[]; files?: string[] };
-  }> = [];
-
-  try {
-    const cleaned = raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-    const parsed = JSON.parse(cleaned);
-    if (Array.isArray(parsed)) rawTopics = parsed;
-  } catch {
-    console.warn('[wiki] generate: JSON parse failed, raw:', raw.slice(0, 300));
-  }
+- No two topics may cover the same subject, and no two questions may be near-duplicates.
+- Order topics by section: Start here, How it works, Codebase, Reference.
+- The LAST topic is title "Repo Config & Tooling", section "Reference", scope.prefixes [] and
+  scope.files listing root config files, CI files and package.json files.
+- Output ONLY a JSON object: {"topics": [ ... ]}. No markdown fences, no prose.`,
+    `README.md:\n${readme.slice(0, README_CHARS)}\n\nFile tree for ${REPO_OWNER}/${REPO_NAME} (branch: ${branch}):\n\n${treeText}`,
+  );
 
   const now = new Date().toISOString();
+  const sectionRank = (t: WikiTopicDoc) => TOPIC_SECTIONS.indexOf(t.section ?? 'How it works');
+  const mappedTopics = (Array.isArray(parsed?.topics) ? (parsed.topics as RawTopic[]) : [])
+    .map((t, i) => toTopicDoc(t, branch, i, now))
+    .filter((t): t is WikiTopicDoc => t !== null)
+    // Stable sort: keeps the model's order within each section.
+    .sort((a, b) => sectionRank(a) - sectionRank(b));
 
-  // Map raw LLM output to WikiTopicDoc array.
-  const mappedTopics: WikiTopicDoc[] = rawTopics
-    .filter(
-      (t) =>
-        typeof t?.title === 'string' &&
-        typeof t?.description === 'string' &&
-        typeof t?.suggestedQuery === 'string',
-    )
-    .map((t, i) => {
-      const title = String(t.title!).trim();
-      const slug = slugify(title);
-      return {
-        _id: `${branch}:${slug}`,
-        kind: 'topic' as const,
-        branch,
-        slug,
-        order: i,
-        title,
-        description: String(t.description!).trim().slice(0, 150),
-        suggestedQuery: String(t.suggestedQuery!).trim().slice(0, 120),
-        scope: {
-          prefixes: Array.isArray(t.scope?.prefixes)
-            ? t.scope!.prefixes.filter((p): p is string => typeof p === 'string')
-            : [],
-          files: Array.isArray(t.scope?.files)
-            ? t.scope!.files.filter((p): p is string => typeof p === 'string')
-            : [],
-        },
-        createdAt: now,
-        updatedAt: now,
-      } satisfies WikiTopicDoc;
-    });
-
-  // Repair: drop empty scopes, reject over-broad prefixes, ensure catch-all.
+  // Repair: drop empty/duplicate topics, reject over-broad prefixes, ensure catch-all.
   const repairedTopics = repairGeneratedTopics(mappedTopics, allPaths, branch);
   const unclassifiedPaths = findUnclassifiedPaths(allPaths, repairedTopics);
 
   if (unclassifiedPaths.length > 0) {
-    console.log(
-      `[wiki] ${unclassifiedPaths.length} paths unclassified after generation (will be classified in Phase 4)`,
-    );
+    console.log(`[wiki] ${unclassifiedPaths.length} paths unclassified after generation`);
   }
 
   // Build snapshot entries with blob SHAs from the GitHub tree API.
@@ -193,80 +233,47 @@ export async function extendTopics(
     return { updatedTopics: currentTopics, remainingUnclassified: [] };
   }
 
-  const client = llmClient();
-  const model = getLlmModel();
-
   const existingTitlesList = currentTopics
-    .map((t, i) => `${i + 1}. slug="${t.slug}" title="${t.title}"`)
+    .map((t, i) => `${i + 1}. slug="${t.slug}" title="${t.title}" — ${t.description}`)
     .join('\n');
 
   console.log(
     `[wiki/extend] incremental extension for ${unclassifiedPaths.length} unclassified paths on branch "${branch}"`,
   );
 
-  const response = await client.chat.completions.create({
-    model,
-    stream: false,
-    messages: [
-      {
-        role: 'system',
-        content: `You are a technical documentation assistant for the Walfly monorepo.
-You will be given a list of file paths that do not yet belong to any wiki topic.
-You may either:
-  (a) Assign each path to an EXISTING topic by returning an extension (add prefixes or files to its scope), OR
-  (b) Create a NEW topic for a genuinely new area of the codebase.
+  const parsed = await completeJsonObject(
+    `You maintain the table of contents of a developer wiki for the Walfly monorepo.
+You are given file paths that do not yet belong to any wiki topic.
 
-IMPORTANT RULES:
-- Do NOT rewrite, rename, or change the description of any existing topic.
-- Only output topics that need to change (extensions) or new topics.
+Almost always, assign each path to the EXISTING topic it most relates to by extending that topic's scope.
+Create a new topic ONLY when the paths form a whole new feature area that no existing topic could
+reasonably explain — never one that overlaps or rephrases an existing title. At most one new topic.
+
+${TOPIC_FIELDS}
+
+Rules:
+- Do NOT rename or re-describe existing topics.
 - Keep scopes narrow — no prefix covering more than 30% of all files.
-- Output ONLY a JSON object with two keys:
-    "extensions": array of { "slug": "<existing slug>", "newPrefixes": [...], "newFiles": [...] }
-    "newTopics":  array of { "title": "...", "description": "...", "suggestedQuery": "...", "scope": { "prefixes": [...], "files": [...] } }
+- Output ONLY a JSON object:
+    {"extensions": [{"slug": "<existing slug>", "newPrefixes": [...], "newFiles": [...]}],
+     "newTopics": [ <topic object> ]}
 - No markdown fences, no prose.`,
-      },
-      {
-        role: 'user',
-        content: `Existing topics:\n${existingTitlesList}\n\nUnclassified paths to assign:\n${unclassifiedPaths.join('\n')}`,
-      },
-    ],
-  });
-
-  const raw = response.choices[0]?.message?.content?.trim() ?? '{}';
-  let parsed: {
-    extensions?: Array<{ slug: string; newPrefixes?: string[]; newFiles?: string[] }>;
-    newTopics?: Array<{
-      title?: string;
-      description?: string;
-      suggestedQuery?: string;
-      scope?: { prefixes?: string[]; files?: string[] };
-    }>;
-  } = {};
-
-  try {
-    const cleaned = raw.replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '').trim();
-    parsed = JSON.parse(cleaned);
-  } catch {
-    console.warn('[wiki/extend] JSON parse failed, raw:', raw.slice(0, 300));
-  }
+    `Existing topics:\n${existingTitlesList}\n\nUnclassified paths to assign:\n${unclassifiedPaths.join('\n')}`,
+  );
 
   const now = new Date().toISOString();
   const updatedTopics: WikiTopicDoc[] = currentTopics.map((t) => ({ ...t }));
 
   // Apply extensions to existing topics (never touch title/description).
-  const extensionSlugs = new Set<string>();
-  for (const ext of parsed.extensions ?? []) {
-    if (typeof ext.slug !== 'string') continue;
-    const idx = updatedTopics.findIndex((t) => t.slug === ext.slug);
+  const extensions = Array.isArray(parsed?.extensions)
+    ? (parsed.extensions as Array<{ slug?: unknown; newPrefixes?: unknown; newFiles?: unknown }>)
+    : [];
+  for (const ext of extensions) {
+    const idx = updatedTopics.findIndex((t) => t.slug === ext?.slug);
     if (idx < 0) continue;
-    extensionSlugs.add(ext.slug);
     const topic = updatedTopics[idx];
-    const addedPrefixes = (ext.newPrefixes ?? []).filter(
-      (p): p is string => typeof p === 'string' && !topic.scope.prefixes.includes(p),
-    );
-    const addedFiles = (ext.newFiles ?? []).filter(
-      (f): f is string => typeof f === 'string' && !topic.scope.files.includes(f),
-    );
+    const addedPrefixes = stringArray(ext.newPrefixes).filter((p) => !topic.scope.prefixes.includes(p));
+    const addedFiles = stringArray(ext.newFiles).filter((f) => !topic.scope.files.includes(f));
     if (addedPrefixes.length > 0 || addedFiles.length > 0) {
       updatedTopics[idx] = {
         ...topic,
@@ -279,40 +286,16 @@ IMPORTANT RULES:
     }
   }
 
-  // Add new topics.
+  // Add new topics, skipping anything that duplicates an existing slug, title or question.
   const CATCH_ALL_SLUG = 'repo-config-tooling';
-  let order = updatedTopics.length;
-  for (const raw of parsed.newTopics ?? []) {
-    if (typeof raw?.title !== 'string' || typeof raw?.description !== 'string') continue;
-    const title = String(raw.title).trim();
-    const slug = title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 60);
-    // Don't create duplicates or overwrite the catch-all.
-    if (updatedTopics.some((t) => t.slug === slug) || slug === CATCH_ALL_SLUG) continue;
-    const newTopic: WikiTopicDoc = {
-      _id: `${branch}:${slug}`,
-      kind: 'topic',
-      branch,
-      slug,
-      order: order++,
-      title,
-      description: String(raw.description).trim().slice(0, 150),
-      suggestedQuery: String(raw.suggestedQuery ?? '').trim().slice(0, 120),
-      scope: {
-        prefixes: Array.isArray(raw.scope?.prefixes)
-          ? raw.scope!.prefixes.filter((p): p is string => typeof p === 'string')
-          : [],
-        files: Array.isArray(raw.scope?.files)
-          ? raw.scope!.files.filter((f): f is string => typeof f === 'string')
-          : [],
-      },
-      createdAt: now,
-      updatedAt: now,
-    };
-    updatedTopics.push(newTopic);
+  const taken = new Set(
+    updatedTopics.flatMap((t) => [t.slug, slugify(t.suggestedQuery)]).concat(CATCH_ALL_SLUG),
+  );
+  const newTopics = Array.isArray(parsed?.newTopics) ? (parsed.newTopics as RawTopic[]) : [];
+  for (const raw of newTopics.slice(0, 1)) {
+    const topic = toTopicDoc(raw, branch, updatedTopics.length, now);
+    if (!topic || taken.has(topic.slug) || taken.has(slugify(topic.suggestedQuery))) continue;
+    updatedTopics.push(topic);
   }
 
   // Apply broad-prefix guard from validate: drop over-broad prefixes (>40% tree).

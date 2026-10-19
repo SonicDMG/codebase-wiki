@@ -8,7 +8,7 @@
  *                           threshold is crossed.
  */
 
-import { getBranchHead, getFileTreeResult } from '@/lib/github';
+import { getBranchHead, getFileTreeResult, isIgnoredPath } from '@/lib/github';
 import { decodeFileList, diffSnapshots, encodeFileList } from './snapshot';
 import { findEmptyTopicIds, pathMatchesScope, promoteDirectoryPrefixes } from './scope';
 import {
@@ -18,12 +18,13 @@ import {
   getStoredBranches,
   getStoredTopics,
   releaseLease,
+  replaceTopics,
   saveSnapshot,
   saveTopics,
-  deleteTopicsForBranch,
 } from './store';
 import { buildSnapshotDoc, extendTopics, generateTopics, REPO_NAME, REPO_OWNER } from './generate';
 import { classifyFile } from './classify';
+import { TOPIC_SECTIONS } from './types';
 import type { SnapshotEntry, SyncOutcome, WikiSnapshotDoc, WikiTopicDoc } from './types';
 
 const CATCH_ALL_SLUG = 'repo-config-tooling';
@@ -34,18 +35,38 @@ export interface PublicTopic {
   description: string;
   suggestedQuery: string;
   slug: string;
+  section?: string;
 }
 
+/** Topics grouped by section (stable — stored order is kept within a section). */
 export function toPublicTopics(topics: WikiTopicDoc[]): PublicTopic[] {
-  return topics.map((t) => ({
+  const rank = (t: WikiTopicDoc) => (t.section ? TOPIC_SECTIONS.indexOf(t.section) : TOPIC_SECTIONS.length);
+  return [...topics].sort((a, b) => rank(a) - rank(b)).map((t) => ({
     title: t.title,
     description: t.description,
     suggestedQuery: t.suggestedQuery,
     slug: t.slug,
+    section: t.section,
   }));
 }
 
 const seedingBranches = new Set<string>();
+
+/**
+ * In-flight initial generations, per branch. The wiki page fires /toc and
+ * /sync together on load (twice in dev StrictMode); without this, each call
+ * ran its own LLM generation and stored a separate topic set.
+ */
+const generating = new Map<string, Promise<{ topics: WikiTopicDoc[]; snapshot: WikiSnapshotDoc }>>();
+
+async function generateAndStore(branch: string) {
+  const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
+  await replaceTopics(branch, result.topics);
+  const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
+  await saveSnapshot(snapshot);
+  console.log(`[wiki] generated and stored ${result.topics.length} topics for branch "${branch}"`);
+  return { topics: result.topics, snapshot };
+}
 
 // ── ensureTopics ──────────────────────────────────────────────────────────────
 
@@ -58,13 +79,11 @@ const seedingBranches = new Set<string>();
 export async function ensureTopics(
   branch: string,
 ): Promise<{ topics: WikiTopicDoc[]; snapshot: WikiSnapshotDoc; generated: boolean }> {
-  let hadTopics = false;
   try {
     const [stored, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
     if (stored.length > 0 && snapshot) {
       return { topics: stored, snapshot, generated: false };
     }
-    hadTopics = stored.length > 0;
   } catch (err) {
     console.warn('[wiki] Astra read failed, will try generation:', err);
   }
@@ -95,8 +114,7 @@ export async function ensureTopics(
             leaseUntil: null,
             lastCheckedAt: now,
           };
-          if (hadTopics) await deleteTopicsForBranch(branch);
-          await saveTopics(seededTopics);
+          await replaceTopics(branch, seededTopics);
           await saveSnapshot(seededSnapshot);
           console.log(`[wiki] seeded branch "${branch}" from "${donor}" (${seededTopics.length} topics)`);
 
@@ -118,14 +136,13 @@ export async function ensureTopics(
     }
   }
 
-  const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
   // Topics without a snapshot cannot be diffed — replace them wholesale.
-  if (hadTopics) await deleteTopicsForBranch(branch);
-  await saveTopics(result.topics);
-  const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
-  await saveSnapshot(snapshot);
-  console.log(`[wiki] generated and stored ${result.topics.length} topics for branch "${branch}"`);
-  return { topics: result.topics, snapshot, generated: true };
+  let pending = generating.get(branch);
+  if (!pending) {
+    pending = generateAndStore(branch).finally(() => generating.delete(branch));
+    generating.set(branch, pending);
+  }
+  return { ...(await pending), generated: true };
 }
 
 // ── syncBranch ────────────────────────────────────────────────────────────────
@@ -231,7 +248,7 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
       ...diff.renames.map((r) => r.newPath),
     ];
     let unclassifiedPaths = [...new Set(candidates)].filter(
-      (p) => pathSet.has(p) && !current.some((t) => pathMatchesScope(p, t.scope)),
+      (p) => pathSet.has(p) && !isIgnoredPath(p) && !current.some((t) => pathMatchesScope(p, t.scope)),
     );
     const absorbed = diff.additions.filter((a) => !unclassifiedPaths.includes(a.path)).length;
 
