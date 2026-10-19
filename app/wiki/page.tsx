@@ -110,11 +110,13 @@ export default function WikiPage() {
   const [rebuilding, setRebuilding] = useState(false);
   const [tocCollapsed, setTocCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [resizing, setResizing] = useState(false);
 
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
   const dragStartWidth = useRef(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  const sidebarRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const statusMenuRef = useRef<HTMLDivElement>(null);
   const tocReqIdRef = useRef(0);
@@ -360,21 +362,27 @@ export default function WikiPage() {
   }, []);
 
   // ── Drag-to-resize sidebar ────────────────────────────────────────────────
+  // Width is written straight to the DOM while dragging (no per-move re-render
+  // of the message list); React state is committed once on mouse-up.
   const onDividerMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     isDragging.current = true;
     dragStartX.current = e.clientX;
     dragStartWidth.current = sidebarWidth;
+    let latest = sidebarWidth;
+    setResizing(true);
 
     const onMouseMove = (ev: MouseEvent) => {
-      if (!isDragging.current || !containerRef.current) return;
+      if (!isDragging.current || !containerRef.current || !sidebarRef.current) return;
       const containerW = containerRef.current.offsetWidth;
       const delta = dragStartX.current - ev.clientX;
-      const next = Math.min(Math.max(dragStartWidth.current + delta, 240), containerW - 320);
-      setSidebarWidth(next);
+      latest = Math.min(Math.max(dragStartWidth.current + delta, 240), containerW - 320);
+      sidebarRef.current.style.width = `${latest}px`;
     };
     const onMouseUp = () => {
       isDragging.current = false;
+      setSidebarWidth(latest);
+      setResizing(false);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
@@ -702,7 +710,14 @@ export default function WikiPage() {
         )}
 
         {/* Right: code reference sidebar */}
-        <aside style={{ ...styles.sidebar, ...(sidebarCollapsed ? styles.sidebarCollapsed : { width: sidebarWidth }) }}>
+        <aside
+          ref={sidebarRef}
+          style={{
+            ...styles.sidebar,
+            ...(sidebarCollapsed ? styles.sidebarCollapsed : { width: sidebarWidth }),
+            ...(resizing ? { transition: 'none' } : {}),
+          }}
+        >
           <div style={styles.panelHeader}>
             <button
               type="button"
