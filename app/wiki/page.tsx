@@ -96,6 +96,8 @@ export default function WikiPage() {
   const [syncWarning, setSyncWarning] = useState<string | null>(null);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
+  const [tocCollapsed, setTocCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
@@ -601,24 +603,37 @@ export default function WikiPage() {
       <div ref={containerRef} style={styles.body}>
 
         {/* Left: TOC nav */}
-        <nav style={styles.tocPane}>
-          <div style={styles.tocHeading}>Topics</div>
-          {tocLoading ? (
-            <div style={styles.tocLoading}>Loading topics…</div>
-          ) : tocTopics.length === 0 ? (
-            <div style={styles.tocLoading}>No topics available.</div>
-          ) : (
-            tocTopics.map((topic, idx) => (
-              <button
-                key={idx}
-                style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
-                onClick={() => handleTopicClick(topic, idx)}
-                title={topic.description}
-                disabled={loading}
-              >
-                {topic.title}
-              </button>
-            ))
+        <nav style={{ ...styles.tocPane, ...(tocCollapsed ? styles.tocPaneCollapsed : {}) }}>
+          <div style={styles.panelHeader}>
+            {!tocCollapsed && <span style={styles.panelHeading}>Topics</span>}
+            <button
+              type="button"
+              onClick={() => setTocCollapsed((v) => !v)}
+              style={styles.collapseBtn}
+              title={tocCollapsed ? 'Expand topics' : 'Collapse topics'}
+              aria-label={tocCollapsed ? 'Expand topics panel' : 'Collapse topics panel'}
+            >
+              {tocCollapsed ? '»' : '«'}
+            </button>
+          </div>
+          {!tocCollapsed && (
+            tocLoading ? (
+              <div style={styles.tocLoading}>Loading topics…</div>
+            ) : tocTopics.length === 0 ? (
+              <div style={styles.tocLoading}>No topics available.</div>
+            ) : (
+              tocTopics.map((topic, idx) => (
+                <button
+                  key={idx}
+                  style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
+                  onClick={() => handleTopicClick(topic, idx)}
+                  title={topic.description}
+                  disabled={loading}
+                >
+                  {topic.title}
+                </button>
+              ))
+            )
           )}
         </nav>
 
@@ -641,16 +656,32 @@ export default function WikiPage() {
           </div>
         </div>
 
-        {/* Drag handle */}
-        <div style={styles.divider} onMouseDown={onDividerMouseDown} title="Drag to resize" />
+        {/* Drag handle (hidden when sidebar is collapsed) */}
+        {!sidebarCollapsed && (
+          <div style={styles.divider} onMouseDown={onDividerMouseDown} title="Drag to resize" />
+        )}
 
         {/* Right: code reference sidebar */}
-        <aside style={{ ...styles.sidebar, width: sidebarWidth, flexShrink: 0 }}>
-          <Sidebar
-            refs={parsedLatest?.refs ?? []}
-            activeRef={activeRef}
-            onRefClick={(idx) => setActiveRef(idx)}
-          />
+        <aside style={{ ...styles.sidebar, ...(sidebarCollapsed ? styles.sidebarCollapsed : { width: sidebarWidth }) }}>
+          <div style={styles.panelHeader}>
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed((v) => !v)}
+              style={styles.collapseBtn}
+              title={sidebarCollapsed ? 'Expand references' : 'Collapse references'}
+              aria-label={sidebarCollapsed ? 'Expand references panel' : 'Collapse references panel'}
+            >
+              {sidebarCollapsed ? '«' : '»'}
+            </button>
+            {!sidebarCollapsed && <span style={styles.panelHeading}>References</span>}
+          </div>
+          {!sidebarCollapsed && (
+            <Sidebar
+              refs={parsedLatest?.refs ?? []}
+              activeRef={activeRef}
+              onRefClick={(idx) => setActiveRef(idx)}
+            />
+          )}
         </aside>
       </div>
 
@@ -908,7 +939,6 @@ function Sidebar({ refs, activeRef, onRefClick }: SidebarProps) {
 
   return (
     <div style={styles.sidebarContent}>
-      <div style={styles.sidebarHeading}>References</div>
       {refs.map((ref) => (
         <RefCard
           key={ref.index}
@@ -1255,13 +1285,36 @@ const styles = {
   tocPane: {
     width: '220px',
     flexShrink: 0,
+    overflowX: 'hidden' as const,
     overflowY: 'auto' as const,
     background: w.surface,
     borderRight: `1px solid ${w.border}`,
-    padding: '16px 0',
+    paddingTop: '0',
+    paddingBottom: '8px',
     display: 'flex',
     flexDirection: 'column' as const,
     gap: '2px',
+    transition: 'width 0.22s ease',
+  },
+  panelHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '8px 10px',
+    borderBottom: `1px solid ${w.border}`,
+    flexShrink: 0,
+    gap: '8px',
+    marginBottom: '4px',
+  },
+  panelHeading: {
+    fontSize: '10px',
+    fontWeight: 600,
+    color: w.textFaint,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.1em',
+    margin: 0,
+    padding: 0,
+    lineHeight: 1,
   },
   tocHeading: {
     fontSize: '10px',
@@ -1297,7 +1350,30 @@ const styles = {
     borderLeft: `3px solid ${w.amber}`,
     paddingLeft: '13px',
   },
+  tocPaneCollapsed: {
+    width: '44px',
+    paddingTop: '8px',
+    paddingBottom: '8px',
+  },
   tocDivider: { width: '1px', flexShrink: 0, background: w.border },
+  // Collapse toggle button — small rounded square, sits inline in the panel header
+  collapseBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '26px',
+    height: '26px',
+    background: w.bg,
+    border: `1px solid ${w.border}`,
+    borderRadius: '6px',
+    cursor: 'pointer',
+    color: w.textMuted,
+    fontSize: '13px',
+    fontWeight: 700,
+    lineHeight: 1,
+    padding: 0,
+    flexShrink: 0,
+  },
 
   // Chat
   chatPane: {
@@ -1359,7 +1435,20 @@ const styles = {
   link: { color: w.amber, textDecoration: 'none' },
 
   // Sidebar
-  sidebar: { overflowY: 'auto' as const, background: w.surface, borderLeft: `1px solid ${w.border}` },
+  sidebar: {
+    overflowY: 'auto' as const,
+    overflowX: 'hidden' as const,
+    background: w.surface,
+    borderLeft: `1px solid ${w.border}`,
+    display: 'flex',
+    flexDirection: 'column' as const,
+    transition: 'width 0.22s ease',
+    flexShrink: 0,
+  },
+  sidebarCollapsed: {
+    width: '44px',
+    overflowY: 'hidden' as const,
+  },
   sidebarEmpty: { height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '32px' },
   sidebarEmptyText: { color: w.textFaint, fontSize: '13px', textAlign: 'center' as const, lineHeight: 1.7, margin: 0 },
   sidebarContent: { padding: '16px', display: 'flex', flexDirection: 'column' as const, gap: '12px' },
