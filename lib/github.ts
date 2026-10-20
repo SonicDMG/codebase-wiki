@@ -3,20 +3,23 @@
  *
  * Helpers for fetching live codebase content from GitHub.
  *
- * Two in-memory caches — both tied to the same TTL so they expire together:
+ * Two in-memory caches. Callers key them by commit SHA, so an entry is
+ * immutable and a long TTL cannot serve stale content; the TTL only bounds
+ * memory. It is deliberately much longer than one chat turn (streaming an
+ * answer alone can take a minute), so a conversation never re-fetches.
  *
- *   Tree cache   — the flat file list for the repo (single entry, 60 s TTL).
- *                  Avoids burning a GitHub API call on every chat turn just to
- *                  get the file list.
+ *   Tree cache   — the flat file list per commit (TREE_CACHE_MAX entries,
+ *                  30 min TTL). Avoids burning a GitHub API call on every chat
+ *                  turn just to get the file list.
  *
  *   Content cache — raw text of individual files, keyed by
- *                   "<owner>/<repo>/<branch>/<path>" (max FILE_CACHE_MAX entries,
- *                   5 min TTL). The same 10-15 files are fetched repeatedly for
+ *                   "<owner>/<repo>/<ref>/<path>" (max FILE_CACHE_MAX entries,
+ *                   30 min TTL). The same 10-15 files are fetched repeatedly for
  *                   related questions; caching them saves ~300 ms per follow-up
  *                   and significantly reduces GitHub API usage.
  *
- *   Both caches are invalidated together when the tree TTL expires, so cached
- *   file contents are never older than the tree snapshot they were selected from.
+ *   If a caller passes a mutable ref (a branch name or 'HEAD') instead of a
+ *   commit SHA, entries can be up to 30 min old. Pass the SHA.
  *
  * With GITHUB_TOKEN set, the authenticated rate limit is 5 000 req/hr.
  * Without it, the unauthenticated limit is 60 req/hr — fine for local dev.
@@ -50,10 +53,10 @@ export type BranchHeadResult =
   | { status: 'not-modified'; etag: string | null }
   | { status: 'rate-limited'; retryAfterSeconds: number | null };
 
-const TREE_TTL_MS = 60_000;
+const TREE_TTL_MS = 30 * 60_000; // 30 minutes
 const TREE_CACHE_MAX = 20;
-const FILE_TTL_MS = 5 * 60_000; // 5 minutes
-const FILE_CACHE_MAX = 50;      // max cached files; evicts oldest on overflow
+const FILE_TTL_MS = 30 * 60_000; // 30 minutes
+const FILE_CACHE_MAX = 200;     // max cached files; evicts oldest on overflow (~15 files per question)
 
 /** Short cache for branch lists — avoids burning calls on repeated branch-picker opens. */
 const BRANCHES_TTL_MS = 30_000;
@@ -163,7 +166,7 @@ export async function getFileTreeResult(
     if (oldestKey !== undefined) treeCache.delete(oldestKey);
   }
   treeCache.set(cacheKey, { ...result, expiresAt: now + TREE_TTL_MS });
-  console.log(`[github] file tree fetched: ${entries.length} files (cached for 60 s)`);
+  console.log(`[github] file tree fetched: ${entries.length} files (cached for 30 min)`);
 
   return result;
 }
@@ -171,7 +174,7 @@ export async function getFileTreeResult(
 /**
  * Fetches the raw content of multiple files in parallel at `ref` (a commit SHA,
  * or a branch name; defaults to 'main').
- * Results are cached for FILE_TTL_MS (5 min). Cache entries are evicted LRU-style
+ * Results are cached for FILE_TTL_MS (30 min). Cache entries are evicted LRU-style
  * when FILE_CACHE_MAX is exceeded. Files that 404 or fail are omitted from the
  * result map (not cached, so a transient failure is retried next turn).
  */
