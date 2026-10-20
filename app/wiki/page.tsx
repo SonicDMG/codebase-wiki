@@ -11,6 +11,10 @@
  * The model writes plain Markdown plus ```diagram fences holding a small JSON
  * spec, which we compile to Mermaid ourselves so diagrams can't have syntax
  * errors. Raw HTML from the model is dropped by react-markdown (skipHtml).
+ *
+ * Every answer has two modes the reader can flip between: 'wiki' (the
+ * technical page) and 'picture' (a picture book an 8-year-old could follow,
+ * built from ```picture JSON cards). The other mode is generated on demand.
  */
 
 import { isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -47,13 +51,38 @@ const c = {
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-interface Message {
-  id: string;
-  role: 'user' | 'assistant';
+type AnswerMode = 'wiki' | 'picture';
+
+const ANSWER_MODES: { mode: AnswerMode; label: string; title: string }[] = [
+  { mode: 'wiki', label: '📖 Wiki', title: 'Technical wiki page' },
+  { mode: 'picture', label: '🎨 Picture book', title: 'Explained with pictures, simple enough for an 8-year-old' },
+];
+
+interface Answer {
   content: string;
   pending?: boolean;
   /** Commit the answer was grounded in (sent by the server before the first token). */
   commit?: string;
+}
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  /** The question (user messages). Assistant text lives in `answers`. */
+  content: string;
+  /** Assistant only: one answer per mode, each generated the first time it's shown. */
+  answers?: Partial<Record<AnswerMode, Answer>>;
+  /** Assistant only: the mode currently shown. */
+  view?: AnswerMode;
+}
+
+function shownAnswer(m: Message | undefined): Answer | undefined {
+  return m?.answers?.[m.view ?? 'wiki'];
+}
+
+/** What the server sees for a turn: the question, or the answer the reader is looking at. */
+function toHistory(m: Message) {
+  return { role: m.role, content: m.role === 'user' ? m.content : shownAnswer(m)?.content ?? '' };
 }
 
 /** A code block extracted from the LLM response, shown in the sidebar. */
@@ -89,10 +118,17 @@ export default function WikiPage() {
     {
       id: 'welcome',
       role: 'assistant',
-      content:
-        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Click a citation chip to see the exact code in the references panel',
+      content: '',
+      view: 'wiki',
+      answers: {
+        wiki: {
+          content:
+            '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Choose **📖 Wiki** for the technical page or **🎨 Picture book** for a simple, picture-first explanation — and flip any answer between the two\n- Click a citation chip to see the exact code in the references panel',
+        },
+      },
     },
   ]);
+  const [answerMode, setAnswerMode] = useState<AnswerMode>('wiki');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [activeRef, setActiveRef] = useState<number | null>(null);
@@ -405,22 +441,24 @@ export default function WikiPage() {
 
   const latestAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
 
-  // ── Send ──────────────────────────────────────────────────────────────────
-  const send = useCallback(async (overrideQuestion?: string) => {
-    const question = (overrideQuestion ?? input).trim();
-    if (!question || loading) return;
+  // ── Stream one answer (in one mode) into an assistant message ─────────────
+  const streamAnswer = useCallback(async (
+    assistantId: string,
+    mode: AnswerMode,
+    history: { role: Message['role']; content: string }[],
+  ) => {
+    const patch = (fn: (a: Answer) => Answer) =>
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? { ...m, answers: { ...m.answers, [mode]: fn(m.answers?.[mode] ?? { content: '' }) } }
+            : m,
+        ),
+      );
 
-    if (!overrideQuestion) setInput('');
     setLoading(true);
     setActiveRef(null);
-
-    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question };
-    const assistantId = crypto.randomUUID();
-    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', pending: true };
-
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
-
-    const history = [...messages, userMsg].map((m) => ({ role: m.role, content: m.content }));
+    patch(() => ({ content: '', pending: true }));
 
     try {
       const res = await fetch('/api/wiki/chat', {
@@ -428,19 +466,14 @@ export default function WikiPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           branch: wikiBranch ?? undefined,
+          mode,
           messages: history,
         }),
       });
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantId
-              ? { ...m, content: `Error: ${(err as { error?: string }).error ?? 'Unknown error'}`, pending: false }
-              : m,
-          ),
-        );
+        patch((a) => ({ ...a, content: `Error: ${(err as { error?: string }).error ?? 'Unknown error'}`, pending: false }));
         return;
       }
 
@@ -464,41 +497,53 @@ export default function WikiPage() {
             const parsed = JSON.parse(data) as { token?: string; error?: string; commit?: string };
             if (parsed.commit) {
               const commit = parsed.commit;
-              setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, commit } : m)));
+              patch((a) => ({ ...a, commit }));
             } else if (parsed.error) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? { ...m, content: m.content + `\n\nError: ${parsed.error}`, pending: false }
-                    : m,
-                ),
-              );
+              patch((a) => ({ ...a, content: a.content + `\n\nError: ${parsed.error}`, pending: false }));
             } else if (parsed.token) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, content: m.content + parsed.token } : m,
-                ),
-              );
+              const token = parsed.token;
+              patch((a) => ({ ...a, content: a.content + token }));
             }
           } catch { /* partial line */ }
         }
       }
     } catch (err) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId
-            ? { ...m, content: `Network error: ${err instanceof Error ? err.message : String(err)}`, pending: false }
-            : m,
-        ),
-      );
+      patch((a) => ({ ...a, content: `Network error: ${err instanceof Error ? err.message : String(err)}`, pending: false }));
     } finally {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === assistantId ? { ...m, pending: false } : m)),
-      );
+      patch((a) => ({ ...a, pending: false }));
       setLoading(false);
       inputRef.current?.focus();
     }
-  }, [input, loading, messages, wikiBranch]);
+  }, [wikiBranch]);
+
+  // ── Send ──────────────────────────────────────────────────────────────────
+  const send = useCallback(async (overrideQuestion?: string) => {
+    const question = (overrideQuestion ?? input).trim();
+    if (!question || loading) return;
+
+    if (!overrideQuestion) setInput('');
+
+    const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question };
+    const assistantId = crypto.randomUUID();
+    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', view: answerMode, answers: {} };
+
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    await streamAnswer(assistantId, answerMode, [...messages, userMsg].map(toHistory));
+  }, [input, loading, messages, answerMode, streamAnswer]);
+
+  // ── Flip an answer between modes; the first flip generates the other version ─
+  const showAnswerAs = useCallback((assistantId: string, mode: AnswerMode) => {
+    const idx = messages.findIndex((m) => m.id === assistantId);
+    const msg = messages[idx];
+    if (!msg || msg.view === mode) return;
+    const needsAnswer = !msg.answers?.[mode];
+    if (needsAnswer && loading) return;
+
+    setActiveRef(null);
+    setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, view: mode } : m)));
+    // History ends with the question this message answers.
+    if (needsAnswer) void streamAnswer(assistantId, mode, messages.slice(0, idx).map(toHistory));
+  }, [messages, loading, streamAnswer]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -542,7 +587,8 @@ export default function WikiPage() {
     }
   };
 
-  const parsedLatest = latestAssistantMsg ? parseMessage(latestAssistantMsg.content, latestAssistantMsg.commit) : null;
+  const latestAnswer = shownAnswer(latestAssistantMsg);
+  const parsedLatest = latestAnswer ? parseMessage(latestAnswer.content, latestAnswer.commit) : null;
 
   return (
     <div style={styles.root}>
@@ -699,6 +745,8 @@ export default function WikiPage() {
                 parsedLatest={parsedLatest}
                 activeRef={activeRef}
                 onCitationClick={handleCitationClick}
+                loading={loading}
+                onShowAs={(mode) => showAnswerAs(msg.id, mode)}
               />
             ))}
           </div>
@@ -742,6 +790,10 @@ export default function WikiPage() {
 
       {/* ── Input ── */}
       <footer style={styles.footer}>
+        <div style={styles.modeRow}>
+          <span style={styles.modeLabel}>Answer as</span>
+          <ModeToggle value={answerMode} onChange={setAnswerMode} />
+        </div>
         <div style={styles.inputRow}>
           <textarea
             ref={inputRef}
@@ -779,29 +831,95 @@ interface MessageBlockProps {
   parsedLatest: ParsedMessage | null;
   activeRef: number | null;
   onCitationClick: (idx: number) => void;
+  loading: boolean;
+  onShowAs: (mode: AnswerMode) => void;
 }
 
-function MessageBlock({ message, isLatestAssistant, parsedLatest, activeRef, onCitationClick }: MessageBlockProps) {
+function MessageBlock({
+  message, isLatestAssistant, parsedLatest, activeRef, onCitationClick, loading, onShowAs,
+}: MessageBlockProps) {
   if (message.role === 'user') {
     return <h1 id={`msg-${message.id}`} style={styles.question}>{message.content}</h1>;
   }
-  const streaming = !!message.pending;
+  const view = message.view ?? 'wiki';
+  const answer = shownAnswer(message);
+  const content = answer?.content ?? '';
+  const streaming = !!answer?.pending;
+  const proseClass = view === 'picture' ? 'md-prose md-picture' : 'md-prose';
   return (
     <article style={styles.answer}>
-      {streaming && !message.content ? (
-        <span style={styles.pending}>Reading the source…</span>
+      {message.id !== 'welcome' && (
+        <div style={styles.answerToolbar}>
+          <ModeToggle
+            value={view}
+            onChange={onShowAs}
+            // Generating the other version is a new request; wait for the current one.
+            isDisabled={(mode) => loading && !message.answers?.[mode]}
+            size="small"
+          />
+        </div>
+      )}
+      {!content ? (
+        <span style={styles.pending}>
+          {view === 'picture' ? 'Drawing the pictures…' : 'Reading the source…'}
+        </span>
       ) : isLatestAssistant && parsedLatest ? (
         <ProseContent
+          className={proseClass}
           prose={parsedLatest.prose}
           refs={parsedLatest.refs}
+          commit={answer?.commit}
           streaming={streaming}
           activeRef={activeRef}
           onCitationClick={onCitationClick}
         />
       ) : (
-        <MarkdownContent content={parseMessage(message.content, message.commit).prose} />
+        <MarkdownContent
+          className={proseClass}
+          content={parseMessage(content, answer?.commit).prose}
+          commit={answer?.commit}
+        />
       )}
     </article>
+  );
+}
+
+// ── ModeToggle ─────────────────────────────────────────────────────────────
+
+interface ModeToggleProps {
+  value: AnswerMode;
+  onChange: (mode: AnswerMode) => void;
+  isDisabled?: (mode: AnswerMode) => boolean;
+  size?: 'small' | 'normal';
+}
+
+function ModeToggle({ value, onChange, isDisabled, size = 'normal' }: ModeToggleProps) {
+  return (
+    <div role="radiogroup" aria-label="Answer style" style={styles.modeToggle}>
+      {ANSWER_MODES.map(({ mode, label, title }) => {
+        const active = mode === value;
+        const disabled = !active && !!isDisabled?.(mode);
+        return (
+          <button
+            key={mode}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            title={disabled ? 'Available once the current answer finishes' : title}
+            disabled={disabled}
+            onClick={() => onChange(mode)}
+            style={{
+              ...styles.modeBtn,
+              ...(size === 'small' ? styles.modeBtnSmall : {}),
+              ...(active ? styles.modeBtnActive : {}),
+              ...(disabled ? styles.modeBtnDisabled : {}),
+            }}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1109,13 +1227,187 @@ function DiagramBlock({ source, streaming }: { source: string; streaming: boolea
   return <MermaidBlock definition={definition} streaming={streaming} />;
 }
 
+// ── Picture cards ──────────────────────────────────────────────────────────
+//
+// Picture-book answers are built from ```picture fences holding one JSON card
+// (see picturePrompt in the chat route). Cards cite code as "path:START-END";
+// with the answer's commit that becomes the same permalink a Markdown citation
+// would use, so it renders as a citation chip and lands in the sidebar.
+
+interface PictureCite { url: string; label: string }
+
+const CITE_SPEC = /^\s*([^\s:]+):(\d+)(?:-(\d+))?\s*$/;
+
+function citeToRef(cite: unknown, commit: string | undefined): PictureCite | null {
+  if (!commit || typeof cite !== 'string') return null;
+  const m = cite.match(CITE_SPEC);
+  if (!m) return null;
+  const [, path, start, end = start] = m;
+  return {
+    url: `${REPO_URL}/blob/${commit}/${path}#L${start}-L${end}`,
+    label: `${path.split('/').pop()}:${start}-${end}`,
+  };
+}
+
+/** A card item's citation. Models sometimes put the "path:START-END" in `real` instead. */
+function itemCite(item: Record<string, unknown>): unknown {
+  if (item.cite !== undefined) return item.cite;
+  return typeof item.real === 'string' && CITE_SPEC.test(item.real) ? item.real : undefined;
+}
+
+/** A cast member's real name, shortened to the file name when the model gave a path. */
+function realName(value: unknown): string {
+  const text = txt(value);
+  const name = text.match(CITE_SPEC)?.[1] ?? text;
+  return /^[^\s]+\/[^\s]+$/.test(name) ? name.split('/').pop()! : name;
+}
+
+/** Every citation in a card, in reading order. */
+function pictureCites(spec: unknown): unknown[] {
+  if (!spec || typeof spec !== 'object') return [];
+  const d = spec as Record<string, unknown>;
+  return [...list(d.members), ...list(d.panels)].map(itemCite).concat(d.cite);
+}
+
+/** Coerce a model-provided value to display text. */
+function txt(value: unknown): string {
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+}
+
+function list(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter((v): v is Record<string, unknown> => !!v && typeof v === 'object') : [];
+}
+
+interface PictureBlockProps {
+  source: string;
+  streaming: boolean;
+  commit: string | undefined;
+  anchor: AnchorOverride;
+}
+
+function PictureBlock({ source, streaming, commit, anchor }: PictureBlockProps) {
+  let spec: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = JSON.parse(source);
+    if (parsed && typeof parsed === 'object') spec = parsed as Record<string, unknown>;
+  } catch {
+    // Partial JSON mid-stream, or malformed.
+  }
+  if (!spec) {
+    return streaming
+      ? <div className="pic-loading">drawing a picture…</div>
+      : <div className="pic-loading">This picture couldn&apos;t be drawn.</div>;
+  }
+
+  const cite = (value: unknown) => {
+    const ref = citeToRef(value, commit);
+    return ref ? <span className="pic-cite">{anchor({ href: ref.url, children: ref.label })}</span> : null;
+  };
+
+  switch (spec.type) {
+    case 'analogy':
+      return (
+        <figure className="pic-card pic-analogy">
+          <div className="pic-analogy-head">
+            <span className="pic-emoji-xl" aria-hidden>{txt(spec.emoji) || '💡'}</span>
+            <div>
+              <div className="pic-kicker">Think of it like this</div>
+              <div className="pic-title">{txt(spec.title)}</div>
+              {txt(spec.text) && <div className="pic-text">{txt(spec.text)}</div>}
+            </div>
+          </div>
+          {list(spec.pairs).length > 0 && (
+            <div className="pic-pairs">
+              {list(spec.pairs).map((p, i) => (
+                <div key={i} className="pic-pair">
+                  <span className="pic-emoji" aria-hidden>{txt(p.emoji)}</span>
+                  <span className="pic-thing">{txt(p.thing)}</span>
+                  <span className="pic-equals" aria-label="is">=</span>
+                  <span className="pic-real">{txt(p.is)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </figure>
+      );
+
+    case 'cast':
+      return (
+        <figure className="pic-card">
+          <div className="pic-kicker">Meet the characters</div>
+          <div className="pic-cast">
+            {list(spec.members).map((m, i) => (
+              <div key={i} className="pic-member">
+                <span className="pic-emoji-lg" aria-hidden>{txt(m.emoji) || '🙂'}</span>
+                <div className="pic-name">{txt(m.name)}</div>
+                {txt(m.real) && <code className="pic-real-name" title={txt(m.real)}>{realName(m.real)}</code>}
+                <div className="pic-text">{txt(m.job)}</div>
+                {cite(itemCite(m))}
+              </div>
+            ))}
+          </div>
+        </figure>
+      );
+
+    case 'comic':
+      return (
+        <figure className="pic-card">
+          <div className="pic-kicker">{txt(spec.title) || 'What happens'}</div>
+          <div className="pic-comic">
+            {list(spec.panels).map((p, i) => (
+              <div key={i} className="pic-panel">
+                <span className="pic-panel-num">{i + 1}</span>
+                <span className="pic-emoji-lg" aria-hidden>{txt(p.emoji) || '✨'}</span>
+                {txt(p.who) && <div className="pic-who">{txt(p.who)}</div>}
+                <div className="pic-text">{txt(p.caption)}</div>
+                {cite(itemCite(p))}
+              </div>
+            ))}
+          </div>
+          {txt(spec.repeat) && (
+            <div className="pic-repeat"><span aria-hidden>🔁</span> {txt(spec.repeat)}</div>
+          )}
+        </figure>
+      );
+
+    case 'choice': {
+      const branch = (value: unknown, kind: 'yes' | 'no') => {
+        const b = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+        return (
+          <div className={`pic-branch pic-branch-${kind}`}>
+            <span className="pic-branch-tag">{kind === 'yes' ? 'Yes' : 'No'}</span>
+            <span className="pic-emoji-lg" aria-hidden>{txt(b.emoji)}</span>
+            <div className="pic-text">{txt(b.text)}</div>
+          </div>
+        );
+      };
+      return (
+        <figure className="pic-card pic-choice">
+          <div className="pic-question">
+            <span className="pic-emoji-lg" aria-hidden>{txt(spec.emoji) || '🤔'}</span>
+            <div className="pic-title">{txt(spec.question)}</div>
+            {cite(spec.cite)}
+          </div>
+          <div className="pic-branches">
+            {branch(spec.yes, 'yes')}
+            {branch(spec.no, 'no')}
+          </div>
+        </figure>
+      );
+    }
+
+    default:
+      return null;
+  }
+}
+
 // ── Shared component overrides for react-markdown ─────────────────────────
 
 type AnchorOverride = (props: { href?: string; children?: React.ReactNode }) => React.ReactElement;
 
-const DIAGRAM_LANGS = new Set(['language-diagram', 'language-mermaid']);
+const DIAGRAM_LANGS = new Set(['language-diagram', 'language-mermaid', 'language-picture']);
 
-function buildComponents(streaming: boolean, anchorOverride?: AnchorOverride) {
+function buildComponents(streaming: boolean, commit: string | undefined, anchorOverride?: AnchorOverride) {
   const anchorFn: AnchorOverride = anchorOverride ?? (({ href, children }) => (
     <a href={href} target="_blank" rel="noreferrer">{children}</a>
   ));
@@ -1132,6 +1424,9 @@ function buildComponents(streaming: boolean, anchorOverride?: AnchorOverride) {
       const text = String(children ?? '').trimEnd();
       if (className === 'language-diagram') return <DiagramBlock source={text} streaming={streaming} />;
       if (className === 'language-mermaid') return <MermaidBlock definition={text} streaming={streaming} />;
+      if (className === 'language-picture') {
+        return <PictureBlock source={text} streaming={streaming} commit={commit} anchor={anchorFn} />;
+      }
       return <code className={className} {...rest}>{children}</code>;
     },
     table({ children }: { children?: React.ReactNode }) {
@@ -1142,10 +1437,10 @@ function buildComponents(streaming: boolean, anchorOverride?: AnchorOverride) {
 
 // ── MarkdownContent — plain react-markdown render (older messages) ─────────
 
-function MarkdownContent({ content }: { content: string }) {
+function MarkdownContent({ content, commit, className }: { content: string; commit?: string; className: string }) {
   return (
-    <div className="md-prose">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(false)}>
+    <div className={className}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(false, commit)}>
         {content}
       </ReactMarkdown>
     </div>
@@ -1158,14 +1453,16 @@ function MarkdownContent({ content }: { content: string }) {
 // the matching sidebar card. Other links render normally.
 
 interface ProseContentProps {
+  className: string;
   prose: string;
+  commit?: string;
   refs: RefBlock[];
   streaming: boolean;
   activeRef: number | null;
   onCitationClick: (idx: number) => void;
 }
 
-function ProseContent({ prose, refs, streaming, activeRef, onCitationClick }: ProseContentProps) {
+function ProseContent({ className, prose, commit, refs, streaming, activeRef, onCitationClick }: ProseContentProps) {
   const refByUrl = new Map(refs.map((r) => [r.url, r]));
 
   const anchorOverride: AnchorOverride = ({ href, children = null }) => {
@@ -1191,8 +1488,8 @@ function ProseContent({ prose, refs, streaming, activeRef, onCitationClick }: Pr
   };
 
   return (
-    <div className="md-prose">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(streaming, anchorOverride)}>
+    <div className={className}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(streaming, commit, anchorOverride)}>
         {prose}
       </ReactMarkdown>
     </div>
@@ -1395,11 +1692,22 @@ function parseMessage(rawContent: string, commit?: string): ParsedMessage {
 
   const refs: RefBlock[] = [];
   const seen = new Set<string>();
-  visit(tree, 'link', (node) => {
-    if (!isCodeCitation(node.url) || seen.has(node.url)) return;
-    seen.add(node.url);
-    const label = node.children.map((ch) => ('value' in ch ? ch.value : '')).join('');
-    refs.push({ index: refs.length, label, url: node.url });
+  const addRef = (url: string, label: string) => {
+    if (seen.has(url)) return;
+    seen.add(url);
+    refs.push({ index: refs.length, label, url });
+  };
+  visit(tree, (node) => {
+    if (node.type === 'link' && isCodeCitation(node.url)) {
+      addRef(node.url, node.children.map((ch) => ('value' in ch ? ch.value : '')).join(''));
+    } else if (node.type === 'code' && node.lang === 'picture') {
+      let spec: unknown;
+      try { spec = JSON.parse(node.value); } catch { return; }
+      for (const value of pictureCites(spec)) {
+        const ref = citeToRef(value, commit);
+        if (ref) addRef(ref.url, ref.label);
+      }
+    }
   });
 
   return { prose, refs };
@@ -1459,6 +1767,61 @@ const MD_CSS = `
 .md-prose a:hover { border-bottom-color: #F5A623; }
 .md-prose figure svg { max-width: 100%; height: auto; }
 .diagram-zoom svg { width: 100%; max-width: none !important; height: auto; }
+
+/* Picture-book mode: bigger, friendlier text */
+.md-picture { font-size: 17px; line-height: 1.7; }
+.md-picture h2 { font-size: 20px; border-bottom: none; }
+.md-picture ul > li { padding-left: 0; }
+.md-picture ul > li::before { display: none; } /* the model starts each bullet with an emoji */
+
+/* Picture cards */
+.pic-card { margin: 4px 0 22px; padding: 18px 20px; background: #fff; border: 1px solid #e2e4e8; border-radius: 14px; }
+.pic-loading { margin: 4px 0 22px; padding: 28px; color: #8b949e; font-style: italic; font-size: 13px; text-align: center; background: #f7f8fa; border: 1px dashed #e2e4e8; border-radius: 14px; }
+.pic-kicker { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #92600a; margin-bottom: 12px; }
+.pic-title { font-family: Georgia, serif; font-size: 19px; font-weight: 700; line-height: 1.35; color: #1a1a1f; }
+.pic-text { font-size: 15px; line-height: 1.5; color: #3a3f47; }
+.pic-emoji { font-size: 22px; line-height: 1; }
+.pic-emoji-lg { display: block; font-size: 38px; line-height: 1.1; margin-bottom: 6px; }
+.pic-emoji-xl { font-size: 64px; line-height: 1; flex-shrink: 0; }
+.pic-cite { display: block; margin-top: 8px; }
+.pic-cite a { font-family: ui-monospace,"SF Mono",Consolas,monospace; font-size: 12px; }
+
+.pic-analogy { background: #fff7e6; border-color: #fcd389; }
+.pic-analogy-head { display: flex; gap: 18px; align-items: center; }
+.pic-analogy-head .pic-kicker { margin-bottom: 4px; }
+.pic-analogy-head .pic-text { margin-top: 4px; }
+.pic-pairs { display: grid; gap: 8px; margin-top: 16px; }
+.pic-pair { display: grid; grid-template-columns: 30px minmax(0,1fr) 22px minmax(0,1fr); align-items: center; gap: 8px; padding: 8px 12px; background: #fff; border: 1px solid #fcd389; border-radius: 10px; font-size: 15px; }
+.pic-thing { font-weight: 600; }
+.pic-equals { text-align: center; color: #F5A623; font-weight: 800; font-size: 18px; }
+.pic-real { color: #3a3f47; }
+
+.pic-cast { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.pic-member { text-align: center; padding: 14px 10px; background: #f7f8fa; border-radius: 12px; }
+.pic-name { font-weight: 700; font-size: 15.5px; }
+.pic-real-name { display: inline-block; max-width: 100%; overflow-wrap: anywhere; margin: 4px 0 6px; font-size: 12px; background: #fff; border: 1px solid #e2e4e8; border-radius: 4px; padding: 1px 6px; font-family: ui-monospace,"SF Mono",Consolas,monospace; }
+.pic-member .pic-text { font-size: 14px; }
+
+.pic-comic { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; counter-reset: none; }
+.pic-panel { position: relative; padding: 26px 12px 14px; text-align: center; background: #fff; border: 2px solid #1a1a1f; border-radius: 6px; box-shadow: 3px 3px 0 #fcd389; }
+.pic-panel-num { position: absolute; top: -11px; left: 10px; width: 24px; height: 24px; border-radius: 50%; background: #F5A623; color: #1a1a1f; font-size: 12.5px; font-weight: 800; line-height: 24px; text-align: center; }
+.pic-who { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #92600a; margin-bottom: 4px; }
+.pic-panel .pic-text { font-size: 14px; }
+.pic-repeat { margin-top: 14px; padding: 8px 12px; background: #f7f8fa; border-radius: 8px; font-size: 14px; color: #3a3f47; }
+
+.pic-question { text-align: center; padding: 6px 0 14px; }
+.pic-branches { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; position: relative; }
+.pic-branch { position: relative; text-align: center; padding: 22px 12px 14px; border-radius: 12px; border: 1px solid; }
+.pic-branch-yes { background: #edf7ee; border-color: #b7dfbb; }
+.pic-branch-no { background: #fbeeee; border-color: #efc3c0; }
+.pic-branch-tag { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); padding: 0 10px; border-radius: 999px; font-size: 11.5px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; line-height: 20px; color: #fff; }
+.pic-branch-yes .pic-branch-tag { background: #2e7d32; }
+.pic-branch-no .pic-branch-tag { background: #b3261e; }
+
+@media (max-width: 560px) {
+  .pic-analogy-head { flex-direction: column; text-align: center; }
+  .pic-branches { grid-template-columns: 1fr; gap: 18px; }
+}
 `;
 
 function GlobalMdStyles() {
@@ -1733,6 +2096,37 @@ const styles = {
     scrollMarginTop: '16px',
   },
   answer: { minWidth: 0 },
+  answerToolbar: { display: 'flex', justifyContent: 'flex-end', margin: '-8px 0 16px' },
+
+  // Answer-mode toggle (footer default + per-answer switch)
+  modeRow: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' },
+  modeLabel: { fontSize: '11px', color: w.textFaint },
+  modeToggle: {
+    display: 'inline-flex',
+    padding: '2px',
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '999px',
+  },
+  modeBtn: {
+    padding: '3px 12px',
+    border: 'none',
+    borderRadius: '999px',
+    background: 'none',
+    color: w.textMuted,
+    fontSize: '12.5px',
+    fontFamily: 'inherit',
+    lineHeight: 1.5,
+    cursor: 'pointer',
+  },
+  modeBtnSmall: { padding: '2px 10px', fontSize: '12px' },
+  modeBtnDisabled: { opacity: 0.45, cursor: 'not-allowed' },
+  modeBtnActive: {
+    background: w.bg,
+    color: '#92600a',
+    fontWeight: 600,
+    boxShadow: `0 0 0 1px ${w.amberBorder}`,
+  },
   pending: { color: w.textMuted, fontStyle: 'italic' as const },
 
   // Citation chips

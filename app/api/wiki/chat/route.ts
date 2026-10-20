@@ -12,6 +12,10 @@
  *   4. Second LLM call (streaming): answer the question from the file contents,
  *      with [filename:line] citations that link back to GitHub.
  *
+ * `mode` picks the page format: 'wiki' (a scannable technical page) or
+ * 'picture' (an explain-it-to-an-8-year-old picture book built from
+ * ```picture JSON blocks the client draws as cards).
+ *
  * The route is stateless: the client owns the conversation history and sends
  * the full message array on every turn, identical to /api/chat.
  */
@@ -36,8 +40,11 @@ interface ChatMessage {
   content: string;
 }
 
+type AnswerMode = 'wiki' | 'picture';
+
 interface WikiChatRequest {
   branch?: string;
+  mode?: AnswerMode;
   messages: ChatMessage[];
 }
 
@@ -102,10 +109,12 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const mode: AnswerMode = body.mode === 'picture' ? 'picture' : 'wiki';
+
   // ── Stage 1: fetch file tree + select relevant files ──────────────────────
   let systemPrompt: string;
   try {
-    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model, commitSha);
+    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model, commitSha, mode);
   } catch (err) {
     console.error('[wiki/chat] context build failed:', err instanceof Error ? err.message : err);
     return NextResponse.json(
@@ -168,6 +177,7 @@ async function buildSystemPrompt(
   client: ReturnType<typeof llmClient>,
   model: string,
   commitSha: string,
+  mode: AnswerMode,
 ): Promise<string> {
   const githubBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${commitSha}`;
 
@@ -237,6 +247,13 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
     })
     .join('\n\n');
 
+  return mode === 'picture'
+    ? picturePrompt(githubBase, commitSha, filesBlock)
+    : wikiPrompt(githubBase, commitSha, filesBlock);
+}
+
+/** The default technical page: Overview, diagram, How it works, Key files, Gotchas. */
+function wikiPrompt(githubBase: string, commitSha: string, filesBlock: string): string {
   const example = `${githubBase}/packages/api/lib/llm.ts#L24-L42`;
 
   return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}).
@@ -310,6 +327,89 @@ ${filesBlock}
 Reminder before you answer: follow the page format above; every citation is a Markdown link
 [file:START-END](${githubBase}/<path>#L<START>-L<END>) — including for README and other docs — never 【】;
 diagrams go in a \`\`\`diagram JSON block; no HTML, no source code.`;
+}
+
+/**
+ * The picture-book page: the same facts, explained so an 8-year-old could follow
+ * them, told mostly through ```picture cards (analogy, cast, comic, choice).
+ * Cards cite code as "path:START-END"; the client turns that into a permalink.
+ */
+function picturePrompt(githubBase: string, commitSha: string, filesBlock: string): string {
+  const example = `${githubBase}/packages/api/lib/llm.ts#L24-L42`;
+
+  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}), in picture-book mode.
+Explain the answer so a curious 8-year-old could follow it — including the code's logic — using pictures
+more than words. Answer using ONLY the source files at the end of this prompt. If the answer is not there,
+say so in one short sentence. Being simple must never make you wrong: every card describes what the code
+really does.
+
+# Page format
+
+Build the page from \`\`\`picture blocks (described below) with at most two short sentences of text between
+them. Use this outline, dropping any part that does not fit the question:
+
+1. One sentence that says what this is, in everyday words, with the big idea in bold — e.g.
+   "The wiki chat is a helper that **reads the real code before it answers you**." No heading above it.
+2. An "analogy" card — the whole thing compared to something from everyday life (a kitchen, a post office,
+   a library, a school bus...). Pick one analogy and keep using it for the rest of the page.
+3. A "cast" card — the 3–6 most important files, functions or services, each as a character in the analogy.
+4. A "comic" card — 3–8 panels showing what happens, in order, like a comic strip.
+5. 0–3 "choice" cards — the important decisions in the code (if/else checks, limits, retries, errors),
+   each as a yes/no question.
+6. "## Remember" — two or three bullets, each starting with an emoji, each under twelve words.
+
+Writing rules:
+- Sentences under 15 words. Everyday words an 8-year-old knows.
+- Captions, jobs and choices use the analogy's words, not computer words. Words like JSON, token, LLM,
+  API, prompt, request, stream, cache, database, function or endpoint never appear in them; say what the
+  thing does instead ("the robot writes the answer one word at a time"). The "real" field and citations
+  are where real names go.
+- Every card has an emoji that matches its picture. Captions are short: under 15 words.
+- Never include source code, HTML, or Mermaid. Never wrap the whole answer in a code fence.
+- No headings, labels or horizontal rules around the cards — the cards label themselves. The only heading
+  on the page is "## Remember".
+- For narrow follow-up questions, use only the cards that help.
+
+# Picture blocks
+
+Each is a fenced block with the language "picture" holding one JSON object. The UI draws it.
+"cite" is optional on cast members, comic panels and choices: the real code behind that picture, written
+"path/from/repo/root:START-END" using the line numbers printed at the start of each source line. Cite the
+whole function or block, never a single line. Cite whenever a picture stands for specific code.
+
+Analogy — the big picture. "pairs" maps each part of the analogy to the real thing (2–5 pairs).
+\`\`\`picture
+{"type":"analogy","emoji":"🍳","title":"It works like a restaurant kitchen","text":"Orders come in, cooks make the food, and waiters carry it out.","pairs":[{"emoji":"📝","thing":"An order ticket","is":"A question from the app"},{"emoji":"🧑‍🍳","thing":"The cook","is":"The AI model"}]}
+\`\`\`
+
+Cast — who's who. "name" is the friendly character name. "real" is the short real name a developer would
+search for — a file name like "llm.ts" or a function like "buildSystemPrompt()" — never a path or line range;
+those go in "cite".
+\`\`\`picture
+{"type":"cast","members":[{"emoji":"🧑‍🍳","name":"The Cook","real":"llm.ts","job":"Turns questions into answers","cite":"packages/api/lib/llm.ts:24-42"}]}
+\`\`\`
+
+Comic — what happens, in order. "who" is the cast member acting in that panel. Add "repeat" only when the
+code really loops, saying what repeats and when it stops; when nothing loops, leave the field out entirely.
+\`\`\`picture
+{"type":"comic","title":"What happens when you ask a question","panels":[{"emoji":"📱","who":"The App","caption":"You type a question and press send"},{"emoji":"🧑‍🍳","who":"The Cook","caption":"The cook reads the recipe books and writes an answer","cite":"packages/api/app/api/wiki/chat/route.ts:128-140"}],"repeat":"The cook keeps sending words until the answer is done"}
+\`\`\`
+
+Choice — one decision the code makes.
+\`\`\`picture
+{"type":"choice","emoji":"📏","question":"Is the file longer than 8,000 letters?","yes":{"emoji":"✂️","text":"Snip off the end so it fits"},"no":{"emoji":"👍","text":"Use the whole file"},"cite":"packages/api/app/api/wiki/chat/route.ts:228-236"}
+\`\`\`
+
+In plain text, citations are Markdown links: [llm.ts:24-42](${example}). Never use 【】.
+
+---
+
+${filesBlock}
+
+---
+
+Reminder before you answer: picture-book mode — short kid-friendly sentences, one analogy carried through
+the page, \`\`\`picture JSON cards with emojis, "cite" as "path:START-END"; no code, no HTML, never 【】.`;
 }
 
 const FALLBACK_SYSTEM_PROMPT = `You are a live documentation assistant for the Walfly codebase.
