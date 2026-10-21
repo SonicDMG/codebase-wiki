@@ -17,7 +17,7 @@
  * built from ```picture JSON cards). The other mode is generated on demand.
  */
 
-import { isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -104,9 +104,87 @@ interface TocTopic {
   suggestedQuery: string;
   /** Nav group heading; absent on topics generated before sections existed. */
   section?: string;
+  slug: string;
+  generatedPage?: string;
+  generatedPagePicture?: string;
+  pageCommitSha?: string;
 }
 
 type SyncState = 'idle' | 'syncing' | 'up-to-date' | 'updated' | 'error' | 'rate-limited';
+
+const WELCOME_MESSAGE: Message = {
+  id: 'welcome',
+  role: 'assistant',
+  content: '',
+  view: 'wiki',
+  answers: {
+    wiki: {
+      content:
+        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Choose **📖 Wiki** for the technical page or **🎨 Picture book** for a simple, picture-first explanation — and flip any answer between the two\n- Click a citation chip to see the exact code in the references panel',
+    },
+  },
+};
+
+const GENERAL_KEY = 'general';
+const CONVERSATIONS_STORAGE_KEY = 'walfly_wiki_conversations_v2';
+
+function topicKey(branch: string | null, slug: string): string {
+  return `${branch ?? ''}:${slug}`;
+}
+
+/**
+ * A topic's conversation opens with its question and the page pre-generated
+ * for it, so follow-ups and mode flips have the question in history.
+ * Null when the page hasn't been generated yet.
+ */
+function topicOpening(topic: TocTopic, view: AnswerMode): Message[] | null {
+  if (!topic.generatedPage) return null;
+  const commit = topic.pageCommitSha;
+  const answers: Message['answers'] = { wiki: { content: topic.generatedPage, commit } };
+  if (topic.generatedPagePicture) answers.picture = { content: topic.generatedPagePicture, commit };
+  return [
+    { id: `q-${topic.slug}`, role: 'user', content: topic.suggestedQuery },
+    // A missing picture page is generated live on the first flip.
+    { id: `page-${topic.slug}`, role: 'assistant', content: '', view: answers[view] ? view : 'wiki', answers },
+  ];
+}
+
+/** True while a conversation is still just the topic's opening page (no follow-ups). */
+function isUntouchedOpening(list: Message[] | undefined, slug: string): boolean {
+  return list?.length === 2 && list[0].id === `q-${slug}` && list[1].id === `page-${slug}`;
+}
+
+function loadConversations(): Record<string, Message[]> | null {
+  try {
+    const raw = localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
+    if (!raw) return null;
+    const stored = JSON.parse(raw) as Record<string, Message[]>;
+    // An answer still pending when the page closed will never finish: drop it if empty, else settle it.
+    for (const list of Object.values(stored)) {
+      for (const m of list) {
+        if (!m.answers) continue;
+        for (const mode of Object.keys(m.answers) as AnswerMode[]) {
+          const a = m.answers[mode];
+          if (!a?.pending) continue;
+          if (a.content) a.pending = false;
+          else delete m.answers[mode];
+        }
+      }
+    }
+    return stored;
+  } catch (err) {
+    console.warn('[wiki] failed to restore conversations:', err);
+    return null;
+  }
+}
+
+function saveConversations(conversations: Record<string, Message[]>) {
+  try {
+    localStorage.setItem(CONVERSATIONS_STORAGE_KEY, JSON.stringify(conversations));
+  } catch (err) {
+    console.warn('[wiki] failed to save conversations:', err);
+  }
+}
 
 const SYNC_POLL_MS = 45_000;
 const SYNC_POLL_CAP_MS = 300_000;
@@ -114,20 +192,24 @@ const SYNC_POLL_CAP_MS = 300_000;
 // ── Main component ─────────────────────────────────────────────────────────
 
 export default function WikiPage() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: 'welcome',
-      role: 'assistant',
-      content: '',
-      view: 'wiki',
-      answers: {
-        wiki: {
-          content:
-            '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Choose **📖 Wiki** for the technical page or **🎨 Picture book** for a simple, picture-first explanation — and flip any answer between the two\n- Click a citation chip to see the exact code in the references panel',
-        },
-      },
-    },
-  ]);
+  // One conversation per topic (keyed `${branch}:${slug}`), plus GENERAL_KEY for free-form questions.
+  const [conversations, setConversations] = useState<Record<string, Message[]>>({
+    [GENERAL_KEY]: [WELCOME_MESSAGE],
+  });
+  const conversationsRestored = useRef(false);
+
+  // Restore after mount, not in the initializer: the server render has no
+  // localStorage, so reading it during render breaks hydration.
+  useEffect(() => {
+    const stored = loadConversations();
+    if (stored) setConversations((prev) => ({ ...prev, ...stored }));
+    conversationsRestored.current = true;
+  }, []);
+
+  useEffect(() => {
+    if (conversationsRestored.current) saveConversations(conversations);
+  }, [conversations]);
+
   const [answerMode, setAnswerMode] = useState<AnswerMode>('wiki');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -135,7 +217,7 @@ export default function WikiPage() {
   const [sidebarWidth, setSidebarWidth] = useState(380);
   const [tocTopics, setTocTopics] = useState<TocTopic[]>([]);
   const [tocLoading, setTocLoading] = useState(true);
-  const [activeTopic, setActiveTopic] = useState<number | null>(null);
+  const [activeSlug, setActiveSlug] = useState<string | null>(null);
   const [wikiBranch, setWikiBranch] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
   const [headSha, setHeadSha] = useState<string | null>(null);
@@ -234,7 +316,7 @@ export default function WikiPage() {
     setHeadSha(null);
     setSyncNote(null);
     setSyncWarning(null);
-    setActiveTopic(null);
+    setActiveSlug(null);
     void loadToc(newBranch);
   };
 
@@ -358,6 +440,15 @@ export default function WikiPage() {
     }
     link.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.10.0/styles/tokyo-night-dark.min.css';
 
+    // Picture-book mode uses the Lumentide guide fonts.
+    if (!document.getElementById('picture-fonts')) {
+      const fonts = document.createElement('link');
+      fonts.id = 'picture-fonts';
+      fonts.rel = 'stylesheet';
+      fonts.href = 'https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Nunito:wght@500;700;900&display=swap';
+      document.head.appendChild(fonts);
+    }
+
     if (!document.getElementById('hljs-script')) {
       const script = document.createElement('script');
       script.id = 'hljs-script';
@@ -426,9 +517,12 @@ export default function WikiPage() {
     window.addEventListener('mouseup', onMouseUp);
   }, [sidebarWidth]);
 
+  const activeKey = activeSlug ? topicKey(wikiBranch, activeSlug) : GENERAL_KEY;
+  const currentMessages = conversations[activeKey] ?? [];
+
   // When a new question is asked, bring it to the top of the reading pane.
   // Don't follow streaming tokens — the reader starts at the top of the answer.
-  const lastQuestionId = [...messages].reverse().find((m) => m.role === 'user')?.id;
+  const lastQuestionId = [...currentMessages].reverse().find((m) => m.role === 'user')?.id;
   useEffect(() => {
     if (!lastQuestionId) return;
     document.getElementById(`msg-${lastQuestionId}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -439,22 +533,48 @@ export default function WikiPage() {
     setSidebarCollapsed(false);
   };
 
-  const latestAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
+  const latestAssistantMsg = [...currentMessages].reverse().find((m) => m.role === 'assistant');
+
+  // A sync can regenerate a topic's page. Swap it in for conversations that
+  // are still just the opening page; once the reader has asked follow-ups,
+  // their conversation is left alone.
+  useEffect(() => {
+    setConversations((prev) => {
+      let next = prev;
+      for (const topic of tocTopics) {
+        const key = topicKey(wikiBranch, topic.slug);
+        const list = prev[key];
+        if (!isUntouchedOpening(list, topic.slug)) continue;
+        const shown = list![1].answers;
+        if (shown?.wiki?.content === topic.generatedPage && shown?.picture?.content === topic.generatedPagePicture) continue;
+        const opening = topicOpening(topic, list![1].view ?? 'wiki');
+        if (!opening) continue;
+        if (next === prev) next = { ...prev };
+        next[key] = opening;
+      }
+      return next;
+    });
+  }, [tocTopics, wikiBranch]);
 
   // ── Stream one answer (in one mode) into an assistant message ─────────────
   const streamAnswer = useCallback(async (
+    activeKey: string,
     assistantId: string,
     mode: AnswerMode,
     history: { role: Message['role']; content: string }[],
   ) => {
     const patch = (fn: (a: Answer) => Answer) =>
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId
-            ? { ...m, answers: { ...m.answers, [mode]: fn(m.answers?.[mode] ?? { content: '' }) } }
-            : m,
-        ),
-      );
+      setConversations((prev) => {
+        const list = prev[activeKey] || [];
+        return {
+          ...prev,
+          [activeKey]: list.map((m) =>
+            m.id === assistantId
+              ? { ...m, answers: { ...m.answers, [mode]: fn(m.answers?.[mode] ?? { content: '' }) } }
+              : m,
+          ),
+        };
+      });
 
     setLoading(true);
     setActiveRef(null);
@@ -517,33 +637,43 @@ export default function WikiPage() {
   }, [wikiBranch]);
 
   // ── Send ──────────────────────────────────────────────────────────────────
-  const send = useCallback(async (overrideQuestion?: string) => {
+  // `key` overrides the active conversation — a topic click sends before its
+  // activeSlug update has re-rendered.
+  const send = useCallback(async (overrideQuestion?: string, key: string = activeKey) => {
     const question = (overrideQuestion ?? input).trim();
     if (!question || loading) return;
 
     if (!overrideQuestion) setInput('');
 
+    const history = conversations[key] ?? [];
     const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question };
     const assistantId = crypto.randomUUID();
     const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', view: answerMode, answers: {} };
 
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
-    await streamAnswer(assistantId, answerMode, [...messages, userMsg].map(toHistory));
-  }, [input, loading, messages, answerMode, streamAnswer]);
+    setConversations((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), userMsg, assistantMsg] }));
+    await streamAnswer(key, assistantId, answerMode, [...history, userMsg].map(toHistory));
+  }, [input, loading, conversations, activeKey, answerMode, streamAnswer]);
 
   // ── Flip an answer between modes; the first flip generates the other version ─
   const showAnswerAs = useCallback((assistantId: string, mode: AnswerMode) => {
-    const idx = messages.findIndex((m) => m.id === assistantId);
-    const msg = messages[idx];
+    const history = conversations[activeKey] ?? [];
+    const idx = history.findIndex((m) => m.id === assistantId);
+    const msg = history[idx];
     if (!msg || msg.view === mode) return;
     const needsAnswer = !msg.answers?.[mode];
     if (needsAnswer && loading) return;
 
     setActiveRef(null);
-    setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, view: mode } : m)));
+    setConversations((prev) => {
+      const list = prev[activeKey] || [];
+      return {
+        ...prev,
+        [activeKey]: list.map((m) => (m.id === assistantId ? { ...m, view: mode } : m)),
+      };
+    });
     // History ends with the question this message answers.
-    if (needsAnswer) void streamAnswer(assistantId, mode, messages.slice(0, idx).map(toHistory));
-  }, [messages, loading, streamAnswer]);
+    if (needsAnswer) void streamAnswer(activeKey, assistantId, mode, history.slice(0, idx).map(toHistory));
+  }, [conversations, activeKey, loading, streamAnswer]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -552,9 +682,15 @@ export default function WikiPage() {
     }
   };
 
-  const handleTopicClick = (topic: TocTopic, idx: number) => {
-    setActiveTopic(idx);
-    void send(topic.suggestedQuery);
+  // Open the topic's own conversation; the first visit starts it with the
+  // pre-generated page, or answers live if that page isn't generated yet.
+  const handleTopicClick = (topic: TocTopic) => {
+    setActiveSlug(topic.slug);
+    const key = topicKey(wikiBranch, topic.slug);
+    if (conversations[key]?.length) return;
+    const opening = topicOpening(topic, answerMode);
+    if (opening) setConversations((prev) => ({ ...prev, [key]: opening }));
+    else void send(topic.suggestedQuery, key);
   };
 
   const handleRebuild = async () => {
@@ -595,7 +731,16 @@ export default function WikiPage() {
       <GlobalMdStyles />
       {/* ── Header ── */}
       <header style={styles.header}>
-        <span style={styles.title}>Walfly Wiki</span>
+        <span
+          style={{ ...styles.title, cursor: 'pointer' }}
+          onClick={() => {
+            if (loading) return;
+            setActiveSlug(null);
+          }}
+          title="Return to general chat"
+        >
+          Walfly Wiki
+        </span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
         {wikiBranch && (
           <div ref={statusMenuRef} style={{ position: 'relative', display: 'inline-block' }}>
@@ -714,13 +859,13 @@ export default function WikiPage() {
               <div style={styles.tocLoading}>No topics available.</div>
             ) : (
               tocTopics.map((topic, idx) => (
-                <div key={idx}>
+                <div key={topic.slug}>
                   {topic.section && topic.section !== tocTopics[idx - 1]?.section && (
                     <div style={styles.tocSection}>{topic.section}</div>
                   )}
                   <button
-                    style={{ ...styles.tocItem, ...(activeTopic === idx ? styles.tocItemActive : {}) }}
-                    onClick={() => handleTopicClick(topic, idx)}
+                    style={{ ...styles.tocItem, ...(activeSlug === topic.slug ? styles.tocItemActive : {}) }}
+                    onClick={() => handleTopicClick(topic)}
                     title={topic.description}
                     disabled={loading}
                   >
@@ -737,7 +882,7 @@ export default function WikiPage() {
         {/* Center: chat */}
         <div style={styles.chatPane}>
           <div style={styles.messageList}>
-            {messages.map((msg) => (
+            {currentMessages.map((msg) => (
               <MessageBlock
                 key={msg.id}
                 message={msg}
@@ -1229,10 +1374,14 @@ function DiagramBlock({ source, streaming }: { source: string; streaming: boolea
 
 // ── Picture cards ──────────────────────────────────────────────────────────
 //
-// Picture-book answers are built from ```picture fences holding one JSON card
-// (see picturePrompt in the chat route). Cards cite code as "path:START-END";
-// with the answer's commit that becomes the same permalink a Markdown citation
-// would use, so it renders as a citation chip and lands in the sidebar.
+// Picture-book answers follow the Lumentide guide style: a "words to learn"
+// header, numbered lessons (a claim heading, one picture, a few short lines,
+// an optional rule), and a closing "whole thing in one breath". Each card is a
+// ```picture fence holding one JSON object (see picturePrompt in prompts.ts).
+// Pictures show the real mechanism — steps, splits, bars, works/doesn't rows —
+// never an analogy. Cards cite code as "path:START-END"; with the answer's
+// commit that becomes the same permalink a Markdown citation would use, so it
+// renders as a citation chip and lands in the sidebar.
 
 interface PictureCite { url: string; label: string }
 
@@ -1249,24 +1398,65 @@ function citeToRef(cite: unknown, commit: string | undefined): PictureCite | nul
   };
 }
 
-/** A card item's citation. Models sometimes put the "path:START-END" in `real` instead. */
-function itemCite(item: Record<string, unknown>): unknown {
-  if (item.cite !== undefined) return item.cite;
-  return typeof item.real === 'string' && CITE_SPEC.test(item.real) ? item.real : undefined;
+/** A `cite` value as single specs — models sometimes give a list, or several joined by commas. */
+function citeSpecs(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(citeSpecs);
+  return typeof value === 'string' ? value.split(',').map((v) => v.trim()).filter(Boolean) : [];
 }
 
-/** A cast member's real name, shortened to the file name when the model gave a path. */
-function realName(value: unknown): string {
-  const text = txt(value);
-  const name = text.match(CITE_SPEC)?.[1] ?? text;
-  return /^[^\s]+\/[^\s]+$/.test(name) ? name.split('/').pop()! : name;
-}
-
-/** Every citation in a card, in reading order. */
-function pictureCites(spec: unknown): unknown[] {
+/** Every `cite` anywhere in a card, in reading order. */
+function pictureCites(spec: unknown): string[] {
+  if (Array.isArray(spec)) return spec.flatMap(pictureCites);
   if (!spec || typeof spec !== 'object') return [];
-  const d = spec as Record<string, unknown>;
-  return [...list(d.members), ...list(d.panels)].map(itemCite).concat(d.cite);
+  return Object.entries(spec).flatMap(([key, value]) => (key === 'cite' ? citeSpecs(value) : pictureCites(value)));
+}
+
+/**
+ * Parse a card's JSON, repairing the model's usual slip: an array left open
+ * before the next key, as in `"lines":["a","b","cite":"x"}`. When a key turns
+ * up inside an array, the array is closed at its last comma; brackets still
+ * open at the end are closed too. Returns null when the card can't be read.
+ */
+function parseCard(source: string): Record<string, unknown> | null {
+  const asCard = (text: string) => {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  };
+  try {
+    return asCard(source);
+  } catch { /* try the repair */ }
+
+  let out = '';
+  const open: { ch: '[' | '{'; lastComma: number }[] = [];
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === '"') {
+      // Copy the whole string, escapes included, so its contents aren't scanned.
+      let j = i + 1;
+      while (j < source.length && source[j] !== '"') j += source[j] === '\\' ? 2 : 1;
+      out += source.slice(i, j + 1);
+      i = j;
+      continue;
+    }
+    const top = open[open.length - 1];
+    if (ch === ':' && top?.ch === '[' && top.lastComma >= 0) {
+      out = `${out.slice(0, top.lastComma)}]${out.slice(top.lastComma)}`;
+      open.pop();
+    } else if (ch === ',' && top) {
+      top.lastComma = out.length;
+    } else if (ch === '[' || ch === '{') {
+      open.push({ ch, lastComma: -1 });
+    } else if (ch === ']' || ch === '}') {
+      open.pop();
+    }
+    out += ch;
+  }
+  out += open.reverse().map((o) => (o.ch === '[' ? ']' : '}')).join('');
+  try {
+    return asCard(out);
+  } catch {
+    return null;
+  }
 }
 
 /** Coerce a model-provided value to display text. */
@@ -1278,6 +1468,152 @@ function list(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter((v): v is Record<string, unknown> => !!v && typeof v === 'object') : [];
 }
 
+function obj(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+/** The guide palette: one colour per concept, named by the model. */
+const PIC_COLORS: Record<string, string> = {
+  orange: '#ffb347', cyan: '#5ef2ff', purple: '#c77dff', green: '#7dff9a',
+  yellow: '#ffe066', red: '#ff5d5d', blue: '#4fc3ff', grey: '#9aa5b8', gray: '#9aa5b8',
+};
+const PIC_FALLBACK_COLORS = ['#5ef2ff', '#ffb347', '#c77dff', '#7dff9a', '#ffe066', '#4fc3ff'];
+
+function picColor(value: unknown, i = 0): string {
+  return PIC_COLORS[txt(value).toLowerCase()] ?? PIC_FALLBACK_COLORS[i % PIC_FALLBACK_COLORS.length];
+}
+
+/** Card text: `code` and **bold** spans. */
+function rich(value: unknown): React.ReactNode {
+  const text = txt(value);
+  if (!text) return null;
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*)/).map((part, i) => {
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) return <code key={i}>{part.slice(1, -1)}</code>;
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) return <b key={i}>{part.slice(2, -2)}</b>;
+    return part;
+  });
+}
+
+/** The drawing inside a lesson. */
+function LessonPicture({ spec, cite }: { spec: Record<string, unknown>; cite: (v: unknown) => React.ReactNode }) {
+  switch (spec.kind) {
+    // Steps in order, left to right, wrapping.
+    case 'flow':
+      return (
+        <div className="pic-flow">
+          {list(spec.steps).map((s, i) => (
+            <Fragment key={i}>
+              {i > 0 && <span className="pic-flow-arrow" aria-hidden>→</span>}
+              <div className="pic-flow-step" style={{ borderColor: picColor(s.color, i) }}>
+                <div className="pic-flow-label" style={{ color: picColor(s.color, i) }}>{txt(s.label)}</div>
+                {txt(s.note) && <div className="pic-small">{rich(s.note)}</div>}
+                {cite(s.cite)}
+              </div>
+            </Fragment>
+          ))}
+        </div>
+      );
+
+    // One whole split into parts, drawn as squares (or a bar when there are many).
+    case 'split': {
+      const parts = list(spec.parts).map((p, i) => ({ label: txt(p.label), n: Math.max(0, Math.round(Number(p.count) || 0)), color: picColor(p.color, i) }));
+      const total = parts.reduce((sum, p) => sum + p.n, 0);
+      return (
+        <div className="pic-split">
+          {txt(spec.title) && <div className="pic-pixel-label">{txt(spec.title)}</div>}
+          {total > 0 && total <= 24 ? (
+            <div className="pic-squares">
+              {parts.flatMap((p, i) => Array.from({ length: p.n }, (_, j) => (
+                <span key={`${i}-${j}`} className="pic-square" style={{ background: p.color }} />
+              )))}
+            </div>
+          ) : (
+            <div className="pic-splitbar">
+              {parts.map((p, i) => <span key={i} style={{ background: p.color, flexGrow: p.n || 1 }} />)}
+            </div>
+          )}
+          <div className="pic-legend">
+            {parts.map((p, i) => (
+              <span key={i} style={{ color: p.color }}>{p.n} {p.label}</span>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // Comparable amounts as horizontal bars.
+    case 'bars': {
+      const bars = list(spec.bars);
+      const max = Number(spec.max) || Math.max(1, ...bars.map((b) => Number(b.value) || 0));
+      return (
+        <div className="pic-bars">
+          {txt(spec.title) && <div className="pic-pixel-label">{txt(spec.title)}</div>}
+          {bars.map((b, i) => {
+            const pct = Math.min(100, Math.max(0, ((Number(b.value) || 0) / max) * 100));
+            return (
+              <div key={i} className="pic-bar-row">
+                <span className="pic-bar-name" style={{ color: picColor(b.color, i) }}>{txt(b.label)}</span>
+                <span className="pic-bar-track"><span style={{ width: `${pct}%`, background: picColor(b.color, i) }} /></span>
+                <span className="pic-bar-value">{txt(b.display) || txt(b.value)}</span>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // Rows of items with a verdict: this works, this doesn't.
+    case 'compare':
+      return (
+        <div className="pic-compare">
+          {list(spec.rows).map((r, i) => (
+            <div key={i} className="pic-compare-row">
+              <div className="pic-chips">
+                {(Array.isArray(r.items) ? r.items : []).map((item, j) => (
+                  <span key={j} className={`pic-chip ${r.ok === false ? 'pic-chip-bad' : 'pic-chip-good'}`}>{txt(item)}</span>
+                ))}
+              </div>
+              <div className={r.ok === false ? 'pic-verdict-bad' : 'pic-verdict-good'}>{rich(r.verdict)}</div>
+            </div>
+          ))}
+        </div>
+      );
+
+    // Layers, outermost first: what a request meets on the way in.
+    case 'stack':
+      return (
+        <div className="pic-stack">
+          {list(spec.layers).reduceRight<React.ReactNode>((inner, layer, i) => (
+            <div className="pic-layer" style={{ borderColor: picColor(layer.color, i) }}>
+              <div className="pic-flow-label" style={{ color: picColor(layer.color, i) }}>{txt(layer.label)}</div>
+              {txt(layer.note) && <div className="pic-small">{rich(layer.note)}</div>}
+              {inner}
+            </div>
+          ), null)}
+        </div>
+      );
+
+    // A row of little cards: the kinds of a thing, side by side.
+    case 'cards':
+      return (
+        <div className="pic-minicards">
+          {list(spec.cards).map((c, i) => (
+            <div key={i} className="pic-minicard">
+              <div className="pic-minicard-head" style={{ color: picColor(c.color, i) }}>
+                {txt(c.emoji) && <span aria-hidden>{txt(c.emoji)} </span>}{txt(c.title)}
+              </div>
+              <div className="pic-small">{rich(c.text)}</div>
+              {cite(c.cite)}
+            </div>
+          ))}
+        </div>
+      );
+
+    default:
+      return null;
+  }
+}
+
 interface PictureBlockProps {
   source: string;
   streaming: boolean;
@@ -1286,12 +1622,13 @@ interface PictureBlockProps {
 }
 
 function PictureBlock({ source, streaming, commit, anchor }: PictureBlockProps) {
+  // Mid-stream the JSON is partial; only repair a card once it's complete.
   let spec: Record<string, unknown> | null = null;
   try {
     const parsed: unknown = JSON.parse(source);
     if (parsed && typeof parsed === 'object') spec = parsed as Record<string, unknown>;
   } catch {
-    // Partial JSON mid-stream, or malformed.
+    if (!streaming) spec = parseCard(source);
   }
   if (!spec) {
     return streaming
@@ -1300,104 +1637,74 @@ function PictureBlock({ source, streaming, commit, anchor }: PictureBlockProps) 
   }
 
   const cite = (value: unknown) => {
-    const ref = citeToRef(value, commit);
-    return ref ? <span className="pic-cite">{anchor({ href: ref.url, children: ref.label })}</span> : null;
+    const refs = citeSpecs(value).map((c) => citeToRef(c, commit)).filter((r): r is PictureCite => !!r);
+    if (refs.length === 0) return null;
+    return (
+      <span className="pic-cite">
+        {refs.map((ref) => <Fragment key={ref.url}>{anchor({ href: ref.url, children: ref.label })}</Fragment>)}
+      </span>
+    );
   };
 
   switch (spec.type) {
-    case 'analogy':
+    case 'words': {
+      const words = list(spec.words);
       return (
-        <figure className="pic-card pic-analogy">
-          <div className="pic-analogy-head">
-            <span className="pic-emoji-xl" aria-hidden>{txt(spec.emoji) || '💡'}</span>
-            <div>
-              <div className="pic-kicker">Think of it like this</div>
-              <div className="pic-title">{txt(spec.title)}</div>
-              {txt(spec.text) && <div className="pic-text">{txt(spec.text)}</div>}
-            </div>
-          </div>
-          {list(spec.pairs).length > 0 && (
-            <div className="pic-pairs">
-              {list(spec.pairs).map((p, i) => (
-                <div key={i} className="pic-pair">
-                  <span className="pic-emoji" aria-hidden>{txt(p.emoji)}</span>
-                  <span className="pic-thing">{txt(p.thing)}</span>
-                  <span className="pic-equals" aria-label="is">=</span>
-                  <span className="pic-real">{txt(p.is)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </figure>
-      );
-
-    case 'cast':
-      return (
-        <figure className="pic-card">
-          <div className="pic-kicker">Meet the characters</div>
-          <div className="pic-cast">
-            {list(spec.members).map((m, i) => (
-              <div key={i} className="pic-member">
-                <span className="pic-emoji-lg" aria-hidden>{txt(m.emoji) || '🙂'}</span>
-                <div className="pic-name">{txt(m.name)}</div>
-                {txt(m.real) && <code className="pic-real-name" title={txt(m.real)}>{realName(m.real)}</code>}
-                <div className="pic-text">{txt(m.job)}</div>
-                {cite(itemCite(m))}
+        <header className="pic-words">
+          {txt(spec.title) && <div className="pic-h1">{txt(spec.title)}</div>}
+          <p className="pic-lede">
+            {words.length === 1 ? 'One word' : `${words.length} words`} to learn:{' '}
+            {words.map((wd, i) => (
+              <Fragment key={i}>
+                {i > 0 && (i === words.length - 1 ? ' and ' : ', ')}
+                <b style={{ color: picColor(wd.color, i) }}>{txt(wd.word)}</b>
+              </Fragment>
+            ))}.
+          </p>
+          <div className="pic-minicards">
+            {words.map((wd, i) => (
+              <div key={i} className="pic-minicard">
+                <div className="pic-minicard-head" style={{ color: picColor(wd.color, i) }}>{txt(wd.word)}</div>
+                {txt(wd.real) && <code className="pic-real-name">{txt(wd.real)}</code>}
+                <div className="pic-small">{rich(wd.means)}</div>
               </div>
             ))}
           </div>
-        </figure>
-      );
-
-    case 'comic':
-      return (
-        <figure className="pic-card">
-          <div className="pic-kicker">{txt(spec.title) || 'What happens'}</div>
-          <div className="pic-comic">
-            {list(spec.panels).map((p, i) => (
-              <div key={i} className="pic-panel">
-                <span className="pic-panel-num">{i + 1}</span>
-                <span className="pic-emoji-lg" aria-hidden>{txt(p.emoji) || '✨'}</span>
-                {txt(p.who) && <div className="pic-who">{txt(p.who)}</div>}
-                <div className="pic-text">{txt(p.caption)}</div>
-                {cite(itemCite(p))}
-              </div>
-            ))}
-          </div>
-          {txt(spec.repeat) && (
-            <div className="pic-repeat"><span aria-hidden>🔁</span> {txt(spec.repeat)}</div>
-          )}
-        </figure>
-      );
-
-    case 'choice': {
-      const branch = (value: unknown, kind: 'yes' | 'no') => {
-        const b = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
-        return (
-          <div className={`pic-branch pic-branch-${kind}`}>
-            <span className="pic-branch-tag">{kind === 'yes' ? 'Yes' : 'No'}</span>
-            <span className="pic-emoji-lg" aria-hidden>{txt(b.emoji)}</span>
-            <div className="pic-text">{txt(b.text)}</div>
-          </div>
-        );
-      };
-      return (
-        <figure className="pic-card pic-choice">
-          <div className="pic-question">
-            <span className="pic-emoji-lg" aria-hidden>{txt(spec.emoji) || '🤔'}</span>
-            <div className="pic-title">{txt(spec.question)}</div>
-            {cite(spec.cite)}
-          </div>
-          <div className="pic-branches">
-            {branch(spec.yes, 'yes')}
-            {branch(spec.no, 'no')}
-          </div>
-        </figure>
+        </header>
       );
     }
 
+    case 'lesson':
+      return (
+        <section className="pic-lesson">
+          <h3 className="pic-lesson-title">{txt(spec.title)}</h3>
+          {txt(spec.say) && <p className="pic-say">{rich(spec.say)}</p>}
+          {spec.picture !== undefined && (
+            <figure className="pic-figure">
+              <LessonPicture spec={obj(spec.picture)} cite={cite} />
+              {txt(obj(spec.picture).caption) && <figcaption>{rich(obj(spec.picture).caption)}</figcaption>}
+            </figure>
+          )}
+          {Array.isArray(spec.lines) && spec.lines.length > 0 && (
+            <ul className="pic-lines">
+              {spec.lines.map((line, i) => <li key={i}>{rich(line)}</li>)}
+            </ul>
+          )}
+          {txt(spec.rule) && <div className="pic-rule">{rich(spec.rule)}</div>}
+          {cite(spec.cite)}
+        </section>
+      );
+
+    case 'breath':
+      return (
+        <section className="pic-lesson pic-breath">
+          <h3 className="pic-breath-title">The whole thing in one breath</h3>
+          <p className="pic-big">{rich(spec.text)}</p>
+        </section>
+      );
+
     default:
-      return null;
+      return <div className="pic-loading">This picture uses an older format. Ask again to redraw it.</div>;
   }
 }
 
@@ -1701,8 +2008,8 @@ function parseMessage(rawContent: string, commit?: string): ParsedMessage {
     if (node.type === 'link' && isCodeCitation(node.url)) {
       addRef(node.url, node.children.map((ch) => ('value' in ch ? ch.value : '')).join(''));
     } else if (node.type === 'code' && node.lang === 'picture') {
-      let spec: unknown;
-      try { spec = JSON.parse(node.value); } catch { return; }
+      const spec = parseCard(node.value);
+      if (!spec) return;
       for (const value of pictureCites(spec)) {
         const ref = citeToRef(value, commit);
         if (ref) addRef(ref.url, ref.label);
@@ -1768,59 +2075,85 @@ const MD_CSS = `
 .md-prose figure svg { max-width: 100%; height: auto; }
 .diagram-zoom svg { width: 100%; max-width: none !important; height: auto; }
 
-/* Picture-book mode: bigger, friendlier text */
-.md-picture { font-size: 17px; line-height: 1.7; }
-.md-picture h2 { font-size: 20px; border-bottom: none; }
+/* Picture-book mode: the Lumentide guide look — a night-sky comic column of
+   dark lesson panels, pixel-font headings, one colour per concept. */
+.md-picture {
+  background: #0b1020; color: #f3f5ff; border-radius: 14px; padding: 22px;
+  font-family: "Nunito","Segoe UI",system-ui,sans-serif; font-size: 18px; line-height: 1.45;
+  display: grid; gap: 22px; counter-reset: lesson;
+}
+.md-picture > * { margin: 0; }
+.md-picture p { color: #f3f5ff; }
+.md-picture a { color: #5ef2ff; border-bottom-color: #26325a; }
+.md-picture code { background: #1f2a48; color: #f3f5ff; border: none; border-radius: 4px; padding: 0 5px; font-size: 0.85em; }
+.md-picture ul { margin: 0; padding-left: 22px; display: grid; gap: 6px; }
 .md-picture ul > li { padding-left: 0; }
-.md-picture ul > li::before { display: none; } /* the model starts each bullet with an emoji */
+.md-picture ul > li::before { display: none; }
+.md-picture li { list-style: disc; }
 
-/* Picture cards */
-.pic-card { margin: 4px 0 22px; padding: 18px 20px; background: #fff; border: 1px solid #e2e4e8; border-radius: 14px; }
-.pic-loading { margin: 4px 0 22px; padding: 28px; color: #8b949e; font-style: italic; font-size: 13px; text-align: center; background: #f7f8fa; border: 1px dashed #e2e4e8; border-radius: 14px; }
-.pic-kicker { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #92600a; margin-bottom: 12px; }
-.pic-title { font-family: Georgia, serif; font-size: 19px; font-weight: 700; line-height: 1.35; color: #1a1a1f; }
-.pic-text { font-size: 15px; line-height: 1.5; color: #3a3f47; }
-.pic-emoji { font-size: 22px; line-height: 1; }
-.pic-emoji-lg { display: block; font-size: 38px; line-height: 1.1; margin-bottom: 6px; }
-.pic-emoji-xl { font-size: 64px; line-height: 1; flex-shrink: 0; }
-.pic-cite { display: block; margin-top: 8px; }
+.pic-loading { padding: 24px; color: #a8b3d6; font-style: italic; font-size: 14px; text-align: center; background: #141c33; border: 2px dashed #26325a; border-radius: 10px; }
+.pic-cite { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
 .pic-cite a { font-family: ui-monospace,"SF Mono",Consolas,monospace; font-size: 12px; }
+.pic-small { font-size: 15px; line-height: 1.4; color: #f3f5ff; }
+.pic-pixel-label { font-family: "Press Start 2P","Courier New",monospace; font-size: 10px; line-height: 1.6; color: #f3f5ff; margin-bottom: 10px; }
 
-.pic-analogy { background: #fff7e6; border-color: #fcd389; }
-.pic-analogy-head { display: flex; gap: 18px; align-items: center; }
-.pic-analogy-head .pic-kicker { margin-bottom: 4px; }
-.pic-analogy-head .pic-text { margin-top: 4px; }
-.pic-pairs { display: grid; gap: 8px; margin-top: 16px; }
-.pic-pair { display: grid; grid-template-columns: 30px minmax(0,1fr) 22px minmax(0,1fr); align-items: center; gap: 8px; padding: 8px 12px; background: #fff; border: 1px solid #fcd389; border-radius: 10px; font-size: 15px; }
-.pic-thing { font-weight: 600; }
-.pic-equals { text-align: center; color: #F5A623; font-weight: 800; font-size: 18px; }
-.pic-real { color: #3a3f47; }
+.pic-words { display: grid; gap: 12px; }
+.pic-h1 { font-family: "Press Start 2P","Courier New",monospace; font-size: clamp(16px, 3.4vw, 22px); line-height: 1.5; color: #5ef2ff; text-wrap: balance; }
+.pic-lede { color: #a8b3d6 !important; font-size: 19px; margin: 0; }
+.pic-real-name { justify-self: start; max-width: 100%; overflow-wrap: anywhere; font-size: 12px !important; font-family: ui-monospace,"SF Mono",Consolas,monospace; }
 
-.pic-cast { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
-.pic-member { text-align: center; padding: 14px 10px; background: #f7f8fa; border-radius: 12px; }
-.pic-name { font-weight: 700; font-size: 15.5px; }
-.pic-real-name { display: inline-block; max-width: 100%; overflow-wrap: anywhere; margin: 4px 0 6px; font-size: 12px; background: #fff; border: 1px solid #e2e4e8; border-radius: 4px; padding: 1px 6px; font-family: ui-monospace,"SF Mono",Consolas,monospace; }
-.pic-member .pic-text { font-size: 14px; }
+.pic-lesson { background: #141c33; border: 3px solid #26325a; border-radius: 10px; padding: 18px; display: grid; gap: 14px; min-width: 0; }
+.pic-lesson-title, .pic-breath-title { margin: 0 !important; border: none !important; padding: 0 !important; font-family: "Press Start 2P","Courier New",monospace; font-size: 13px !important; line-height: 1.7; letter-spacing: 0.02em; color: #ffb347 !important; text-wrap: balance; }
+.pic-lesson-title::before { counter-increment: lesson; content: counter(lesson) ". "; }
+.pic-say { font-weight: 700; margin: 0; }
+.pic-lines { margin: 0; }
+.pic-rule { border-left: 6px solid #7dff9a; padding: 8px 12px; background: #0a0f1d; border-radius: 0 8px 8px 0; font-weight: 700; }
+.pic-big { font-weight: 900; font-size: 21px; margin: 0; }
 
-.pic-comic { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; counter-reset: none; }
-.pic-panel { position: relative; padding: 26px 12px 14px; text-align: center; background: #fff; border: 2px solid #1a1a1f; border-radius: 6px; box-shadow: 3px 3px 0 #fcd389; }
-.pic-panel-num { position: absolute; top: -11px; left: 10px; width: 24px; height: 24px; border-radius: 50%; background: #F5A623; color: #1a1a1f; font-size: 12.5px; font-weight: 800; line-height: 24px; text-align: center; }
-.pic-who { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #92600a; margin-bottom: 4px; }
-.pic-panel .pic-text { font-size: 14px; }
-.pic-repeat { margin-top: 14px; padding: 8px 12px; background: #f7f8fa; border-radius: 8px; font-size: 14px; color: #3a3f47; }
+.pic-figure { margin: 0; background: #0a0f1d; border-radius: 8px; padding: 14px; overflow-x: auto; }
+.pic-figure figcaption { font-size: 15px; color: #a8b3d6; margin-top: 10px; }
 
-.pic-question { text-align: center; padding: 6px 0 14px; }
-.pic-branches { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; position: relative; }
-.pic-branch { position: relative; text-align: center; padding: 22px 12px 14px; border-radius: 12px; border: 1px solid; }
-.pic-branch-yes { background: #edf7ee; border-color: #b7dfbb; }
-.pic-branch-no { background: #fbeeee; border-color: #efc3c0; }
-.pic-branch-tag { position: absolute; top: -10px; left: 50%; transform: translateX(-50%); padding: 0 10px; border-radius: 999px; font-size: 11.5px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; line-height: 20px; color: #fff; }
-.pic-branch-yes .pic-branch-tag { background: #2e7d32; }
-.pic-branch-no .pic-branch-tag { background: #b3261e; }
+.pic-flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }
+.pic-flow-step { flex: 1 1 120px; min-width: 0; background: #141c33; border: 3px solid; border-radius: 8px; padding: 10px; display: grid; gap: 4px; align-content: start; }
+.pic-flow-label { font-family: "Press Start 2P","Courier New",monospace; font-size: 9.5px; line-height: 1.6; overflow-wrap: anywhere; }
+.pic-flow-arrow { align-self: center; color: #ffe066; font-size: 22px; font-weight: 900; }
+
+.pic-squares { display: flex; flex-wrap: wrap; gap: 6px; }
+.pic-square { width: 34px; height: 34px; border-radius: 5px; }
+.pic-splitbar { display: flex; height: 28px; border-radius: 6px; overflow: hidden; gap: 3px; }
+.pic-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-family: "Press Start 2P","Courier New",monospace; font-size: 9.5px; line-height: 1.6; text-transform: uppercase; }
+
+.pic-bars { display: grid; gap: 10px; }
+.pic-bar-row { display: grid; grid-template-columns: minmax(70px, 28%) minmax(0, 1fr) auto; align-items: center; gap: 10px; font-weight: 900; font-size: 15px; }
+.pic-bar-name { overflow-wrap: anywhere; }
+.pic-bar-track { height: 24px; background: #1f2a48; border-radius: 6px; overflow: hidden; }
+.pic-bar-track > span { display: block; height: 100%; border-radius: 6px; }
+.pic-bar-value { color: #f3f5ff; min-width: 3ch; }
+
+.pic-compare { display: grid; gap: 12px; }
+.pic-compare-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.pic-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pic-chip { font-family: "Press Start 2P","Courier New",monospace; font-size: 8.5px; line-height: 1.6; padding: 10px 8px; min-width: 70px; text-align: center; background: #141c33; border-radius: 6px; border: 3px solid #8c94a1; color: #f3f5ff; }
+.pic-chip-good { border-color: #7dff9a; }
+.pic-verdict-good { color: #7dff9a; font-weight: 900; }
+.pic-verdict-bad { color: #ff9e7a; font-weight: 900; }
+
+.pic-stack { display: grid; }
+.pic-layer { border: 3px dashed; border-radius: 12px; padding: 10px 12px; display: grid; gap: 8px; }
+.pic-layer .pic-layer { border-style: solid; }
+
+.pic-minicards { display: flex; flex-wrap: wrap; gap: 12px; }
+.pic-minicard { flex: 1 1 160px; min-width: 0; background: #0a0f1d; border-radius: 8px; padding: 12px; display: grid; gap: 6px; align-content: start; }
+.pic-lesson .pic-minicard { background: #141c33; }
+.pic-minicard-head { font-family: "Press Start 2P","Courier New",monospace; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
 
 @media (max-width: 560px) {
-  .pic-analogy-head { flex-direction: column; text-align: center; }
-  .pic-branches { grid-template-columns: 1fr; gap: 18px; }
+  .md-picture { padding: 14px; }
+  .pic-flow-arrow { transform: rotate(90deg); flex-basis: 100%; text-align: center; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .pic-rule { animation: pic-glow 1.6s ease-in-out 1; }
+  @keyframes pic-glow { 0% { border-left-color: #26325a } 100% { border-left-color: #7dff9a } }
 }
 `;
 

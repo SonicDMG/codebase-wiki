@@ -39,6 +39,12 @@ export interface WikiTopicDoc {
   updatedAt: string; // ISO-8601
   /** $vectorize input — title + description, capped at ~750 chars. */
   $vectorize?: string;
+  /** Pre-generated wiki page content in markdown format. */
+  generatedPage?: string;
+  /** Pre-generated picture book page content in markdown/JSON format. */
+  generatedPagePicture?: string;
+  /** The commit SHA at which this page content was generated. */
+  pageCommitSha?: string;
 }
 
 /**

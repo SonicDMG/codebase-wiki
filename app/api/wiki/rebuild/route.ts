@@ -9,7 +9,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { generateTopics, buildSnapshotDoc } from '@/lib/wiki/generate';
+import { generateTopics, buildSnapshotDoc, rebuildTopicPages } from '@/lib/wiki/generate';
 import {
   acquireLease,
   releaseLease,
@@ -47,8 +47,12 @@ export async function POST(req: NextRequest) {
   try {
     const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
 
+    // Pre-generate pages for all topics
+    const allPaths = snapshotEntries.map((e) => e.path);
+    const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths);
+
     // Replace all topic documents for this branch wholesale
-    await replaceTopics(branch, result.topics);
+    await replaceTopics(branch, topicsWithPages);
 
     // Save fresh snapshot document
     const snapshot = buildSnapshotDoc(

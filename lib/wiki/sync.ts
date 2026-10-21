@@ -22,7 +22,7 @@ import {
   saveSnapshot,
   saveTopics,
 } from './store';
-import { buildSnapshotDoc, extendTopics, generateTopics, REPO_NAME, REPO_OWNER } from './generate';
+import { buildSnapshotDoc, extendTopics, generateTopics, REPO_NAME, REPO_OWNER, generatePagesForTopic, rebuildTopicPages } from './generate';
 import { classifyFile } from './classify';
 import { TOPIC_SECTIONS } from './types';
 import type { SnapshotEntry, SyncOutcome, WikiSnapshotDoc, WikiTopicDoc } from './types';
@@ -36,6 +36,9 @@ export interface PublicTopic {
   suggestedQuery: string;
   slug: string;
   section?: string;
+  generatedPage?: string;
+  generatedPagePicture?: string;
+  pageCommitSha?: string;
 }
 
 /** Topics grouped by section (stable — stored order is kept within a section). */
@@ -47,6 +50,9 @@ export function toPublicTopics(topics: WikiTopicDoc[]): PublicTopic[] {
     suggestedQuery: t.suggestedQuery,
     slug: t.slug,
     section: t.section,
+    generatedPage: t.generatedPage,
+    generatedPagePicture: t.generatedPagePicture,
+    pageCommitSha: t.pageCommitSha,
   }));
 }
 
@@ -61,11 +67,13 @@ const generating = new Map<string, Promise<{ topics: WikiTopicDoc[]; snapshot: W
 
 async function generateAndStore(branch: string) {
   const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
-  await replaceTopics(branch, result.topics);
+  const allPaths = snapshotEntries.map((e) => e.path);
+  const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths);
+  await replaceTopics(branch, topicsWithPages);
   const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
   await saveSnapshot(snapshot);
-  console.log(`[wiki] generated and stored ${result.topics.length} topics for branch "${branch}"`);
-  return { topics: result.topics, snapshot };
+  console.log(`[wiki] generated and stored ${topicsWithPages.length} topics for branch "${branch}"`);
+  return { topics: topicsWithPages, snapshot };
 }
 
 // ── ensureTopics ──────────────────────────────────────────────────────────────
@@ -82,6 +90,40 @@ export async function ensureTopics(
   try {
     const [stored, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
     if (stored.length > 0 && snapshot) {
+      // Check if any topic lacks page content (due to older codebase wiki generation)
+      const missingPages = stored.filter((t) => !t.generatedPage);
+      if (missingPages.length > 0) {
+        console.log(`[wiki] Stored topics found, but ${missingPages.length} topics are missing pre-generated pages. Starting background backfill...`);
+        
+        // Run backfilling completely asynchronously to keep TOC loading instant (takes < 5ms)
+        void (async () => {
+          try {
+            const { entries } = await getFileTreeResult(REPO_OWNER, REPO_NAME, snapshot.headSha);
+            const allPaths = entries.filter((e) => e.type === 'blob' && !isIgnoredPath(e.path)).map((e) => e.path);
+            
+            // Rebuild missing pages in parallel for speed!
+            await Promise.all(
+              missingPages.map(async (topic) => {
+                try {
+                  console.log(`[wiki] Background backfilling page content for topic "${topic.title}"...`);
+                  const { wiki, picture } = await generatePagesForTopic(topic, branch, snapshot.headSha, allPaths);
+                  topic.generatedPage = wiki;
+                  topic.generatedPagePicture = picture;
+                  topic.pageCommitSha = snapshot.headSha;
+                  topic.updatedAt = new Date().toISOString();
+                  await saveTopics([topic]);
+                  console.log(`[wiki] Background backfill complete for topic "${topic.title}".`);
+                } catch (err) {
+                  console.error(`[wiki] Background backfill failed for topic "${topic.title}":`, err);
+                }
+              })
+            );
+            console.log(`[wiki] All missing pages backfilled successfully in the background.`);
+          } catch (backfillErr) {
+            console.error(`[wiki] Background automatic backfill of missing pages failed:`, backfillErr);
+          }
+        })();
+      }
       return { topics: stored, snapshot, generated: false };
     }
   } catch (err) {
@@ -369,6 +411,40 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
         unclassifiedPaths = remainingUnclassified;
       } catch (err) {
         console.warn('[wiki/sync] incremental extension failed:', err);
+      }
+    }
+
+    // Rebuild pages for affected or new topics on SHA change
+    const changedPaths = [
+      ...diff.additions.map((a) => a.path),
+      ...diff.deletions.map((d) => d.path),
+      ...diff.modifications.map((m) => m.path),
+      ...diff.renames.map((r) => r.newPath),
+      ...diff.renames.map((r) => r.oldPath),
+    ];
+
+    const topicsToRebuild = current.filter((topic) => {
+      const isAffected = changedPaths.some((p) => pathMatchesScope(p, topic.scope));
+      const hasNoPage = !topic.generatedPage;
+      return isAffected || hasNoPage;
+    });
+
+    if (topicsToRebuild.length > 0) {
+      console.log(`[wiki/sync] Rebuilding page content for ${topicsToRebuild.length} topics due to SHA/file changes...`);
+      for (const topic of topicsToRebuild) {
+        try {
+          console.log(`[wiki/sync] Rebuilding page for topic "${topic.title}"...`);
+          const { wiki, picture } = await generatePagesForTopic(topic, branch, head.sha, newPaths);
+          topic.generatedPage = wiki;
+          topic.generatedPagePicture = picture;
+          topic.pageCommitSha = head.sha;
+          topic.updatedAt = now;
+          if (!topicsToSave.some((ts) => ts._id === topic._id)) {
+            topicsToSave.push(topic);
+          }
+        } catch (err) {
+          console.error(`[wiki/sync] Failed to rebuild page for topic "${topic.title}":`, err);
+        }
       }
     }
 

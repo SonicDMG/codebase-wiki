@@ -20,6 +20,7 @@ import {
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
 import { TOPIC_SECTIONS } from './types';
+import { wikiPrompt, picturePrompt } from './prompts';
 import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
 
@@ -371,4 +372,130 @@ export function buildSnapshotDoc(
     lastCheckedAt: now,
     lastRebuiltAt: now,
   };
+}
+
+type PageMode = 'wiki' | 'picture';
+
+const PAGE_PROMPTS: Record<PageMode, (githubBase: string, commitSha: string, filesBlock: string) => string> = {
+  wiki: wikiPrompt,
+  picture: picturePrompt,
+};
+
+/**
+ * Generates the pre-built page content for a topic, in the given modes
+ * (both by default), from the files in the topic's scope at `commitSha`.
+ */
+export async function generatePagesForTopic(
+  topic: WikiTopicDoc,
+  branch: string,
+  commitSha: string,
+  allPaths: string[],
+  modes: PageMode[] = ['wiki', 'picture'],
+): Promise<Partial<Record<PageMode, string>>> {
+  const allModes = (text: string) => Object.fromEntries(modes.map((m) => [m, text]));
+
+  // 1. Find matching files in topic scope.
+  const matchedPaths = allPaths.filter(
+    (p) => !isIgnoredPath(p) && pathMatchesScope(p, topic.scope)
+  );
+  if (matchedPaths.length === 0) return allModes(`No source files found matching this topic's scope.`);
+
+  // 2. Fetch matched file contents.
+  const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, matchedPaths, commitSha);
+  const fetchedPaths = Object.keys(contents);
+  if (fetchedPaths.length === 0) return allModes(`Could not fetch source files for this topic.`);
+
+  // 3. Format files block.
+  const MAX_FILE_CHARS = 8000;
+  const filesBlock = fetchedPaths
+    .map((path) => {
+      const raw = contents[path];
+      const text = raw.length > MAX_FILE_CHARS ? raw.slice(0, MAX_FILE_CHARS) : raw;
+      const numbered = text
+        .split('\n')
+        .map((line, i) => `${i + 1}| ${line}`)
+        .join('\n');
+      const truncated = text.length < raw.length ? '\n... [truncated]' : '';
+      return `<file path="${path}">\n${numbered}${truncated}\n</file>`;
+    })
+    .join('\n\n');
+
+  // 4. Generate each mode's page in parallel.
+  const client = llmClient();
+  const model = getLlmModel();
+  const githubBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${commitSha}`;
+
+  const generate = async (mode: PageMode) => {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: PAGE_PROMPTS[mode](githubBase, commitSha, filesBlock) },
+        { role: 'user', content: topic.suggestedQuery },
+      ],
+    });
+    return response.choices[0]?.message?.content?.trim() ?? '';
+  };
+
+  console.log(`[wiki/generate] generating ${modes.join(' + ')} page(s) for topic "${topic.title}"...`);
+  const pages = await Promise.all(
+    modes.map(async (mode) => {
+      // A stored page is read many times, so retry picture pages whose cards don't parse.
+      let page = await generate(mode);
+      for (let retry = 0; mode === 'picture' && retry < PICTURE_RETRIES && !pictureCardsParse(page); retry++) {
+        console.warn(`[wiki/generate] picture page for "${topic.title}" has a malformed card; retrying`);
+        page = await generate(mode);
+      }
+      return [mode, page] as const;
+    }),
+  );
+  return Object.fromEntries(pages);
+}
+
+const PICTURE_RETRIES = 2;
+
+/** True when every ```picture card on the page is valid JSON (a final card may lack its closing fence). */
+function pictureCardsParse(page: string): boolean {
+  for (const [, source] of page.matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)) {
+    try {
+      JSON.parse(source);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Rebuilds the generated pages for a list of topics.
+ */
+export async function rebuildTopicPages(
+  topics: WikiTopicDoc[],
+  branch: string,
+  commitSha: string,
+  allPaths: string[],
+): Promise<WikiTopicDoc[]> {
+  console.log(`[wiki] Rebuilding pages for ${topics.length} topics...`);
+  const updatedTopics: WikiTopicDoc[] = [];
+
+  // Generate pages in parallel to keep it fast!
+  await Promise.all(
+    topics.map(async (topic) => {
+      try {
+        console.log(`[wiki] Rebuilding page for topic "${topic.title}"...`);
+        const { wiki, picture } = await generatePagesForTopic(topic, branch, commitSha, allPaths);
+        updatedTopics.push({
+          ...topic,
+          generatedPage: wiki,
+          generatedPagePicture: picture,
+          pageCommitSha: commitSha,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        console.error(`[wiki] Failed to generate pages for topic "${topic.title}":`, err);
+        updatedTopics.push(topic);
+      }
+    })
+  );
+
+  return updatedTopics;
 }
