@@ -12,9 +12,11 @@
  * spec, which we compile to Mermaid ourselves so diagrams can't have syntax
  * errors. Raw HTML from the model is dropped by react-markdown (skipHtml).
  *
- * Every answer has two modes the reader can flip between: 'wiki' (the
- * technical page) and 'picture' (a picture book an 8-year-old could follow,
- * built from ```picture JSON cards). The other mode is generated on demand.
+ * The whole app runs in one of two modes, switched once in the header: 'wiki'
+ * (technical pages, light amber theme) or 'picture' — the Field Guide, the
+ * Lumentide guide style built from ```picture JSON cards, with the page,
+ * topics and code panels on the night-sky theme. An answer missing in the
+ * current mode is generated when its conversation is open.
  */
 
 import { Fragment, isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -53,10 +55,12 @@ const c = {
 
 type AnswerMode = 'wiki' | 'picture';
 
+// 'picture' is the Field Guide: the Lumentide guide style, for the whole app.
 const ANSWER_MODES: { mode: AnswerMode; label: string; title: string }[] = [
-  { mode: 'wiki', label: '📖 Wiki', title: 'Technical wiki page' },
-  { mode: 'picture', label: '🎨 Picture book', title: 'Explained with pictures, simple enough for an 8-year-old' },
+  { mode: 'wiki', label: '📖 Wiki', title: 'Technical wiki pages' },
+  { mode: 'picture', label: '🕹️ Field Guide', title: 'The real words and how things work, drawn in pictures' },
 ];
+const MODE_STORAGE_KEY = 'walfly_wiki_mode';
 
 interface Answer {
   content: string;
@@ -70,19 +74,17 @@ interface Message {
   role: 'user' | 'assistant';
   /** The question (user messages). Assistant text lives in `answers`. */
   content: string;
-  /** Assistant only: one answer per mode, each generated the first time it's shown. */
+  /** Assistant only: one answer per mode, each generated the first time the app is in that mode. */
   answers?: Partial<Record<AnswerMode, Answer>>;
-  /** Assistant only: the mode currently shown. */
-  view?: AnswerMode;
 }
 
-function shownAnswer(m: Message | undefined): Answer | undefined {
-  return m?.answers?.[m.view ?? 'wiki'];
+function shownAnswer(m: Message | undefined, mode: AnswerMode): Answer | undefined {
+  return m?.answers?.[mode];
 }
 
-/** What the server sees for a turn: the question, or the answer the reader is looking at. */
-function toHistory(m: Message) {
-  return { role: m.role, content: m.role === 'user' ? m.content : shownAnswer(m)?.content ?? '' };
+/** What the server sees for a turn: the question, or the answer in the current mode. */
+function toHistory(m: Message, mode: AnswerMode) {
+  return { role: m.role, content: m.role === 'user' ? m.content : shownAnswer(m, mode)?.content ?? '' };
 }
 
 /** A code block extracted from the LLM response, shown in the sidebar. */
@@ -116,11 +118,17 @@ const WELCOME_MESSAGE: Message = {
   id: 'welcome',
   role: 'assistant',
   content: '',
-  view: 'wiki',
   answers: {
     wiki: {
       content:
-        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Choose **📖 Wiki** for the technical page or **🎨 Picture book** for a simple, picture-first explanation — and flip any answer between the two\n- Click a citation chip to see the exact code in the references panel',
+        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Switch the whole wiki between **📖 Wiki** (technical pages) and **🕹️ Field Guide** (the real words and how things work, in pictures) at the top right\n- Click a citation chip to see the exact code in the references panel',
+    },
+    picture: {
+      content: [
+        '{"type":"words","title":"Walfly Field Guide","words":[{"word":"Topic","color":"orange","means":"One part of the codebase, with a page already written for it."},{"word":"Citation","color":"cyan","means":"A link to the exact lines of code behind a picture."}]}',
+        '{"type":"lesson","title":"Every topic has its own page","picture":{"kind":"flow","steps":[{"label":"Pick a topic","color":"orange","note":"on the left"},{"label":"Read its page","color":"green"},{"label":"Ask more","color":"cyan","note":"in the box below"}]},"lines":["Each topic keeps its own conversation.","Your follow-up questions stay with their topic."]}',
+        '{"type":"lesson","title":"Pictures come from the real code","picture":{"kind":"compare","rows":[{"items":["Wiki"],"ok":true,"verdict":"Technical pages, for reading closely"},{"items":["Field Guide"],"ok":true,"verdict":"The same facts, drawn in pictures"}]},"lines":["Switch modes once, at the top right. Every page follows.","Click a **Citation** to see the code beside the page."],"rule":"Pages are read live from GitHub, so they match the current commit."}',
+      ].map((card) => '```picture\n' + card + '\n```').join('\n\n'),
     },
   },
 };
@@ -137,15 +145,15 @@ function topicKey(branch: string | null, slug: string): string {
  * for it, so follow-ups and mode flips have the question in history.
  * Null when the page hasn't been generated yet.
  */
-function topicOpening(topic: TocTopic, view: AnswerMode): Message[] | null {
+function topicOpening(topic: TocTopic): Message[] | null {
   if (!topic.generatedPage) return null;
   const commit = topic.pageCommitSha;
   const answers: Message['answers'] = { wiki: { content: topic.generatedPage, commit } };
   if (topic.generatedPagePicture) answers.picture = { content: topic.generatedPagePicture, commit };
   return [
     { id: `q-${topic.slug}`, role: 'user', content: topic.suggestedQuery },
-    // A missing picture page is generated live on the first flip.
-    { id: `page-${topic.slug}`, role: 'assistant', content: '', view: answers[view] ? view : 'wiki', answers },
+    // A missing picture page is generated live the first time it's shown.
+    { id: `page-${topic.slug}`, role: 'assistant', content: '', answers },
   ];
 }
 
@@ -159,6 +167,10 @@ function loadConversations(): Record<string, Message[]> | null {
     const raw = localStorage.getItem(CONVERSATIONS_STORAGE_KEY);
     if (!raw) return null;
     const stored = JSON.parse(raw) as Record<string, Message[]>;
+    for (const [key, list] of Object.entries(stored)) {
+      // The welcome text belongs to this version of the page, not to the save.
+      stored[key] = list.map((m) => (m.id === WELCOME_MESSAGE.id ? WELCOME_MESSAGE : m));
+    }
     // An answer still pending when the page closed will never finish: drop it if empty, else settle it.
     for (const list of Object.values(stored)) {
       for (const m of list) {
@@ -204,12 +216,22 @@ export default function WikiPage() {
     const stored = loadConversations();
     if (stored) setConversations((prev) => ({ ...prev, ...stored }));
     conversationsRestored.current = true;
+    try {
+      const mode = localStorage.getItem(MODE_STORAGE_KEY);
+      if (mode === 'wiki' || mode === 'picture') setAnswerMode(mode);
+    } catch { /* storage unavailable: start in wiki mode */ }
   }, []);
+
+  const changeMode = (mode: AnswerMode) => {
+    setAnswerMode(mode);
+    try { localStorage.setItem(MODE_STORAGE_KEY, mode); } catch { /* not remembered */ }
+  };
 
   useEffect(() => {
     if (conversationsRestored.current) saveConversations(conversations);
   }, [conversations]);
 
+  // One mode for the whole app; every answer, topic and panel follows it.
   const [answerMode, setAnswerMode] = useState<AnswerMode>('wiki');
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
@@ -471,16 +493,16 @@ export default function WikiPage() {
           fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
           flowchart: { curve: 'basis', padding: 12 },
           themeVariables: {
-            primaryColor: w.amberLight,
-            primaryBorderColor: w.amberBorder,
-            primaryTextColor: w.text,
-            lineColor: w.textFaint,
-            clusterBkg: w.surface,
-            clusterBorder: w.border,
-            edgeLabelBackground: w.bg,
-            actorBkg: w.amberLight,
-            actorBorder: w.amberBorder,
-            noteBkgColor: w.surface,
+            primaryColor: PALETTES.wiki.amberLight,
+            primaryBorderColor: PALETTES.wiki.amberBorder,
+            primaryTextColor: PALETTES.wiki.text,
+            lineColor: PALETTES.wiki.textFaint,
+            clusterBkg: PALETTES.wiki.surface,
+            clusterBorder: PALETTES.wiki.border,
+            edgeLabelBackground: PALETTES.wiki.bg,
+            actorBkg: PALETTES.wiki.amberLight,
+            actorBorder: PALETTES.wiki.amberBorder,
+            noteBkgColor: PALETTES.wiki.surface,
             fontSize: '13px',
           },
         });
@@ -547,7 +569,7 @@ export default function WikiPage() {
         if (!isUntouchedOpening(list, topic.slug)) continue;
         const shown = list![1].answers;
         if (shown?.wiki?.content === topic.generatedPage && shown?.picture?.content === topic.generatedPagePicture) continue;
-        const opening = topicOpening(topic, list![1].view ?? 'wiki');
+        const opening = topicOpening(topic);
         if (!opening) continue;
         if (next === prev) next = { ...prev };
         next[key] = opening;
@@ -648,32 +670,23 @@ export default function WikiPage() {
     const history = conversations[key] ?? [];
     const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question };
     const assistantId = crypto.randomUUID();
-    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', view: answerMode, answers: {} };
+    const assistantMsg: Message = { id: assistantId, role: 'assistant', content: '', answers: {} };
 
     setConversations((prev) => ({ ...prev, [key]: [...(prev[key] ?? []), userMsg, assistantMsg] }));
-    await streamAnswer(key, assistantId, answerMode, [...history, userMsg].map(toHistory));
+    await streamAnswer(key, assistantId, answerMode, [...history, userMsg].map((m) => toHistory(m, answerMode)));
   }, [input, loading, conversations, activeKey, answerMode, streamAnswer]);
 
-  // ── Flip an answer between modes; the first flip generates the other version ─
-  const showAnswerAs = useCallback((assistantId: string, mode: AnswerMode) => {
-    const history = conversations[activeKey] ?? [];
-    const idx = history.findIndex((m) => m.id === assistantId);
-    const msg = history[idx];
-    if (!msg || msg.view === mode) return;
-    const needsAnswer = !msg.answers?.[mode];
-    if (needsAnswer && loading) return;
-
-    setActiveRef(null);
-    setConversations((prev) => {
-      const list = prev[activeKey] || [];
-      return {
-        ...prev,
-        [activeKey]: list.map((m) => (m.id === assistantId ? { ...m, view: mode } : m)),
-      };
-    });
+  // ── Answers missing in the current mode are generated, one at a time ────
+  // Switching modes (or opening a conversation) fills in, oldest first, every
+  // answer the open conversation doesn't have yet in that mode.
+  useEffect(() => {
+    if (loading) return;
+    const list = conversations[activeKey] ?? [];
+    const idx = list.findIndex((m) => m.role === 'assistant' && m.id !== WELCOME_MESSAGE.id && !m.answers?.[answerMode]);
+    if (idx < 0) return;
     // History ends with the question this message answers.
-    if (needsAnswer) void streamAnswer(activeKey, assistantId, mode, history.slice(0, idx).map(toHistory));
-  }, [conversations, activeKey, loading, streamAnswer]);
+    void streamAnswer(activeKey, list[idx].id, answerMode, list.slice(0, idx).map((m) => toHistory(m, answerMode)));
+  }, [answerMode, activeKey, conversations, loading, streamAnswer]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -688,7 +701,7 @@ export default function WikiPage() {
     setActiveSlug(topic.slug);
     const key = topicKey(wikiBranch, topic.slug);
     if (conversations[key]?.length) return;
-    const opening = topicOpening(topic, answerMode);
+    const opening = topicOpening(topic);
     if (opening) setConversations((prev) => ({ ...prev, [key]: opening }));
     else void send(topic.suggestedQuery, key);
   };
@@ -723,11 +736,11 @@ export default function WikiPage() {
     }
   };
 
-  const latestAnswer = shownAnswer(latestAssistantMsg);
+  const latestAnswer = shownAnswer(latestAssistantMsg, answerMode);
   const parsedLatest = latestAnswer ? parseMessage(latestAnswer.content, latestAnswer.commit) : null;
 
   return (
-    <div style={styles.root}>
+    <div className="wiki-root" data-mode={answerMode} style={styles.root}>
       <GlobalMdStyles />
       {/* ── Header ── */}
       <header style={styles.header}>
@@ -742,6 +755,7 @@ export default function WikiPage() {
           Walfly Wiki
         </span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
+        <ModeToggle value={answerMode} onChange={changeMode} />
         {wikiBranch && (
           <div ref={statusMenuRef} style={{ position: 'relative', display: 'inline-block' }}>
             <button
@@ -890,8 +904,7 @@ export default function WikiPage() {
                 parsedLatest={parsedLatest}
                 activeRef={activeRef}
                 onCitationClick={handleCitationClick}
-                loading={loading}
-                onShowAs={(mode) => showAnswerAs(msg.id, mode)}
+                mode={answerMode}
               />
             ))}
           </div>
@@ -935,10 +948,6 @@ export default function WikiPage() {
 
       {/* ── Input ── */}
       <footer style={styles.footer}>
-        <div style={styles.modeRow}>
-          <span style={styles.modeLabel}>Answer as</span>
-          <ModeToggle value={answerMode} onChange={setAnswerMode} />
-        </div>
         <div style={styles.inputRow}>
           <textarea
             ref={inputRef}
@@ -976,37 +985,24 @@ interface MessageBlockProps {
   parsedLatest: ParsedMessage | null;
   activeRef: number | null;
   onCitationClick: (idx: number) => void;
-  loading: boolean;
-  onShowAs: (mode: AnswerMode) => void;
+  mode: AnswerMode;
 }
 
 function MessageBlock({
-  message, isLatestAssistant, parsedLatest, activeRef, onCitationClick, loading, onShowAs,
+  message, isLatestAssistant, parsedLatest, activeRef, onCitationClick, mode,
 }: MessageBlockProps) {
   if (message.role === 'user') {
     return <h1 id={`msg-${message.id}`} style={styles.question}>{message.content}</h1>;
   }
-  const view = message.view ?? 'wiki';
-  const answer = shownAnswer(message);
+  const answer = shownAnswer(message, mode);
   const content = answer?.content ?? '';
   const streaming = !!answer?.pending;
-  const proseClass = view === 'picture' ? 'md-prose md-picture' : 'md-prose';
+  const proseClass = mode === 'picture' ? 'md-prose md-picture' : 'md-prose';
   return (
     <article style={styles.answer}>
-      {message.id !== 'welcome' && (
-        <div style={styles.answerToolbar}>
-          <ModeToggle
-            value={view}
-            onChange={onShowAs}
-            // Generating the other version is a new request; wait for the current one.
-            isDisabled={(mode) => loading && !message.answers?.[mode]}
-            size="small"
-          />
-        </div>
-      )}
       {!content ? (
         <span style={styles.pending}>
-          {view === 'picture' ? 'Drawing the pictures…' : 'Reading the source…'}
+          {mode === 'picture' ? 'Drawing the pictures…' : 'Reading the source…'}
         </span>
       ) : isLatestAssistant && parsedLatest ? (
         <ProseContent
@@ -1034,31 +1030,22 @@ function MessageBlock({
 interface ModeToggleProps {
   value: AnswerMode;
   onChange: (mode: AnswerMode) => void;
-  isDisabled?: (mode: AnswerMode) => boolean;
-  size?: 'small' | 'normal';
 }
 
-function ModeToggle({ value, onChange, isDisabled, size = 'normal' }: ModeToggleProps) {
+function ModeToggle({ value, onChange }: ModeToggleProps) {
   return (
-    <div role="radiogroup" aria-label="Answer style" style={styles.modeToggle}>
+    <div role="radiogroup" aria-label="Wiki style" style={styles.modeToggle}>
       {ANSWER_MODES.map(({ mode, label, title }) => {
         const active = mode === value;
-        const disabled = !active && !!isDisabled?.(mode);
         return (
           <button
             key={mode}
             type="button"
             role="radio"
             aria-checked={active}
-            title={disabled ? 'Available once the current answer finishes' : title}
-            disabled={disabled}
+            title={title}
             onClick={() => onChange(mode)}
-            style={{
-              ...styles.modeBtn,
-              ...(size === 'small' ? styles.modeBtnSmall : {}),
-              ...(active ? styles.modeBtnActive : {}),
-              ...(disabled ? styles.modeBtnDisabled : {}),
-            }}
+            style={{ ...styles.modeBtn, ...(active ? styles.modeBtnActive : {}) }}
           >
             {label}
           </button>
@@ -2075,10 +2062,11 @@ const MD_CSS = `
 .md-prose figure svg { max-width: 100%; height: auto; }
 .diagram-zoom svg { width: 100%; max-width: none !important; height: auto; }
 
-/* Picture-book mode: the Lumentide guide look — a night-sky comic column of
-   dark lesson panels, pixel-font headings, one colour per concept. */
+/* Field Guide mode: the Lumentide guide look — a night-sky comic column of
+   dark lesson panels, pixel-font headings, one colour per concept. The page
+   around it switches palette with the mode (THEME_CSS). */
 .md-picture {
-  background: #0b1020; color: #f3f5ff; border-radius: 14px; padding: 22px;
+  color: #f3f5ff;
   font-family: "Nunito","Segoe UI",system-ui,sans-serif; font-size: 18px; line-height: 1.45;
   display: grid; gap: 22px; counter-reset: lesson;
 }
@@ -2148,7 +2136,6 @@ const MD_CSS = `
 .pic-minicard-head { font-family: "Press Start 2P","Courier New",monospace; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
 
 @media (max-width: 560px) {
-  .md-picture { padding: 14px; }
   .pic-flow-arrow { transform: rotate(90deg); flex-basis: 100%; text-align: center; }
 }
 @media (prefers-reduced-motion: no-preference) {
@@ -2158,32 +2145,87 @@ const MD_CSS = `
 `;
 
 function GlobalMdStyles() {
-  return <style dangerouslySetInnerHTML={{ __html: MD_CSS }} />;
+  return <style dangerouslySetInnerHTML={{ __html: THEME_CSS + MD_CSS }} />;
 }
 
 // ── Styles ─────────────────────────────────────────────────────────────────
 
-const w = {
-  bg:          '#ffffff',
-  surface:     '#f7f8fa',
-  border:      '#e2e4e8',
-  text:        '#1a1a1f',
-  textMuted:   '#57606a',
-  textFaint:   '#8b949e',
-  amber:       c.amber,
-  amberLight:  '#fff7e6',
-  amberBorder: '#fcd389',
-  codeBg:      '#1E1E22',
-  codeBorder:  '#2A2A2F',
-  codeText:    '#e2e4e8',
+// Every colour and font in the page styles is a CSS variable, set per mode on
+// the root (THEME_CSS): the wiki's light amber look, or the Field Guide's
+// night-sky Lumentide look. Mermaid needs real colours, so it reads the
+// wiki palette directly.
+const PALETTES = {
+  wiki: {
+    bg:          '#ffffff',
+    surface:     '#f7f8fa',
+    border:      '#e2e4e8',
+    text:        '#1a1a1f',
+    textMuted:   '#57606a',
+    textFaint:   '#8b949e',
+    amber:       c.amber,
+    amberLight:  '#fff7e6',
+    amberBorder: '#fcd389',
+    amberGlow:   c.amberGlow,
+    accentText:  '#92600a',
+    onAccent:    '#1a1a1f',
+    codeBg:      '#1E1E22',
+    codeBorder:  '#2A2A2F',
+    codeText:    '#e2e4e8',
+    fontBody:    '-apple-system, "Segoe UI", system-ui, sans-serif',
+    fontHeading: 'Georgia, "Times New Roman", serif',
+    titleSize:   '17px',
+    questionSize: '26px',
+    questionLine: '1.3',
+    fontLabel:   'inherit',
+    panelBorder: '1px',
+  },
+  picture: {
+    bg:          '#0b1020',
+    surface:     '#141c33',
+    border:      '#26325a',
+    text:        '#f3f5ff',
+    textMuted:   '#a8b3d6',
+    textFaint:   '#7d88ad',
+    amber:       '#ffb347',
+    amberLight:  '#1f2a48',
+    amberBorder: '#3a4a7a',
+    amberGlow:   '#ffb34733',
+    accentText:  '#ffe066',
+    onAccent:    '#0b1020',
+    codeBg:      '#0a0f1d',
+    codeBorder:  '#26325a',
+    codeText:    '#f3f5ff',
+    fontBody:    '"Nunito", "Segoe UI", system-ui, sans-serif',
+    fontHeading: '"Press Start 2P", "Courier New", monospace',
+    titleSize:   '13px',
+    questionSize: '17px',
+    questionLine: '1.7',
+    fontLabel:   '"Press Start 2P", "Courier New", monospace',
+    panelBorder: '3px',
+  },
 } as const;
+
+type PaletteKey = keyof typeof PALETTES.wiki;
+
+const w = Object.fromEntries(
+  (Object.keys(PALETTES.wiki) as PaletteKey[]).map((k) => [k, `var(--w-${k})`]),
+) as Record<PaletteKey, string>;
+
+const paletteVars = (mode: AnswerMode) =>
+  Object.entries(PALETTES[mode]).map(([k, v]) => `--w-${k}: ${v};`).join(' ');
+
+const THEME_CSS = `
+.wiki-root { ${paletteVars('wiki')} }
+.wiki-root[data-mode="picture"] { ${paletteVars('picture')} }
+.wiki-root ::placeholder { color: var(--w-textFaint); }
+`;
 
 const styles = {
   root: {
     display: 'flex',
     flexDirection: 'column' as const,
     height: '100dvh',
-    fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+    fontFamily: w.fontBody,
     fontSize: '15px',
     lineHeight: 1.65,
     color: w.text,
@@ -2199,9 +2241,9 @@ const styles = {
     background: w.bg,
   },
   title: {
-    fontFamily: 'Georgia, "Times New Roman", serif',
+    fontFamily: w.fontHeading,
     fontWeight: 700,
-    fontSize: '17px',
+    fontSize: w.titleSize,
     color: w.text,
     letterSpacing: '0.5px',
   },
@@ -2218,12 +2260,12 @@ const styles = {
     marginRight: '10px',
     whiteSpace: 'nowrap' as const,
   },
-  syncPillUpdated: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
+  syncPillUpdated: { background: w.amberLight, borderColor: w.amberBorder, color: w.accentText },
   syncPillError: { color: '#b3261e', borderColor: '#f0b4af' },
-  syncPillRateLimited: { background: w.amberLight, borderColor: w.amberBorder, color: '#92600a' },
+  syncPillRateLimited: { background: w.amberLight, borderColor: w.amberBorder, color: w.accentText },
   syncWarning: {
     fontSize: '11px',
-    color: '#92600a',
+    color: w.accentText,
     background: w.amberLight,
     border: `1px solid ${w.amberBorder}`,
     borderRadius: '4px',
@@ -2284,7 +2326,7 @@ const styles = {
     width: '100%',
     padding: '6px 12px',
     fontSize: '12px',
-    fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+    fontFamily: 'inherit',
     color: w.text,
     background: 'none',
     border: 'none',
@@ -2342,6 +2384,7 @@ const styles = {
     padding: '0 16px 8px',
   },
   tocSection: {
+    fontFamily: w.fontLabel,
     fontSize: '10px',
     fontWeight: 600,
     color: w.textFaint,
@@ -2370,7 +2413,7 @@ const styles = {
   },
   tocItemActive: {
     background: w.amberLight,
-    color: '#92600a',
+    color: w.accentText,
     fontWeight: 600,
     borderLeft: `3px solid ${w.amber}`,
     paddingLeft: '13px',
@@ -2418,10 +2461,10 @@ const styles = {
 
   // Questions read as page titles; answers as the article beneath.
   question: {
-    fontFamily: 'Georgia, "Times New Roman", serif',
-    fontSize: '26px',
+    fontFamily: w.fontHeading,
+    fontSize: w.questionSize,
     fontWeight: 700,
-    lineHeight: 1.3,
+    lineHeight: w.questionLine,
     color: w.text,
     margin: '48px 0 20px',
     paddingTop: '32px',
@@ -2429,11 +2472,8 @@ const styles = {
     scrollMarginTop: '16px',
   },
   answer: { minWidth: 0 },
-  answerToolbar: { display: 'flex', justifyContent: 'flex-end', margin: '-8px 0 16px' },
 
   // Answer-mode toggle (footer default + per-answer switch)
-  modeRow: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' },
-  modeLabel: { fontSize: '11px', color: w.textFaint },
   modeToggle: {
     display: 'inline-flex',
     padding: '2px',
@@ -2452,11 +2492,9 @@ const styles = {
     lineHeight: 1.5,
     cursor: 'pointer',
   },
-  modeBtnSmall: { padding: '2px 10px', fontSize: '12px' },
-  modeBtnDisabled: { opacity: 0.45, cursor: 'not-allowed' },
   modeBtnActive: {
     background: w.bg,
-    color: '#92600a',
+    color: w.accentText,
     fontWeight: 600,
     boxShadow: `0 0 0 1px ${w.amberBorder}`,
   },
@@ -2469,7 +2507,7 @@ const styles = {
     borderRadius: '4px',
     background: w.surface,
     border: `1px solid ${w.border}`,
-    color: '#92600a',
+    color: w.accentText,
     fontSize: '11.5px',
     lineHeight: '18px',
     fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
@@ -2481,7 +2519,7 @@ const styles = {
   citationActive: {
     background: w.amber,
     border: `1px solid ${w.amber}`,
-    color: '#1a1a1f',
+    color: w.onAccent,
   },
   link: { color: w.amber, textDecoration: 'none' },
 
@@ -2504,6 +2542,7 @@ const styles = {
   sidebarEmptyText: { color: w.textFaint, fontSize: '13px', textAlign: 'center' as const, lineHeight: 1.7, margin: 0 },
   sidebarContent: { padding: '16px', display: 'flex', flexDirection: 'column' as const, gap: '12px' },
   sidebarHeading: {
+    fontFamily: w.fontLabel,
     fontSize: '10px',
     fontWeight: 600,
     color: w.textFaint,
@@ -2514,13 +2553,13 @@ const styles = {
   // Ref cards
   refCard: {
     borderRadius: '8px',
-    border: `1px solid ${w.border}`,
+    border: `${w.panelBorder} solid ${w.border}`,
     background: w.bg,
     overflow: 'hidden',
     cursor: 'pointer',
     transition: 'border-color 0.15s',
   },
-  refCardActive: { border: `2px solid ${w.amber}`, boxShadow: `0 0 0 3px ${c.amberGlow}` },
+  refCardActive: { border: `2px solid ${w.amber}`, boxShadow: `0 0 0 3px ${w.amberGlow}` },
   refCardHeader: {
     display: 'flex',
     alignItems: 'center',
@@ -2576,7 +2615,7 @@ const styles = {
     height: '38px',
     borderRadius: '50%',
     background: w.amber,
-    color: '#1a1a1f',
+    color: w.onAccent,
     border: 'none',
     fontSize: '18px',
     fontWeight: 700,

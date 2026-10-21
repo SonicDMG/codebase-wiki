@@ -13,8 +13,8 @@
  *      with [filename:line] citations that link back to GitHub.
  *
  * `mode` picks the page format: 'wiki' (a scannable technical page) or
- * 'picture' (an explain-it-to-an-8-year-old picture book built from
- * ```picture JSON blocks the client draws as cards).
+ * 'picture' (the Field Guide: real words and mechanisms drawn as ```picture
+ * JSON cards the client renders, in the Lumentide guide style).
  *
  * The route is stateless: the client owns the conversation history and sends
  * the full message array on every turn, identical to /api/chat.

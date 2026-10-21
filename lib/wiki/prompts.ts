@@ -1,5 +1,5 @@
 /**
- * prompts.ts — Shared LLM prompts for wiki page generation (Wiki & Picture Book modes).
+ * prompts.ts — Shared LLM prompts for wiki page generation (Wiki & Field Guide modes).
  */
 
 const REPO_OWNER = 'SonicDMG';
@@ -83,14 +83,14 @@ diagrams go in a \`\`\`diagram JSON block; no HTML, no source code.`;
 }
 
 /**
- * The picture-book page, in the Lumentide guide style: teach a few real words,
+ * The Field Guide page, in the Lumentide guide style: teach a few real words,
  * then a column of numbered lessons, each a claim heading, one picture of the
  * real mechanism and a few short lines; end with the whole thing in one breath.
  * Simple and exact, never an analogy. Cards cite code as "path:START-END"; the
  * client turns that into a permalink.
  */
 export function picturePrompt(githubBase: string, commitSha: string, filesBlock: string): string {
-  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}), in picture-book mode.
+  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}), in Field Guide mode.
 Explain the answer so a curious 10-year-old could follow it, using pictures more than words. Answer using
 ONLY the source files at the end of this prompt. If the answer is not there, say so in one short sentence.
 
@@ -197,7 +197,7 @@ ${filesBlock}
 
 ---
 
-Reminder before you answer: picture-book mode, Lumentide style — each card in its own \`\`\`picture fence:
+Reminder before you answer: Field Guide mode, Lumentide style — each card in its own \`\`\`picture fence:
 one "words" card (plain words, code names in "real"), 4–8 "lesson" cards, one "breath" card. At least three
 picture kinds and "flow" at most twice; plain-word labels; no analogy; real limits from the code, made-up
 examples start with "Say"; "cite" as "path:START-END" or a list of them; no prose outside cards, never 【】.`;

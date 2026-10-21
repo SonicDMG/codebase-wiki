@@ -41,7 +41,7 @@ export interface WikiTopicDoc {
   $vectorize?: string;
   /** Pre-generated wiki page content in markdown format. */
   generatedPage?: string;
-  /** Pre-generated picture book page content in markdown/JSON format. */
+  /** Pre-generated Field Guide page (```picture cards) for the topic. */
   generatedPagePicture?: string;
   /** The commit SHA at which this page content was generated. */
   pageCommitSha?: string;
