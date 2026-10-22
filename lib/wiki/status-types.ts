@@ -2,6 +2,9 @@
  * status-types.ts — response shape of GET /api/wiki/status.
  * Type-only, so client code can `import type` it without pulling in server modules.
  */
+import type { WikiJob, WikiJobSummary } from './types';
+
+
 
 export type StalenessState = 'current' | 'files-changed' | 'older-template' | 'missing-or-failed';
 
@@ -20,6 +23,10 @@ export interface WikiStatusTopic {
 }
 
 export interface WikiStatusResponse {
+  /** Current or latest job on this branch, or null. */
+  job: WikiJob | null;
+  /** Last (up to 10) finished jobs, newest first. */
+  recentJobs: WikiJobSummary[];
   branch: string;
   headSha: string;
   templateVersion: number;

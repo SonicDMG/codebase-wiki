@@ -1,20 +1,26 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { WikiStatusResponse } from '@/lib/wiki/status-types';
 
 const POLL_MS = 45_000;
+const JOB_POLL_MS = 1_000;
 
 /**
  * Fetches /api/wiki/status for a branch on mount / branch change, then every
- * 45 seconds while the document is visible. Aborts and clears timers on cleanup.
+ * 45 seconds (every 1 second while a job is running) while the document is
+ * visible. Aborts and clears timers on cleanup. `refresh()` refetches now.
  */
 export function useWikiStatus(branch: string | null): {
   status: WikiStatusResponse | null;
   error: string | null;
+  refresh: () => void;
 } {
   const [status, setStatus] = useState<WikiStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const loadRef = useRef<() => void>(() => {});
+
+  const jobRunning = status?.job?.status === 'running';
 
   useEffect(() => {
     if (!branch) return;
@@ -40,13 +46,14 @@ export function useWikiStatus(branch: string | null): {
         setError(err instanceof Error ? err.message : 'status fetch failed');
       }
     };
+    loadRef.current = () => void load();
 
     const start = () => {
       if (timer) return;
       void load();
       timer = setInterval(() => {
         if (document.visibilityState === 'visible') void load();
-      }, POLL_MS);
+      }, jobRunning ? JOB_POLL_MS : POLL_MS);
     };
     const stop = () => {
       if (timer) clearInterval(timer);
@@ -57,7 +64,6 @@ export function useWikiStatus(branch: string | null): {
       else stop();
     };
 
-    setStatus(null);
     if (document.visibilityState === 'visible') start();
     document.addEventListener('visibilitychange', onVisibility);
 
@@ -67,7 +73,14 @@ export function useWikiStatus(branch: string | null): {
       controller?.abort();
       document.removeEventListener('visibilitychange', onVisibility);
     };
+  }, [branch, jobRunning]);
+
+  // Clear stale status when the branch changes.
+  useEffect(() => {
+    setStatus(null);
   }, [branch]);
 
-  return { status, error };
+  const refresh = useCallback(() => loadRef.current(), []);
+
+  return { status, error, refresh };
 }

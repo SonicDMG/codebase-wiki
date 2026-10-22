@@ -84,6 +84,64 @@ export interface WikiSnapshotDoc {
   leaseUntil: number | null;
   lastCheckedAt: string; // ISO-8601
   lastRebuiltAt: string; // ISO-8601
+  /**
+   * Current or latest background job. Written ONLY through the targeted `$set`
+   * helpers in store.ts — never by saveSnapshot (which preserves it).
+   */
+  job?: WikiJob;
+  /** Summaries of the last 10 finished jobs, newest first. */
+  recentJobs?: WikiJobSummary[];
+}
+
+// ── Background jobs ───────────────────────────────────────────────────────────
+
+export type WikiJobStatus = 'running' | 'completed' | 'completed-with-errors' | 'cancelled' | 'failed';
+
+/** What a job was asked to do. Union is open for later variants. */
+export type WikiJobRequest = { kind: 'refresh-stale' };
+export type WikiJobKind = WikiJobRequest['kind'];
+
+/** One step of a job; the runner loops over stages in order. */
+export interface WikiJobStage {
+  kind: 'refresh-pages';
+}
+
+/** One per-topic failure (old page kept). */
+export interface WikiJobFailure {
+  slug: string;
+  modes: Array<'wiki' | 'picture'>;
+  error: string;
+}
+
+export interface WikiJob {
+  id: string;
+  kind: WikiJobKind;
+  status: WikiJobStatus;
+  stages: WikiJobStage[];
+  /** Topics to process. */
+  total: number;
+  /** Topics finished (succeeded + failed). */
+  finished: number;
+  succeeded: number;
+  failures: WikiJobFailure[];
+  /** Slugs of topics currently in flight. */
+  currentSlugs: string[];
+  startedAt: string; // ISO-8601
+  finishedAt?: string; // ISO-8601
+  heartbeatAt: string; // ISO-8601
+  cancelRequested?: boolean;
+}
+
+export interface WikiJobSummary {
+  id: string;
+  kind: WikiJobKind;
+  status: WikiJobStatus;
+  total: number;
+  finished: number;
+  succeeded: number;
+  failed: number;
+  startedAt: string;
+  finishedAt: string;
 }
 
 /** One entry in the compact file list (decoded). */

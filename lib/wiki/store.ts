@@ -15,7 +15,7 @@
 import type { Collection } from '@datastax/astra-db-ts';
 import { getDb } from '@walfly/db';
 import { VECTOR_DIMENSION, VECTOR_MODEL, VECTORIZE_MAX_CHARS } from '@walfly/db';
-import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult } from './types';
+import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult, WikiJob, WikiJobSummary } from './types';
 
 const WIKI_TOC_COLLECTION = 'wiki_toc';
 
@@ -202,14 +202,76 @@ export async function deleteTopicsByIds(ids: string[]): Promise<void> {
 
 // ── Snapshot writes ───────────────────────────────────────────────────────────
 
-/** Upsert the snapshot document for a branch. */
+/**
+ * Upsert the snapshot document for a branch.
+ *
+ * Uses a targeted `$set` of every field EXCEPT `_id`, `job` and `recentJobs`
+ * (never a full replace). Callers such as sync.ts pass a snapshot they read
+ * earlier, so replacing would silently wipe job state written meanwhile by the
+ * job runner. `updateOne` with `upsert: true` creates the document (with the
+ * filter's `_id`) when it does not exist yet.
+ */
 export async function saveSnapshot(snapshot: WikiSnapshotDoc): Promise<void> {
   const col = await ensureWikiTocCollection();
+  const { _id, job: _job, recentJobs: _recent, ...fields } = snapshot;
   // Snapshot is NOT vector-indexed — omit $vectorize entirely.
-  await col.findOneAndReplace({ _id: snapshot._id } as any, snapshot as any, {
-    upsert: true,
-    returnDocument: 'after',
-  });
+  await col.updateOne({ _id } as any, { $set: fields } as any, { upsert: true });
+}
+
+// ── Job state (on the snapshot document) ─────────────────────────────────────
+//
+// All job writes are targeted `$set`s on `job` / `job.<field>` / `recentJobs`,
+// guarded by a filter on `job.id` / `job.status`, so that:
+//   - a cancel flag written by the stop route is never overwritten by a runner
+//     progress write (the runner writes progress via dotted paths only);
+//   - a stale runner can't write into a newer job;
+//   - nothing here creates a bogus partial `job` object.
+
+const RECENT_JOBS_LIMIT = 10;
+
+/** Create/replace the whole `job` object (only at job start). */
+export async function updateSnapshotJob(branch: string, job: WikiJob): Promise<void> {
+  const col = await ensureWikiTocCollection();
+  await col.updateOne({ _id: `${branch}:snapshot` } as any, { $set: { job } } as any);
+}
+
+/**
+ * Write individual job fields via dotted-path `$set` (e.g. `job.finished`).
+ * Never touches `job.cancelRequested`. No-op when `job.id` doesn't match.
+ */
+export async function updateJobFields(
+  branch: string,
+  jobId: string,
+  fields: Partial<Omit<WikiJob, 'id' | 'cancelRequested'>>,
+): Promise<void> {
+  const set: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined) set[`job.${k}`] = v;
+  }
+  if (Object.keys(set).length === 0) return;
+  const col = await ensureWikiTocCollection();
+  await col.updateOne({ _id: `${branch}:snapshot`, 'job.id': jobId } as any, { $set: set } as any);
+}
+
+/** Set only `job.cancelRequested` on the running job. Returns true if a running job was flagged. */
+export async function requestJobCancel(branch: string): Promise<boolean> {
+  const col = await ensureWikiTocCollection();
+  const res = await col.updateOne(
+    { _id: `${branch}:snapshot`, 'job.status': 'running' } as any,
+    { $set: { 'job.cancelRequested': true } } as any,
+  );
+  return res.matchedCount > 0;
+}
+
+/** Prepend a finished-job summary to `recentJobs` (keeps the last 10). */
+export async function appendRecentJob(branch: string, summary: WikiJobSummary): Promise<void> {
+  const snap = await getSnapshot(branch);
+  const recentJobs = [summary, ...(snap?.recentJobs ?? []).filter((j) => j.id !== summary.id)].slice(
+    0,
+    RECENT_JOBS_LIMIT,
+  );
+  const col = await ensureWikiTocCollection();
+  await col.updateOne({ _id: `${branch}:snapshot` } as any, { $set: { recentJobs } } as any);
 }
 
 // ── Lease management ─────────────────────────────────────────────────────────

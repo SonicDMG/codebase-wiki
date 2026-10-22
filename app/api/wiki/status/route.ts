@@ -51,6 +51,8 @@ export async function GET(req: NextRequest) {
 
     if (!snapshot || topics.length === 0) {
       const empty: WikiStatusResponse = {
+        job: snapshot?.job ?? null,
+        recentJobs: snapshot?.recentJobs ?? [],
         branch,
         headSha: '',
         templateVersion: TEMPLATE_VERSION,
@@ -62,6 +64,8 @@ export async function GET(req: NextRequest) {
 
     const entries = decodeFileList(snapshot.fileListText);
     const result: WikiStatusResponse = {
+      job: snapshot.job ?? null,
+      recentJobs: snapshot.recentJobs ?? [],
       branch,
       headSha: snapshot.headSha,
       templateVersion: TEMPLATE_VERSION,

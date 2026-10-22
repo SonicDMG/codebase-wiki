@@ -28,6 +28,7 @@ import { visit } from 'unist-util-visit';
 import type { Root } from 'mdast';
 import { StatusDot } from './StatusDot';
 import { useWikiStatus } from './useWikiStatus';
+import { RefreshStaleButton } from './RefreshStaleButton';
 
 const mdParser = unified().use(remarkParse).use(remarkGfm);
 
@@ -243,7 +244,7 @@ export default function WikiPage() {
   const [tocLoading, setTocLoading] = useState(true);
   const [activeSlug, setActiveSlug] = useState<string | null>(null);
   const [wikiBranch, setWikiBranch] = useState<string | null>(null);
-  const { status: wikiStatus } = useWikiStatus(wikiBranch);
+  const { status: wikiStatus, refresh: refreshStatus } = useWikiStatus(wikiBranch);
   const [branches, setBranches] = useState<string[]>([]);
   const [headSha, setHeadSha] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('idle');
@@ -815,6 +816,9 @@ export default function WikiPage() {
               </div>
             )}
           </div>
+        )}
+        {wikiBranch && (
+          <RefreshStaleButton branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
         )}
         {syncWarning && (
           <span
