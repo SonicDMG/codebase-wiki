@@ -142,6 +142,18 @@ export async function saveTopics(topics: WikiTopicDoc[]): Promise<void> {
 }
 
 /**
+ * Set only the given fields on one topic document. Uses a targeted `$set`
+ * (never a full replace) so a concurrent writer — e.g. a backfill running
+ * alongside a sync — can't overwrite fields it didn't touch.
+ */
+export async function updateTopicFields(id: string, fields: Partial<WikiTopicDoc>): Promise<void> {
+  const set = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+  if (Object.keys(set).length === 0) return;
+  const col = await ensureWikiTocCollection();
+  await col.updateOne({ _id: id } as any, { $set: set } as any);
+}
+
+/**
  * Return the set of branch names that have at least one stored snapshot.
  * Used by branch seeding in sync.ts to find a donor branch.
  */

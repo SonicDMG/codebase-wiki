@@ -28,6 +28,10 @@ import { encodeFileList } from './snapshot';
 export const REPO_OWNER = 'SonicDMG';
 export const REPO_NAME = 'walfly';
 
+/** Placeholder pages stored when generation had nothing to work with. */
+export const NO_SOURCE_FILES_PAGE = `No source files found matching this topic's scope.`;
+export const FETCH_FAILED_PAGE = `Could not fetch source files for this topic.`;
+
 /** README excerpt given to the generator so topics follow what the system does, not the folder layout. */
 const README_CHARS = 6_000;
 
@@ -434,12 +438,12 @@ export async function generatePagesForTopic(
   const matchedPaths = allPaths.filter(
     (p) => !isIgnoredPath(p) && pathMatchesScope(p, topic.scope)
   );
-  if (matchedPaths.length === 0) return allModes(`No source files found matching this topic's scope.`);
+  if (matchedPaths.length === 0) return allModes(NO_SOURCE_FILES_PAGE);
 
   // 2. Fetch matched file contents.
   const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, matchedPaths, commitSha);
   const fetchedPaths = Object.keys(contents);
-  if (fetchedPaths.length === 0) return allModes(`Could not fetch source files for this topic.`);
+  if (fetchedPaths.length === 0) return allModes(FETCH_FAILED_PAGE);
 
   // 3. Format files block.
   const MAX_FILE_CHARS = 8000;

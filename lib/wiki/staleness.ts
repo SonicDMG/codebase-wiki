@@ -24,7 +24,7 @@ export interface StalenessResult {
 }
 
 /** True when a picture page has at least one parseable ```picture card. */
-function hasPictureCards(page: string): boolean {
+export function hasPictureCards(page: string): boolean {
   const cards = [...page.matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)];
   if (cards.length === 0) return false;
   for (const [, source] of cards) {

@@ -11,11 +11,15 @@ import { getStoredTopics, getSnapshot } from '@/lib/wiki/store';
 import { decodeFileList } from '@/lib/wiki/snapshot';
 import { classifyStaleness } from '@/lib/wiki/staleness';
 import { TEMPLATE_VERSION } from '@/lib/wiki/prompts';
+import { backfillBranch, hasUnfingerprintedPages } from '@/lib/wiki/backfill';
 import type { StateCounts, WikiStatusResponse } from '@/lib/wiki/status-types';
 
 export const runtime = 'nodejs';
 
 const DEFAULT_BRANCH = 'main';
+
+/** Branches whose backfill this server process has already attempted (even if some pages stayed unverifiable). */
+const backfillAttempted = new Set<string>();
 
 const zeroCounts = (): StateCounts => ({
   current: 0,
@@ -28,7 +32,21 @@ export async function GET(req: NextRequest) {
   const branch = req.nextUrl.searchParams.get('branch')?.trim() || DEFAULT_BRANCH;
 
   try {
-    const [topics, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+    let [topics, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+
+    // One-time fingerprint backfill for pre-fingerprint pages. GitHub only, no LLM;
+    // failures never fail the status response.
+    let backfill: WikiStatusResponse['backfill'];
+    if (!backfillAttempted.has(branch) && hasUnfingerprintedPages(topics)) {
+      backfillAttempted.add(branch);
+      try {
+        const res = await backfillBranch(branch);
+        backfill = { filled: res.filled, unverifiable: res.unverifiable.length };
+        topics = await getStoredTopics(branch);
+      } catch (err) {
+        console.error('[wiki/status] backfill failed:', err);
+      }
+    }
     const counts = { wiki: zeroCounts(), picture: zeroCounts() };
 
     if (!snapshot || topics.length === 0) {
@@ -48,6 +66,7 @@ export async function GET(req: NextRequest) {
       headSha: snapshot.headSha,
       templateVersion: TEMPLATE_VERSION,
       counts,
+      ...(backfill ? { backfill } : {}),
       topics: topics.map((t) => {
         const wiki = classifyStaleness(t, 'wiki', entries);
         const picture = classifyStaleness(t, 'picture', entries);

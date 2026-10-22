@@ -24,5 +24,7 @@ export interface WikiStatusResponse {
   headSha: string;
   templateVersion: number;
   counts: { wiki: StateCounts; picture: StateCounts };
+  /** Present only on the read that ran the one-time fingerprint backfill. */
+  backfill?: { filled: number; unverifiable: number };
   topics: WikiStatusTopic[];
 }
