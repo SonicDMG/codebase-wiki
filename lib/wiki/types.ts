@@ -45,6 +45,21 @@ export interface WikiTopicDoc {
   generatedPagePicture?: string;
   /** The commit SHA at which this page content was generated. */
   pageCommitSha?: string;
+  /**
+   * Fingerprint for the Wiki page — a hash of the blob SHAs for files matched
+   * by this topic's scope at generation time. Written alongside generatedPage.
+   */
+  pageFingerprint?: string;
+  /** Template version used when generatedPage was produced. */
+  pageTemplateVersion?: number;
+  /**
+   * Fingerprint for the Field Guide page — a hash of the blob SHAs for files
+   * matched by this topic's scope at generation time. Written alongside
+   * generatedPagePicture.
+   */
+  pagePictureFingerprint?: string;
+  /** Template version used when generatedPagePicture was produced. */
+  pagePictureTemplateVersion?: number;
 }
 
 /**

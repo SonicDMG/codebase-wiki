@@ -38,7 +38,7 @@ const CONCURRENCY = 3;
 
 (async () => {
   const { getStoredTopics, getSnapshot, saveTopics } = await import('../lib/wiki/store');
-  const { generatePagesForTopic } = await import('../lib/wiki/generate');
+  const { generatePagesForTopic, pageFieldsToStore } = await import('../lib/wiki/generate');
   const { decodeFileList } = await import('../lib/wiki/snapshot');
 
   const [stored, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
@@ -47,7 +47,8 @@ const CONCURRENCY = 3;
     console.error(`[regen-pictures] no stored topics for branch "${branch}"`);
     process.exit(1);
   }
-  const allPaths = decodeFileList(snapshot.fileListText).map((e) => e.path);
+  const entries = decodeFileList(snapshot.fileListText);
+  const allPaths = entries.map((e) => e.path);
   console.log(`[regen-pictures] ${topics.length} topics on "${branch}" at ${snapshot.headSha.slice(0, 7)}`);
 
   let failed = 0;
@@ -57,9 +58,9 @@ const CONCURRENCY = 3;
       for (let topic = queue.shift(); topic; topic = queue.shift()) {
         try {
           const commit = topic.pageCommitSha ?? snapshot.headSha;
-          const { picture } = await generatePagesForTopic(topic, branch, commit, allPaths, ['picture']);
-          if (!picture) throw new Error('empty page');
-          await saveTopics([{ ...topic, generatedPagePicture: picture, pageCommitSha: commit }]);
+          const pages = await generatePagesForTopic(topic, branch, commit, allPaths, ['picture'], entries);
+          if (!pages.picture) throw new Error('empty page');
+          await saveTopics([{ ...topic, ...pageFieldsToStore(pages, commit) }]);
           console.log(`[regen-pictures] ✓ ${topic.title}`);
         } catch (err) {
           failed++;

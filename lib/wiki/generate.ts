@@ -20,7 +20,8 @@ import {
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
 import { TOPIC_SECTIONS } from './types';
-import { wikiPrompt, picturePrompt } from './prompts';
+import { wikiPrompt, picturePrompt, TEMPLATE_VERSION } from './prompts';
+import { computeFingerprint } from './fingerprint';
 import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
 
@@ -381,9 +382,43 @@ const PAGE_PROMPTS: Record<PageMode, (githubBase: string, commitSha: string, fil
   picture: picturePrompt,
 };
 
+/** Result of generatePagesForTopic: the pages plus the scope fingerprint they were built from. */
+export interface GeneratedPages {
+  wiki?: string;
+  picture?: string;
+  /** Scope fingerprint at generation time; undefined when no snapshot entries were supplied or no files were generated from. */
+  fingerprint?: string;
+}
+
+/**
+ * Topic fields to store for freshly generated pages. Only the modes present in
+ * `pages` are written, so regenerating one mode never clobbers the other's fields.
+ */
+export function pageFieldsToStore(
+  pages: GeneratedPages,
+  commitSha: string,
+  updatedAt: string = new Date().toISOString(),
+): Partial<WikiTopicDoc> {
+  const fields: Partial<WikiTopicDoc> = { pageCommitSha: commitSha, updatedAt };
+  if (pages.wiki !== undefined) {
+    fields.generatedPage = pages.wiki;
+    fields.pageFingerprint = pages.fingerprint;
+    fields.pageTemplateVersion = TEMPLATE_VERSION;
+  }
+  if (pages.picture !== undefined) {
+    fields.generatedPagePicture = pages.picture;
+    fields.pagePictureFingerprint = pages.fingerprint;
+    fields.pagePictureTemplateVersion = TEMPLATE_VERSION;
+  }
+  return fields;
+}
+
 /**
  * Generates the pre-built page content for a topic, in the given modes
  * (both by default), from the files in the topic's scope at `commitSha`.
+ *
+ * @param snapshotEntries - Optional full snapshot entries (path + blobSha),
+ *   used to compute the returned scope fingerprint.
  */
 export async function generatePagesForTopic(
   topic: WikiTopicDoc,
@@ -391,7 +426,8 @@ export async function generatePagesForTopic(
   commitSha: string,
   allPaths: string[],
   modes: PageMode[] = ['wiki', 'picture'],
-): Promise<Partial<Record<PageMode, string>>> {
+  snapshotEntries?: SnapshotEntry[],
+): Promise<GeneratedPages> {
   const allModes = (text: string) => Object.fromEntries(modes.map((m) => [m, text]));
 
   // 1. Find matching files in topic scope.
@@ -436,6 +472,9 @@ export async function generatePagesForTopic(
     return response.choices[0]?.message?.content?.trim() ?? '';
   };
 
+  // Compute fingerprint once if snapshot entries are available.
+  const fingerprint = snapshotEntries ? computeFingerprint(topic.scope, snapshotEntries) : undefined;
+
   console.log(`[wiki/generate] generating ${modes.join(' + ')} page(s) for topic "${topic.title}"...`);
   const pages = await Promise.all(
     modes.map(async (mode) => {
@@ -448,7 +487,7 @@ export async function generatePagesForTopic(
       return [mode, page] as const;
     }),
   );
-  return Object.fromEntries(pages);
+  return { ...(Object.fromEntries(pages) as Partial<Record<PageMode, string>>), fingerprint };
 }
 
 const PICTURE_RETRIES = 2;
@@ -475,6 +514,7 @@ export async function rebuildTopicPages(
   branch: string,
   commitSha: string,
   allPaths: string[],
+  entries?: SnapshotEntry[],
 ): Promise<WikiTopicDoc[]> {
   console.log(`[wiki] Rebuilding pages for ${topics.length} topics...`);
   const updatedTopics: WikiTopicDoc[] = [];
@@ -484,14 +524,8 @@ export async function rebuildTopicPages(
     topics.map(async (topic) => {
       try {
         console.log(`[wiki] Rebuilding page for topic "${topic.title}"...`);
-        const { wiki, picture } = await generatePagesForTopic(topic, branch, commitSha, allPaths);
-        updatedTopics.push({
-          ...topic,
-          generatedPage: wiki,
-          generatedPagePicture: picture,
-          pageCommitSha: commitSha,
-          updatedAt: new Date().toISOString(),
-        });
+        const pages = await generatePagesForTopic(topic, branch, commitSha, allPaths, ['wiki', 'picture'], entries);
+        updatedTopics.push({ ...topic, ...pageFieldsToStore(pages, commitSha) });
       } catch (err) {
         console.error(`[wiki] Failed to generate pages for topic "${topic.title}":`, err);
         updatedTopics.push(topic);

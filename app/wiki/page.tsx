@@ -26,6 +26,8 @@ import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { visit } from 'unist-util-visit';
 import type { Root } from 'mdast';
+import { StatusDot } from './StatusDot';
+import { useWikiStatus } from './useWikiStatus';
 
 const mdParser = unified().use(remarkParse).use(remarkGfm);
 
@@ -241,6 +243,7 @@ export default function WikiPage() {
   const [tocLoading, setTocLoading] = useState(true);
   const [activeSlug, setActiveSlug] = useState<string | null>(null);
   const [wikiBranch, setWikiBranch] = useState<string | null>(null);
+  const { status: wikiStatus } = useWikiStatus(wikiBranch);
   const [branches, setBranches] = useState<string[]>([]);
   const [headSha, setHeadSha] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('idle');
@@ -862,7 +865,13 @@ export default function WikiPage() {
                     title={topic.description}
                     disabled={loading}
                   >
-                    {topic.title}
+                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      {(() => {
+                        const entry = wikiStatus?.topics.find((s) => s.slug === topic.slug)?.[answerMode];
+                        return entry ? <StatusDot state={entry.state} mode={answerMode} reason={entry.reason} /> : null;
+                      })()}
+                      <span>{topic.title}</span>
+                    </span>
                   </button>
                 </div>
               ))

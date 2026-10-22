@@ -1,6 +1,15 @@
 /**
  * prompts.ts — Shared LLM prompts for wiki page generation (Wiki & Field Guide modes).
+ *
+ * TEMPLATE_VERSION — bump this by hand whenever the prompt changes in a way
+ * that makes previously-generated pages "old". Every page generated from now on
+ * records this value; the staleness classifier treats a mismatch as
+ * 'older-template'.
  */
+
+/** Hand-bumped version stamp for the generation prompts. Increment when prompts change. */
+export const TEMPLATE_VERSION = 1;
+
 
 const REPO_OWNER = 'SonicDMG';
 const REPO_NAME = 'walfly';

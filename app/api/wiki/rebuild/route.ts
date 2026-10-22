@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
 
     // Pre-generate pages for all topics
     const allPaths = snapshotEntries.map((e) => e.path);
-    const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths);
+    const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths, snapshotEntries);
 
     // Replace all topic documents for this branch wholesale
     await replaceTopics(branch, topicsWithPages);
