@@ -7,6 +7,7 @@ import { paletteCss } from '../palettes';
 import { StatusDot } from '../StatusDot';
 import { useWikiStatus } from '../useWikiStatus';
 import { useJobActions, jobKindLabel } from '../useJobActions';
+import { ConfirmRebuildDialog } from '../ConfirmRebuildDialog';
 
 // ── State labels (matching WikiStatusPill) ─────────────────────────────────
 
@@ -58,6 +59,9 @@ function StatusPageInner() {
     return () => { cancelled = true; };
   }, [paramBranch]);
 
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const rebuildBtnRef = useRef<HTMLButtonElement>(null);
+
   const { status, error, refresh } = useWikiStatus(branch);
   const { busy, message, start, stop } = useJobActions(branch ?? '', refresh);
 
@@ -87,7 +91,7 @@ function StatusPageInner() {
   const progressPct =
     running && job && job.total > 0
       ? Math.round((job.finished / job.total) * 100)
-      : 0;
+      : null;
 
   return (
     <div
@@ -231,6 +235,19 @@ function StatusPageInner() {
                 >
                   Regenerate all Field Guide pages
                 </button>
+                <button
+                  ref={rebuildBtnRef}
+                  type="button"
+                  onClick={() => setRebuildDialogOpen(true)}
+                  disabled={busy || running}
+                  style={{
+                    ...btnBase,
+                    ...(busy || running ? btnDisabled : {}),
+                  }}
+                  aria-label="Rebuild the whole wiki from scratch"
+                >
+                  Rebuild from scratch
+                </button>
                 {running && (
                   <button
                     type="button"
@@ -253,6 +270,17 @@ function StatusPageInner() {
                 {message}
               </div>
             </section>
+            <ConfirmRebuildDialog
+              open={rebuildDialogOpen}
+              onConfirm={() => {
+                setRebuildDialogOpen(false);
+                void start({ kind: 'rebuild' });
+              }}
+              onCancel={() => {
+                setRebuildDialogOpen(false);
+                rebuildBtnRef.current?.focus();
+              }}
+            />
 
             {/* ── Live job ── */}
             {job && (
@@ -273,32 +301,45 @@ function StatusPageInner() {
                   )}
                 </div>
 
-                {/* Progress bar */}
-                {running && job.total > 0 && (
-                  <div
-                    role="progressbar"
-                    aria-valuenow={job.finished}
-                    aria-valuemin={0}
-                    aria-valuemax={job.total}
-                    aria-label={`Refreshing ${job.finished} of ${job.total}`}
-                    style={{
-                      height: '8px',
-                      background: 'var(--w-border)',
-                      borderRadius: '4px',
-                      overflow: 'hidden',
-                      marginBottom: '12px',
-                    }}
-                  >
+                {/* Progress bar or "designing topics" placeholder */}
+                {running && (
+                  job.total === 0 ? (
                     <div
                       style={{
-                        height: '100%',
-                        width: `${progressPct}%`,
-                        background: 'var(--w-accentText)',
-                        borderRadius: '4px',
-                        transition: 'width 0.4s ease',
+                        fontSize: '12px',
+                        color: 'var(--w-textMuted)',
+                        marginBottom: '12px',
+                        fontStyle: 'italic',
                       }}
-                    />
-                  </div>
+                    >
+                      Designing topics…
+                    </div>
+                  ) : (
+                    <div
+                      role="progressbar"
+                      aria-valuenow={job.finished}
+                      aria-valuemin={0}
+                      aria-valuemax={job.total}
+                      aria-label={`Refreshing ${job.finished} of ${job.total}`}
+                      style={{
+                        height: '8px',
+                        background: 'var(--w-border)',
+                        borderRadius: '4px',
+                        overflow: 'hidden',
+                        marginBottom: '12px',
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: '100%',
+                          width: `${progressPct ?? 0}%`,
+                          background: 'var(--w-accentText)',
+                          borderRadius: '4px',
+                          transition: 'width 0.4s ease',
+                        }}
+                      />
+                    </div>
+                  )
                 )}
 
                 {/* Failures */}

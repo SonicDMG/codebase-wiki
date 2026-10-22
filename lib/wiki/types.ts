@@ -101,13 +101,14 @@ export type WikiJobStatus = 'running' | 'completed' | 'completed-with-errors' | 
 export type WikiJobRequest =
   | { kind: 'refresh-stale' }
   | { kind: 'refresh-field-guide'; onlyStale?: boolean }
-  | { kind: 'refresh-page'; slug: string; mode: 'wiki' | 'picture' };
+  | { kind: 'refresh-page'; slug: string; mode: 'wiki' | 'picture' }
+  | { kind: 'rebuild' };
 export type WikiJobKind = WikiJobRequest['kind'];
 
 /** One step of a job; the runner loops over stages in order. */
-export interface WikiJobStage {
-  kind: 'refresh-pages';
-}
+export type WikiJobStage =
+  | { kind: 'refresh-pages' }
+  | { kind: 'rebuild' };
 
 /** One per-topic failure (old page kept). */
 export interface WikiJobFailure {

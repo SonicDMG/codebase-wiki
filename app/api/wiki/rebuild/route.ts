@@ -2,26 +2,18 @@
  * POST /api/wiki/rebuild
  *
  * Body: { branch?: string }  (defaults to "main")
- * Response: { status: 'synced' | 'locked', branch, headSha, topics, changeSummary? }
+ * Response: { status: 'started', jobId: string }
  *
- * Forces a complete rebuild of wiki topics from scratch for the specified branch,
- * replacing all existing topic documents and snapshot state.
+ * Starts a detached rebuild job via the job runner and returns immediately.
+ * 409 when a job is already running on the branch.
+ * The actual rebuild runs in the background; poll /api/wiki/status or /api/wiki/jobs
+ * to track progress.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { generateTopics, buildSnapshotDoc, rebuildTopicPages } from '@/lib/wiki/generate';
-import {
-  acquireLease,
-  releaseLease,
-  replaceTopics,
-  saveSnapshot,
-  getStoredTopics,
-  getSnapshot,
-} from '@/lib/wiki/store';
-import { toPublicTopics } from '@/lib/wiki/sync';
+import { getJobRunner, JobAlreadyRunningError } from '@/lib/wiki/runner';
 
 export const runtime = 'nodejs';
-export const maxDuration = 120;
 
 const DEFAULT_BRANCH = 'main';
 
@@ -30,56 +22,17 @@ export async function POST(req: NextRequest) {
   const branch =
     typeof body.branch === 'string' && body.branch.trim() ? body.branch.trim() : DEFAULT_BRANCH;
 
-  if (!(await acquireLease(branch))) {
-    const [storedTopics, snapshot] = await Promise.all([
-      getStoredTopics(branch),
-      getSnapshot(branch),
-    ]);
-    return NextResponse.json({
-      status: 'locked',
-      branch,
-      headSha: snapshot?.headSha ?? '',
-      topics: toPublicTopics(storedTopics),
-      changeSummary: 'Rebuild locked by concurrent sync',
-    });
-  }
-
   try {
-    const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
-
-    // Pre-generate pages for all topics
-    const allPaths = snapshotEntries.map((e) => e.path);
-    const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths, snapshotEntries);
-
-    // Replace all topic documents for this branch wholesale
-    await replaceTopics(branch, topicsWithPages);
-
-    // Save fresh snapshot document
-    const snapshot = buildSnapshotDoc(
-      branch,
-      snapshotEntries,
-      unclassifiedPaths,
-      result.headSha,
-      treeSha,
-    );
-    await saveSnapshot({ ...snapshot, leaseUntil: null });
-
-    return NextResponse.json({
-      status: 'synced',
-      branch: result.branch,
-      headSha: result.headSha,
-      topics: toPublicTopics(result.topics),
-      changeSummary: `Rebuilt ${result.topics.length} topics from scratch`,
-    });
+    const result = await getJobRunner().start(branch, { kind: 'rebuild' });
+    return NextResponse.json({ status: result.status, jobId: (result as { jobId?: string }).jobId });
   } catch (err) {
+    if (err instanceof JobAlreadyRunningError) {
+      return NextResponse.json({ error: err.message, jobId: err.jobId }, { status: 409 });
+    }
     console.error('[wiki/rebuild] failed:', err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to rebuild wiki topics' },
+      { error: err instanceof Error ? err.message : 'Failed to start rebuild job' },
       { status: 500 },
-    );
-  } finally {
-    await releaseLease(branch).catch((err) =>
-      console.warn('[wiki/rebuild] lease release failed:', err),
     );
   }
 }

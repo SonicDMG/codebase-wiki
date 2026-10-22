@@ -5,6 +5,7 @@ import type { CSSProperties } from 'react';
 import type { WikiStatusResponse, StalenessState } from '@/lib/wiki/status-types';
 import { StatusDot } from './StatusDot';
 import { useJobActions } from './useJobActions';
+import { ConfirmRebuildDialog } from './ConfirmRebuildDialog';
 
 type AnswerMode = 'wiki' | 'picture';
 
@@ -27,6 +28,8 @@ export function WikiStatusPill({
   refresh: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
+  const rebuildOpenerRef = useRef<HTMLButtonElement>(null);
   const { busy, message, start, stop } = useJobActions(branch, refresh);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -82,11 +85,13 @@ export function WikiStatusPill({
   // Ring arc calculations
   const radius = 6;
   const circumference = 2 * Math.PI * radius;
-  let ringRatio = 1;
+  let ringRatio = 0;
   if (running && job && job.total > 0) {
     ringRatio = Math.min(1, Math.max(0, job.finished / job.total));
-  } else if (totalPages > 0) {
+  } else if (!running && totalPages > 0) {
     ringRatio = Math.min(1, Math.max(0, currentCount / totalPages));
+  } else if (!running) {
+    ringRatio = 1;
   }
   const strokeDashoffset = circumference * (1 - ringRatio);
 
@@ -124,8 +129,13 @@ export function WikiStatusPill({
   let pillAriaLabel = '';
 
   if (running && job) {
-    pillText = `${job.finished}/${job.total}`;
-    pillAriaLabel = `Refreshing ${job.finished} of ${job.total} topics`;
+    if (job.total === 0) {
+      pillText = 'Designing topics…';
+      pillAriaLabel = 'Rebuild running: designing topics';
+    } else {
+      pillText = `${job.finished}/${job.total}`;
+      pillAriaLabel = `Refreshing ${job.finished} of ${job.total} topics`;
+    }
   } else if (staleCount === 0) {
     pillText = (
       <>
@@ -306,6 +316,16 @@ export function WikiStatusPill({
                 >
                   Refresh stale ({staleCount})
                 </button>
+                <button
+                  ref={rebuildOpenerRef}
+                  type="button"
+                  style={{ ...s.refreshBtn, ...(busy ? s.btnDisabled : {}) }}
+                  disabled={busy}
+                  aria-label="Rebuild the whole wiki from scratch"
+                  onClick={() => setRebuildDialogOpen(true)}
+                >
+                  Rebuild from scratch
+                </button>
               </>
             )}
           </div>
@@ -321,6 +341,18 @@ export function WikiStatusPill({
           </div>
         </div>
       )}
+      <ConfirmRebuildDialog
+        open={rebuildDialogOpen}
+        onConfirm={() => {
+          setRebuildDialogOpen(false);
+          setOpen(false);
+          void start({ kind: 'rebuild' });
+        }}
+        onCancel={() => {
+          setRebuildDialogOpen(false);
+          rebuildOpenerRef.current?.focus();
+        }}
+      />
     </div>
   );
 }

@@ -18,8 +18,12 @@
 import { randomUUID } from 'node:crypto';
 import {
   appendRecentJob,
+  acquireLease as acquireSyncLease,
+  releaseLease as releaseSyncLease,
   getSnapshot,
   getStoredTopics,
+  replaceTopics,
+  saveSnapshot,
   requestJobCancel,
   updateJobFields,
   updateSnapshotJob,
@@ -31,7 +35,9 @@ import type { PageMode } from './staleness';
 import {
   FETCH_FAILED_PAGE,
   NO_SOURCE_FILES_PAGE,
+  buildSnapshotDoc,
   generatePagesForTopic,
+  generateTopics,
   pageFieldsToStore,
 } from './generate';
 import type {
@@ -206,6 +212,32 @@ class LocalDetachedRunner implements JobRunner {
     }
 
     try {
+      // Rebuild kind: create job immediately (topic count unknown) and run detached.
+      if (request.kind === 'rebuild') {
+        const now = new Date().toISOString();
+        const stages: WikiJobStage[] = [{ kind: 'rebuild' }];
+        const job: WikiJob = {
+          id: jobId,
+          kind: 'rebuild',
+          status: 'running',
+          stages,
+          total: 0,
+          finished: 0,
+          succeeded: 0,
+          failures: [],
+          currentSlugs: [],
+          startedAt: now,
+          heartbeatAt: now,
+          cancelRequested: false,
+        };
+        await updateSnapshotJob(branch, job);
+        console.log(`${LOG} ${jobId} rebuild started on ${branch}`);
+        void this.runRebuild(branch, job).catch((e) =>
+          console.error(`${LOG} ${jobId} rebuild runner crashed unexpectedly:`, e),
+        );
+        return { status: 'started', jobId };
+      }
+
       // Plan up front so "nothing to do" never creates a running job.
       const plan = await planFor(branch, request);
       if (!plan || plan.items.length === 0) {
@@ -293,6 +325,7 @@ class LocalDetachedRunner implements JobRunner {
             break;
           }
         }
+        // rebuild stage is handled entirely in runRebuild; should never reach here
       }
       if (status !== 'cancelled') {
         status = failures.length > 0 ? 'completed-with-errors' : 'completed';
@@ -403,6 +436,205 @@ class LocalDetachedRunner implements JobRunner {
     } catch (e) {
       console.warn(`${LOG} topic "${topic.slug}" failed:`, errMsg(e));
       return { slug: topic.slug, modes, error: errMsg(e) };
+    }
+  }
+  /** Full rebuild: generateTopics -> generate all pages in memory -> swap. Never rejects. */
+  private async runRebuild(branch: string, job: WikiJob): Promise<void> {
+    const jobId = job.id;
+    let status: WikiJobStatus = 'failed';
+    let finished = 0;
+    let succeeded = 0;
+    const failures: WikiJobFailure[] = [];
+    const inFlight = new Set<string>();
+
+    const beat = () => {
+      void this.heartbeat(branch, jobId).catch((e) =>
+        console.warn(`${LOG} ${jobId} heartbeat failed:`, errMsg(e)),
+      );
+    };
+    const timer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+
+    const writeProgress = async () => {
+      try {
+        await updateJobFields(branch, jobId, {
+          finished,
+          succeeded,
+          failures: [...failures],
+          currentSlugs: [...inFlight],
+          heartbeatAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.warn(`${LOG} ${jobId} progress write failed:`, errMsg(e));
+      }
+    };
+
+    // Staged in memory; nothing goes to the DB until the swap.
+    const stagedTopics: WikiTopicDoc[] = [];
+    let cancelled = false;
+
+    try {
+      // (a) Generate topic list.
+      console.log(`${LOG} ${jobId} rebuild: generating topics for ${branch}`);
+      const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
+      const newTopics = result.topics;
+      const headSha = result.headSha;
+      const allPaths = snapshotEntries.map((e) => e.path);
+
+      if (newTopics.length === 0) {
+        status = 'failed';
+        failures.push({ slug: '*', modes: [], error: 'generateTopics returned zero topics' });
+        return; // falls into finally
+      }
+
+      // Update job total now that we know it.
+      await updateJobFields(branch, jobId, { total: newTopics.length, heartbeatAt: new Date().toISOString() });
+      job.total = newTopics.length;
+
+      // (b) Generate pages for every new topic in memory, concurrency 2.
+      const queue = newTopics.map((topic) => ({ topic, modes: ['wiki', 'picture'] as PageMode[] }));
+
+      const worker = async () => {
+        for (;;) {
+          if (cancelled) return;
+          // Re-read cancel flag from DB before each topic (matches refreshPages behaviour).
+          const snap = await getSnapshot(branch);
+          if (snap?.job?.id === jobId && snap.job.cancelRequested) {
+            cancelled = true;
+            console.log(`${LOG} ${jobId} rebuild cancel requested`);
+            return;
+          }
+          const item = queue.shift();
+          if (!item) return;
+          const { topic, modes } = item;
+          const slug = topic.slug;
+          inFlight.add(slug);
+          await writeProgress();
+
+          // Generate pages.
+          let topicWithPages = topic;
+          try {
+            const pages = await generatePagesForTopic(
+              topic,
+              branch,
+              headSha,
+              allPaths,
+              modes,
+              snapshotEntries,
+            );
+            const failedModes: PageMode[] = [];
+            for (const mode of modes) {
+              const problem = validatePage(mode, pages[mode]);
+              if (problem) {
+                console.warn(`${LOG} ${jobId} rebuild topic "${slug}" ${mode}: ${problem}`);
+                failedModes.push(mode);
+              }
+            }
+            if (failedModes.length > 0) {
+              failures.push({ slug, modes: failedModes, error: `validation failed for modes: ${failedModes.join(', ')}` });
+            }
+            // Store pages for modes that passed; failed modes use placeholder from generate.
+            const goodPages = { ...pages };
+            for (const m of failedModes) {
+              delete (goodPages as Record<string, unknown>)[m];
+            }
+            topicWithPages = { ...topic, ...pageFieldsToStore(goodPages, headSha) };
+          } catch (e) {
+            console.warn(`${LOG} ${jobId} rebuild topic "${slug}" failed:`, errMsg(e));
+            failures.push({ slug, modes, error: errMsg(e) });
+            // topic without pages stays staged (old wiki untouched until swap)
+          }
+
+          stagedTopics.push(topicWithPages);
+          inFlight.delete(slug);
+          finished++;
+          if (!failures.find((f) => f.slug === slug)) succeeded++;
+          await writeProgress();
+        }
+      };
+
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, newTopics.length) }, worker));
+
+      // (c) Check if cancelled / zero topics staged.
+      if (cancelled) {
+        status = 'cancelled';
+        console.log(`${LOG} ${jobId} rebuild cancelled before swap; old wiki untouched`);
+        return; // finally will write status
+      }
+
+      if (stagedTopics.length === 0) {
+        status = 'failed';
+        failures.push({ slug: '*', modes: [], error: 'no topics staged after generation' });
+        return;
+      }
+
+      // (d) Swap: acquire sync lease (up to 3 retries, 5 s apart).
+      let leaseAcquired = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (await acquireSyncLease(branch)) {
+          leaseAcquired = true;
+          break;
+        }
+        if (attempt < 2) {
+          console.warn(`${LOG} ${jobId} sync lease locked; retrying in 5 s (attempt ${attempt + 1})`);
+          await new Promise((r) => setTimeout(r, 5_000));
+        }
+      }
+
+      if (!leaseAcquired) {
+        status = 'failed';
+        failures.push({ slug: '*', modes: [], error: 'could not acquire sync lease after 3 attempts; old wiki untouched' });
+        return;
+      }
+
+      try {
+        console.log(`${LOG} ${jobId} rebuild swapping ${stagedTopics.length} topics`);
+        await replaceTopics(branch, stagedTopics);
+        const snapshotDoc = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, headSha, treeSha);
+        await saveSnapshot({ ...snapshotDoc, leaseUntil: null });
+        console.log(`${LOG} ${jobId} rebuild swap complete`);
+      } finally {
+        await releaseSyncLease(branch).catch((e) =>
+          console.warn(`${LOG} ${jobId} sync lease release failed:`, errMsg(e)),
+        );
+      }
+
+      status = failures.length > 0 ? 'completed-with-errors' : 'completed';
+    } catch (e) {
+      status = 'failed';
+      console.error(`${LOG} ${jobId} rebuild failed:`, e);
+      failures.push({ slug: '*', modes: [], error: errMsg(e) });
+    } finally {
+      clearInterval(timer);
+      inFlight.clear();
+      const finishedAt = new Date().toISOString();
+      try {
+        await updateJobFields(branch, jobId, {
+          status,
+          finished,
+          succeeded,
+          failures,
+          currentSlugs: [],
+          finishedAt,
+          heartbeatAt: finishedAt,
+        });
+        await appendRecentJob(branch, {
+          id: jobId,
+          kind: job.kind,
+          status,
+          total: job.total,
+          finished,
+          succeeded,
+          failed: failures.length,
+          startedAt: job.startedAt,
+          finishedAt,
+        });
+      } catch (e) {
+        console.error(`${LOG} ${jobId} could not write final status:`, e);
+      }
+      await this.releaseLease(branch, jobId);
+      console.log(
+        `${LOG} ${jobId} rebuild ${status}: ${succeeded}/${job.total} succeeded, ${failures.length} failure(s)`,
+      );
     }
   }
 }

@@ -252,7 +252,6 @@ export default function WikiPage() {
   const [syncNote, setSyncNote] = useState<string | null>(null);
   const [syncWarning, setSyncWarning] = useState<string | null>(null);
   const [statusMenuOpen, setStatusMenuOpen] = useState(false);
-  const [rebuilding, setRebuilding] = useState(false);
   const [tocCollapsed, setTocCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [resizing, setResizing] = useState(false);
@@ -329,6 +328,22 @@ export default function WikiPage() {
       }
     }
   }, []);
+
+  // A finished rebuild swaps the whole topic list: reload the sidebar.
+  const jobStatusRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const prev = jobStatusRef.current;
+    jobStatusRef.current = wikiStatus?.job?.status;
+    if (
+      prev === 'running' &&
+      wikiStatus?.job?.kind === 'rebuild' &&
+      wikiStatus.job.status !== 'running' &&
+      wikiStatus.job.status !== 'cancelled' &&
+      wikiStatus.job.status !== 'failed'
+    ) {
+      void loadToc(wikiBranch ?? undefined);
+    }
+  }, [wikiStatus?.job?.status, wikiStatus?.job?.kind, wikiBranch, loadToc]);
 
   // ── Load branches and TOC on mount ─────────────────────────────────────────
   useEffect(() => {
@@ -689,36 +704,6 @@ export default function WikiPage() {
     else void send(topic.suggestedQuery, key);
   };
 
-  const handleRebuild = async () => {
-    if (!wikiBranch || rebuilding) return;
-    setRebuilding(true);
-    try {
-      const res = await fetch('/api/wiki/rebuild', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ branch: wikiBranch }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as {
-        status: 'synced' | 'locked';
-        headSha?: string;
-        topics?: TocTopic[];
-        changeSummary?: string;
-      };
-      if (data.headSha) setHeadSha(data.headSha);
-      if (Array.isArray(data.topics)) setTocTopics(data.topics);
-      setSyncNote(data.changeSummary ?? 'rebuilt all topics');
-      setSyncState('updated');
-      setStatusMenuOpen(false);
-    } catch (err) {
-      console.warn('[wiki] rebuild failed:', err);
-      setSyncState('error');
-      setSyncNote('rebuild failed');
-    } finally {
-      setRebuilding(false);
-    }
-  };
-
   const latestAnswer = shownAnswer(latestAssistantMsg, answerMode);
   const parsedLatest = latestAnswer ? parseMessage(latestAnswer.content, latestAnswer.commit) : null;
 
@@ -763,17 +748,15 @@ export default function WikiPage() {
               title={syncNote ?? undefined}
             >
               {wikiBranch} @ {headSha ? headSha.slice(0, 7) : '…'} ·{' '}
-              {rebuilding
-                ? 'rebuilding…'
-                : syncState === 'syncing'
-                  ? 'syncing…'
-                  : syncState === 'updated'
-                    ? `updated${syncNote ? ` (${syncNote})` : ''}`
-                    : syncState === 'rate-limited'
-                      ? 'rate-limited · retrying'
-                      : syncState === 'error'
-                        ? 'sync failed'
-                        : 'up to date'}{' '}
+              {syncState === 'syncing'
+                ? 'syncing…'
+                : syncState === 'updated'
+                  ? `updated${syncNote ? ` (${syncNote})` : ''}`
+                  : syncState === 'rate-limited'
+                    ? 'rate-limited · retrying'
+                    : syncState === 'error'
+                      ? 'sync failed'
+                      : 'up to date'}{' '}
               ▾
             </button>
             {statusMenuOpen && (
@@ -802,18 +785,6 @@ export default function WikiPage() {
                     )}
                   </select>
                 </div>
-                <div style={styles.dropdownDivider} />
-                <button
-                  type="button"
-                  style={{
-                    ...styles.rebuildButton,
-                    ...(rebuilding ? styles.rebuildButtonDisabled : {}),
-                  }}
-                  onClick={handleRebuild}
-                  disabled={rebuilding}
-                >
-                  {rebuilding ? 'Rebuilding…' : 'Rebuild all'}
-                </button>
               </div>
             )}
           </div>

@@ -12,6 +12,8 @@ export function jobKindLabel(kind: WikiJobKind): string {
       return 'Refresh Field Guide';
     case 'refresh-page':
       return 'Refresh one page';
+    case 'rebuild':
+      return 'Rebuild from scratch';
     default:
       return kind;
   }
