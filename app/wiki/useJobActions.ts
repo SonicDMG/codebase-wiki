@@ -14,6 +14,8 @@ export function jobKindLabel(kind: WikiJobKind): string {
       return 'Refresh one page';
     case 'rebuild':
       return 'Rebuild from scratch';
+    case 'integrity-check':
+      return 'Integrity check';
     default:
       return kind;
   }

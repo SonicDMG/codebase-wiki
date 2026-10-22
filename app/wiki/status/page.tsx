@@ -237,6 +237,18 @@ function StatusPageInner() {
                   Regenerate all Field Guide pages
                 </button>
                 <button
+                  type="button"
+                  onClick={() => void start({ kind: 'integrity-check' })}
+                  disabled={busy || running}
+                  style={{
+                    ...btnBase,
+                    ...(busy || running ? btnDisabled : {}),
+                  }}
+                  aria-label="Check the integrity of all stored pages"
+                >
+                  Check integrity
+                </button>
+                <button
                   ref={rebuildBtnRef}
                   type="button"
                   onClick={() => setRebuildDialogOpen(true)}
@@ -344,7 +356,7 @@ function StatusPageInner() {
                       aria-valuenow={job.finished}
                       aria-valuemin={0}
                       aria-valuemax={job.total}
-                      aria-label={`Refreshing ${job.finished} of ${job.total}`}
+                      aria-label={`${job.kind === 'integrity-check' ? 'Checking' : 'Refreshing'} ${job.finished} of ${job.total}`}
                       style={{
                         height: '8px',
                         background: 'var(--w-border)',
@@ -370,7 +382,7 @@ function StatusPageInner() {
                 {job.failures.length > 0 && (
                   <div style={{ marginTop: '8px' }}>
                     <p style={{ fontSize: '13px', fontWeight: 600, marginBottom: '6px', color: '#cf222e' }}>
-                      Failures (old pages kept):
+                      {job.kind === 'integrity-check' ? 'Topics with problems:' : 'Failures (old pages kept):'}
                     </p>
                     <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: '12px' }}>
                       {job.failures.map((f) => (
@@ -381,6 +393,52 @@ function StatusPageInner() {
                         </li>
                       ))}
                     </ul>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {/* ── Integrity check results ── */}
+            {job?.integrity && (
+              <section aria-labelledby="integrity-heading" style={{ marginBottom: '28px' }}>
+                <h2 id="integrity-heading" style={{ fontSize: '15px', fontWeight: 600, marginBottom: '10px' }}>
+                  Integrity check
+                </h2>
+                <p style={{ fontSize: '13px', margin: '0 0 10px', color: 'var(--w-textMuted)' }}>
+                  Checked at {new Date(job.integrity.checkedAt).toLocaleString()}
+                </p>
+                {job.integrity.problems.length === 0 ? (
+                  <p style={{ fontSize: '13px', margin: 0 }}>No problems found.</p>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table
+                      style={{ borderCollapse: 'collapse', width: '100%', fontSize: '12px' }}
+                      aria-label="Integrity problems"
+                    >
+                      <thead>
+                        <tr style={{ borderBottom: '1px solid var(--w-border)' }}>
+                          <th scope="col" style={thStyle}>Topic</th>
+                          <th scope="col" style={thStyle}>Page</th>
+                          <th scope="col" style={thStyle}>Reason</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {job.integrity.problems.map((p) => (
+                          <tr key={`${p.slug}:${p.mode}:${p.reason}`} style={{ borderBottom: '1px solid rgba(128,128,128,0.1)' }}>
+                            <td style={tdStyle}>
+                              <a
+                                href={`#topic-${p.slug}`}
+                                style={{ color: 'var(--w-accentText)', fontFamily: 'ui-monospace, monospace' }}
+                              >
+                                {p.slug}
+                              </a>
+                            </td>
+                            <td style={tdStyle}>{p.mode === 'wiki' ? 'Wiki' : 'Field Guide'}</td>
+                            <td style={{ ...tdStyle, color: 'var(--w-textMuted)' }}>{p.reason}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
               </section>

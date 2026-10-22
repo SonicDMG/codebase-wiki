@@ -32,6 +32,7 @@ import {
 import { decodeFileList } from './snapshot';
 import { classifyStaleness, hasPictureCards } from './staleness';
 import type { PageMode } from './staleness';
+import { checkTopicIntegrity } from './integrity';
 import {
   FETCH_FAILED_PAGE,
   NO_SOURCE_FILES_PAGE,
@@ -41,6 +42,7 @@ import {
   pageFieldsToStore,
 } from './generate';
 import type {
+  IntegrityProblem,
   WikiJob,
   WikiJobFailure,
   WikiJobRequest,
@@ -144,6 +146,8 @@ async function planFor(branch: string, request: WikiJobRequest): Promise<Plan | 
       throw new Error(`Unknown topic "${request.slug}"`);
     }
     items.push({ topic, modes: [request.mode] });
+  } else if (request.kind === 'integrity-check') {
+    for (const topic of topics) items.push({ topic, modes: ['wiki', 'picture'] });
   }
 
   return { items, entries, allPaths: entries.map((e) => e.path), commit: snapshot.headSha };
@@ -246,6 +250,49 @@ class LocalDetachedRunner implements JobRunner {
         console.log(`${LOG} ${jobId} resume rebuild on ${branch}`);
         void this.runRebuild(branch, freshJob).catch((e) =>
           console.error(`${LOG} ${jobId} rebuild runner crashed unexpectedly:`, e),
+        );
+        return { jobId };
+      }
+
+      if (job.kind === 'integrity-check') {
+        // Cheap, read-only: restart the check from scratch.
+        const freshPlan = await planFor(branch, job.request);
+        const total = freshPlan?.items.length ?? 0;
+        const reset = {
+          total,
+          finished: 0,
+          succeeded: 0,
+          failures: [] as WikiJobFailure[],
+          doneSlugs: [] as string[],
+          currentSlugs: [] as string[],
+          heartbeatAt: new Date().toISOString(),
+        };
+        await updateJobFields(branch, jobId, reset);
+        if (!freshPlan || total === 0) {
+          const finishedAt = new Date().toISOString();
+          await updateJobFields(branch, jobId, {
+            status: 'completed',
+            integrity: { checkedAt: finishedAt, problems: [] },
+            finishedAt,
+            heartbeatAt: finishedAt,
+          });
+          await appendRecentJob(branch, {
+            id: jobId,
+            kind: job.kind,
+            status: 'completed',
+            total: 0,
+            finished: 0,
+            succeeded: 0,
+            failed: 0,
+            startedAt: job.startedAt,
+            finishedAt,
+          });
+          await this.releaseLease(branch, jobId);
+          return { jobId };
+        }
+        console.log(`${LOG} ${jobId} resume integrity-check on ${branch}`);
+        void this.run(branch, { ...job, ...reset }, freshPlan).catch((e) =>
+          console.error(`${LOG} ${jobId} runner crashed unexpectedly:`, e),
         );
         return { jobId };
       }
@@ -395,7 +442,8 @@ class LocalDetachedRunner implements JobRunner {
       }
 
       const now = new Date().toISOString();
-      const stages: WikiJobStage[] = [{ kind: 'refresh-pages' }];
+      const stages: WikiJobStage[] =
+        request.kind === 'integrity-check' ? [{ kind: 'integrity-check' }] : [{ kind: 'refresh-pages' }];
       const job: WikiJob = {
         id: jobId,
         kind: request.kind,
@@ -446,6 +494,7 @@ class LocalDetachedRunner implements JobRunner {
     const failures: WikiJobFailure[] = init?.initFailures ? [...init.initFailures] : [];
     const doneSlugs: string[] = init?.initDoneSlugs ? [...init.initDoneSlugs] : [];
     const inFlight = new Set<string>();
+    const integrityProblems: IntegrityProblem[] = [];
 
     const beat = () => {
       void this.heartbeat(branch, jobId).catch((e) =>
@@ -473,17 +522,21 @@ class LocalDetachedRunner implements JobRunner {
 
     try {
       for (const stage of job.stages) {
-        if (stage.kind === 'refresh-pages') {
-          const cancelled = await this.refreshPages(branch, jobId, plan, {
+        if (stage.kind === 'refresh-pages' || stage.kind === 'integrity-check') {
+          const ctx = {
             inFlight,
             writeProgress,
-            onResult: (ok, failure, slug) => {
+            onResult: (ok: boolean, failure?: WikiJobFailure, slug?: string) => {
               finished++;
               if (ok) succeeded++;
               else if (failure) failures.push(failure);
               if (slug) doneSlugs.push(slug);
             },
-          });
+          };
+          const cancelled =
+            stage.kind === 'integrity-check'
+              ? await this.checkIntegrity(branch, jobId, plan, ctx, integrityProblems)
+              : await this.refreshPages(branch, jobId, plan, ctx);
           if (cancelled) {
             status = 'cancelled';
             break;
@@ -512,6 +565,9 @@ class LocalDetachedRunner implements JobRunner {
           doneSlugs: [...doneSlugs],
           finishedAt,
           heartbeatAt: finishedAt,
+          ...(job.kind === 'integrity-check' && (status === 'completed' || status === 'completed-with-errors')
+            ? { integrity: { checkedAt: finishedAt, problems: integrityProblems } }
+            : {}),
         });
         await appendRecentJob(branch, {
           id: jobId,
@@ -532,6 +588,48 @@ class LocalDetachedRunner implements JobRunner {
         `${LOG} ${jobId} ${status}: ${succeeded}/${job.total} succeeded, ${failures.length} failure(s)`,
       );
     }
+  }
+
+  /** Stage: read-only integrity check, sequential, no LLM. Returns true if cancelled. */
+  private async checkIntegrity(
+    branch: string,
+    jobId: string,
+    plan: Plan,
+    ctx: {
+      inFlight: Set<string>;
+      writeProgress: () => Promise<void>;
+      onResult: (ok: boolean, failure?: WikiJobFailure, slug?: string) => void;
+    },
+    problems: IntegrityProblem[],
+  ): Promise<boolean> {
+    for (const { topic } of plan.items) {
+      // Re-read the cancel flag from the DB before each topic.
+      const snap = await getSnapshot(branch);
+      if (snap?.job?.id === jobId && snap.job.cancelRequested) {
+        console.log(`${LOG} ${jobId} cancel requested; stopping integrity check`);
+        return true;
+      }
+      ctx.inFlight.add(topic.slug);
+      await ctx.writeProgress();
+      const found = checkTopicIntegrity(topic);
+      ctx.inFlight.delete(topic.slug);
+      if (found.length === 0) {
+        ctx.onResult(true, undefined, topic.slug);
+      } else {
+        problems.push(...found);
+        ctx.onResult(
+          false,
+          {
+            slug: topic.slug,
+            modes: [...new Set(found.map((p) => p.mode))],
+            error: found.map((p) => `${p.mode}: ${p.reason}`).join('; '),
+          },
+          topic.slug,
+        );
+      }
+      await ctx.writeProgress();
+    }
+    return false;
   }
 
   /** Stage: regenerate stale pages, concurrency 2. Returns true if cancelled. */

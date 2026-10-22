@@ -22,6 +22,7 @@ import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
 import { TOPIC_SECTIONS } from './types';
 import { wikiPrompt, picturePrompt, TEMPLATE_VERSION } from './prompts';
 import { computeFingerprint } from './fingerprint';
+import { hasPictureCards } from './staleness';
 import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
 
@@ -484,7 +485,7 @@ export async function generatePagesForTopic(
     modes.map(async (mode) => {
       // A stored page is read many times, so retry picture pages whose cards don't parse.
       let page = await generate(mode);
-      for (let retry = 0; mode === 'picture' && retry < PICTURE_RETRIES && !pictureCardsParse(page); retry++) {
+      for (let retry = 0; mode === 'picture' && retry < PICTURE_RETRIES && !hasPictureCards(page); retry++) {
         console.warn(`[wiki/generate] picture page for "${topic.title}" has a malformed card; retrying`);
         page = await generate(mode);
       }
@@ -495,20 +496,6 @@ export async function generatePagesForTopic(
 }
 
 const PICTURE_RETRIES = 2;
-
-/** True when the page has at least one ```picture card and every card is valid JSON (a final card may lack its closing fence). */
-function pictureCardsParse(page: string): boolean {
-  const cards = [...page.matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)];
-  if (cards.length === 0) return false;
-  for (const [, source] of cards) {
-    try {
-      JSON.parse(source);
-    } catch {
-      return false;
-    }
-  }
-  return true;
-}
 
 /**
  * Rebuilds the generated pages for a list of topics.

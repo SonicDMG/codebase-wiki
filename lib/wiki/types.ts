@@ -102,13 +102,22 @@ export type WikiJobRequest =
   | { kind: 'refresh-stale' }
   | { kind: 'refresh-field-guide'; onlyStale?: boolean }
   | { kind: 'refresh-page'; slug: string; mode: 'wiki' | 'picture' }
-  | { kind: 'rebuild' };
+  | { kind: 'rebuild' }
+  | { kind: 'integrity-check' };
 export type WikiJobKind = WikiJobRequest['kind'];
 
 /** One step of a job; the runner loops over stages in order. */
 export type WikiJobStage =
   | { kind: 'refresh-pages' }
-  | { kind: 'rebuild' };
+  | { kind: 'rebuild' }
+  | { kind: 'integrity-check' };
+
+/** One page-level problem found by an integrity check. */
+export interface IntegrityProblem {
+  slug: string;
+  mode: 'wiki' | 'picture';
+  reason: string;
+}
 
 /** One per-topic failure (old page kept). */
 export interface WikiJobFailure {
@@ -138,6 +147,8 @@ export interface WikiJob {
   request?: WikiJobRequest;
   /** Slugs whose topics have finished (succeeded OR failed); used for resume. */
   doneSlugs?: string[];
+  /** Result of an 'integrity-check' job (written with the final status). */
+  integrity?: { checkedAt: string; problems: IntegrityProblem[] };
 }
 
 export interface WikiJobSummary {

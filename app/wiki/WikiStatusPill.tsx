@@ -135,7 +135,7 @@ export function WikiStatusPill({
       pillAriaLabel = 'Rebuild running: designing topics';
     } else {
       pillText = `${job.finished}/${job.total}`;
-      pillAriaLabel = `Refreshing ${job.finished} of ${job.total} topics`;
+      pillAriaLabel = `${job.kind === 'integrity-check' ? 'Checking' : 'Refreshing'} ${job.finished} of ${job.total} topics`;
     }
   } else if (interrupted && job) {
     pillText = `Interrupted · ${job.finished}/${job.total}`;
@@ -155,7 +155,9 @@ export function WikiStatusPill({
   // Failures note for dropdown
   const failed = !running && job && job.failures.length > 0 ? job.failures : null;
   const failureNote = failed
-    ? `${failed.length} topic(s) failed; old pages kept: ${failed.map((f) => f.slug).join(', ')}`
+    ? job?.kind === 'integrity-check'
+      ? `${failed.length} topic(s) with integrity problems: ${failed.map((f) => f.slug).join(', ')}`
+      : `${failed.length} topic(s) failed; old pages kept: ${failed.map((f) => f.slug).join(', ')}`
     : null;
 
   return (
@@ -258,7 +260,7 @@ export function WikiStatusPill({
                   <div style={s.jobTitle}>
                     {running ? (
                       <span>
-                        Refreshing {job.finished}/{job.total}
+                        {job.kind === 'integrity-check' ? 'Checking' : 'Refreshing'} {job.finished}/{job.total}
                         {job.currentSlugs.length > 0 && ` (${job.currentSlugs.join(', ')})`}
                       </span>
                     ) : interrupted ? (

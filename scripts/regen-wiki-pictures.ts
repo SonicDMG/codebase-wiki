@@ -22,21 +22,11 @@ const args = process.argv.slice(2);
 const branch = args.find((a) => !a.startsWith('--')) ?? 'main';
 const onlyBroken = args.includes('--broken');
 
-function hasBrokenCard(page: string | undefined): boolean {
-  const cards = [...(page ?? '').matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)];
-  if (cards.length === 0) return true;
-  return cards.some(([, source]) => {
-    try {
-      JSON.parse(source);
-      return false;
-    } catch {
-      return true;
-    }
-  });
-}
 const CONCURRENCY = 3;
 
 (async () => {
+  const { hasPictureCards } = await import('../lib/wiki/staleness');
+  const hasBrokenCard = (page: string | undefined) => !hasPictureCards(page ?? '');
   const { getStoredTopics, getSnapshot, saveTopics } = await import('../lib/wiki/store');
   const { generatePagesForTopic, pageFieldsToStore } = await import('../lib/wiki/generate');
   const { decodeFileList } = await import('../lib/wiki/snapshot');

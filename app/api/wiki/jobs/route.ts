@@ -3,7 +3,7 @@
  *   {
  *     branch?: string,
  *     action: 'start' | 'stop' | 'resume',
- *     kind?: 'refresh-stale' | 'refresh-field-guide' | 'refresh-page' | 'rebuild',
+ *     kind?: 'refresh-stale' | 'refresh-field-guide' | 'refresh-page' | 'rebuild' | 'integrity-check',
  *     onlyStale?: boolean,
  *     slug?: string,
  *     mode?: 'wiki' | 'picture'
@@ -72,6 +72,8 @@ export async function POST(req: NextRequest) {
         };
       } else if (kind === 'rebuild') {
         request = { kind: 'rebuild' };
+      } else if (kind === 'integrity-check') {
+        request = { kind: 'integrity-check' };
       } else {
         return NextResponse.json({ error: `Unknown job kind "${String(kind)}".` }, { status: 400 });
       }
