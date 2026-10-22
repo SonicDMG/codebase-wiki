@@ -5,6 +5,7 @@ import type { CSSProperties } from 'react';
 import type { WikiStatusResponse, StalenessState } from '@/lib/wiki/status-types';
 import { StatusDot } from './StatusDot';
 import { useJobActions } from './useJobActions';
+import { useAutoRefresh } from './useAutoRefresh';
 import { JobProgress } from './JobProgress';
 import { ConfirmRebuildDialog } from './ConfirmRebuildDialog';
 
@@ -32,6 +33,7 @@ export function WikiStatusPill({
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const rebuildOpenerRef = useRef<HTMLButtonElement>(null);
   const { busy, message, start, stop, resume } = useJobActions(branch, refresh);
+  const { enabled: autoEnabled, setEnabled: setAutoEnabled, pendingPrompt, confirmPrompt, dismissPrompt, staleTopicCount } = useAutoRefresh({ branch, status, start, busy });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -366,6 +368,24 @@ export function WikiStatusPill({
           </div>
 
           <div style={s.divider} />
+
+          {/* Auto-refresh toggle */}
+          <div style={s.section}>
+            <label style={s.autoRefreshLabel}>
+              <input
+                type="checkbox"
+                checked={autoEnabled}
+                onChange={(e) => setAutoEnabled(e.target.checked)}
+                style={s.autoRefreshCheckbox}
+              />
+              Auto-refresh out-of-date pages
+            </label>
+            <div style={s.autoRefreshHelper}>
+              Runs in this tab only while it is focused. Waits for your click when more than 4 topics are out of date.
+            </div>
+          </div>
+
+          <div style={s.divider} />
           <div style={s.statusPageRow}>
             <a
               href={`/wiki/status?branch=${encodeURIComponent(branch)}`}
@@ -376,6 +396,35 @@ export function WikiStatusPill({
           </div>
         </div>
       )}
+
+      {pendingPrompt && (
+        <div
+          role="region"
+          aria-label="Auto-refresh prompt"
+          style={s.autoRefreshPrompt}
+        >
+          <span style={s.autoRefreshPromptText}>
+            {staleTopicCount} topics are out of date. Refresh them now?
+          </span>
+          <div style={s.autoRefreshPromptBtns}>
+            <button
+              type="button"
+              style={s.autoRefreshConfirmBtn}
+              onClick={confirmPrompt}
+            >
+              Refresh now
+            </button>
+            <button
+              type="button"
+              style={s.autoRefreshDismissBtn}
+              onClick={dismissPrompt}
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      )}
+
       <ConfirmRebuildDialog
         open={rebuildDialogOpen}
         onConfirm={() => {
@@ -545,9 +594,9 @@ const s: Record<string, CSSProperties> = {
     fontSize: '11px',
     padding: '4px 12px',
     borderRadius: '6px',
-    border: '1px solid #0f62fe',
-    background: '#0f62fe',
-    color: '#ffffff',
+    border: '1px solid var(--w-amber, #F5A623)',
+    background: 'var(--w-amber, #F5A623)',
+    color: 'var(--w-onAccent, #1a1a1f)',
     cursor: 'pointer',
     fontWeight: 500,
   },
@@ -573,6 +622,75 @@ const s: Record<string, CSSProperties> = {
     fontSize: '11px',
     color: 'var(--w-accentText, #92600a)',
     textDecoration: 'none',
+    fontWeight: 500,
+  },
+  autoRefreshLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '6px',
+    fontSize: '11px',
+    fontWeight: 500,
+    color: 'var(--w-text, #1a1a1f)',
+    cursor: 'pointer',
+  },
+  autoRefreshCheckbox: {
+    cursor: 'pointer',
+    accentColor: 'var(--w-amber, #F5A623)',
+    width: '13px',
+    height: '13px',
+    flexShrink: 0,
+  },
+  autoRefreshHelper: {
+    fontSize: '10px',
+    color: 'var(--w-textMuted, #57606a)',
+    marginTop: '3px',
+    lineHeight: '1.4',
+  },
+  autoRefreshPrompt: {
+    position: 'absolute',
+    top: 'calc(100% + 4px)',
+    left: 0,
+    background: 'var(--w-bg, #ffffff)',
+    border: '1px solid var(--w-border, #e2e4e8)',
+    borderRadius: '8px',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.15)',
+    padding: '10px 12px',
+    zIndex: 100,
+    minWidth: '280px',
+    maxWidth: '340px',
+    fontFamily: 'var(--w-fontBody, -apple-system, sans-serif)',
+    fontSize: '12px',
+    color: 'var(--w-text, #1a1a1f)',
+  },
+  autoRefreshPromptText: {
+    display: 'block',
+    marginBottom: '8px',
+    fontSize: '12px',
+    lineHeight: '1.4',
+  },
+  autoRefreshPromptBtns: {
+    display: 'flex',
+    gap: '8px',
+    justifyContent: 'flex-end',
+  },
+  autoRefreshConfirmBtn: {
+    fontSize: '11px',
+    padding: '4px 12px',
+    borderRadius: '6px',
+    border: '1px solid var(--w-amber, #F5A623)',
+    background: 'var(--w-amber, #F5A623)',
+    color: 'var(--w-onAccent, #1a1a1f)',
+    cursor: 'pointer',
+    fontWeight: 500,
+  },
+  autoRefreshDismissBtn: {
+    fontSize: '11px',
+    padding: '4px 12px',
+    borderRadius: '6px',
+    border: '1px solid var(--w-border, #e2e4e8)',
+    background: 'var(--w-surface, #f7f8fa)',
+    color: 'var(--w-text, #1a1a1f)',
+    cursor: 'pointer',
     fontWeight: 500,
   },
 };
