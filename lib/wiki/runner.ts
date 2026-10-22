@@ -103,18 +103,43 @@ interface Plan {
   commit: string;
 }
 
-/** Topics with >= 1 non-current mode, carrying exactly their stale modes. */
-async function planRefreshStale(branch: string): Promise<Plan | null> {
+/** Build the generation plan for a job request. */
+async function planFor(branch: string, request: WikiJobRequest): Promise<Plan | null> {
   const [topics, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
-  if (!snapshot || topics.length === 0) return null;
+  if (!snapshot || topics.length === 0) {
+    if (request.kind === 'refresh-page') {
+      throw new Error(`Unknown topic "${request.slug}"`);
+    }
+    return null;
+  }
   const entries = decodeFileList(snapshot.fileListText);
   const items: WorkItem[] = [];
-  for (const topic of topics) {
-    const modes = (['wiki', 'picture'] as PageMode[]).filter(
-      (m) => classifyStaleness(topic, m, entries).state !== 'current',
-    );
-    if (modes.length > 0) items.push({ topic, modes });
+
+  if (request.kind === 'refresh-stale') {
+    for (const topic of topics) {
+      const modes = (['wiki', 'picture'] as PageMode[]).filter(
+        (m) => classifyStaleness(topic, m, entries).state !== 'current',
+      );
+      if (modes.length > 0) items.push({ topic, modes });
+    }
+  } else if (request.kind === 'refresh-field-guide') {
+    for (const topic of topics) {
+      if (request.onlyStale) {
+        if (classifyStaleness(topic, 'picture', entries).state !== 'current') {
+          items.push({ topic, modes: ['picture'] });
+        }
+      } else {
+        items.push({ topic, modes: ['picture'] });
+      }
+    }
+  } else if (request.kind === 'refresh-page') {
+    const topic = topics.find((t) => t.slug === request.slug);
+    if (!topic) {
+      throw new Error(`Unknown topic "${request.slug}"`);
+    }
+    items.push({ topic, modes: [request.mode] });
   }
+
   return { items, entries, allPaths: entries.map((e) => e.path), commit: snapshot.headSha };
 }
 
@@ -182,7 +207,7 @@ class LocalDetachedRunner implements JobRunner {
 
     try {
       // Plan up front so "nothing to do" never creates a running job.
-      const plan = request.kind === 'refresh-stale' ? await planRefreshStale(branch) : null;
+      const plan = await planFor(branch, request);
       if (!plan || plan.items.length === 0) {
         await this.releaseLease(branch, jobId);
         console.log(`${LOG} nothing to do for ${branch}`);
@@ -384,7 +409,10 @@ class LocalDetachedRunner implements JobRunner {
 
 // ── Singleton accessor ────────────────────────────────────────────────────────
 
+// Module-level (not globalThis) so dev HMR picks up edits; the only shared
+// state, the active-jobs map, already lives on globalThis.
+const runner: JobRunner = new LocalDetachedRunner();
+
 export function getJobRunner(): JobRunner {
-  const g = globalThis as { __wikiJobRunner?: JobRunner };
-  return (g.__wikiJobRunner ??= new LocalDetachedRunner());
+  return runner;
 }

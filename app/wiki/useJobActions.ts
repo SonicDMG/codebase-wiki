@@ -1,6 +1,21 @@
 'use client';
 
 import { useState, useCallback } from 'react';
+import type { WikiJobKind, WikiJobRequest } from '@/lib/wiki/types';
+
+/** Human-readable label for a job kind. */
+export function jobKindLabel(kind: WikiJobKind): string {
+  switch (kind) {
+    case 'refresh-stale':
+      return 'Refresh stale pages';
+    case 'refresh-field-guide':
+      return 'Refresh Field Guide';
+    case 'refresh-page':
+      return 'Refresh one page';
+    default:
+      return kind;
+  }
+}
 
 export function useJobActions(
   branch: string,
@@ -8,21 +23,21 @@ export function useJobActions(
 ): {
   busy: boolean;
   message: string | null;
-  start: () => Promise<void>;
+  start: (request?: WikiJobRequest) => Promise<void>;
   stop: () => Promise<void>;
 } {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const post = useCallback(
-    async (action: 'start' | 'stop') => {
+    async (action: 'start' | 'stop', request: WikiJobRequest = { kind: 'refresh-stale' }) => {
       setBusy(true);
       setMessage(null);
       try {
         const res = await fetch('/api/wiki/jobs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ branch, action, kind: 'refresh-stale' }),
+          body: JSON.stringify({ branch, action, ...request }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -42,7 +57,10 @@ export function useJobActions(
     [branch, refresh]
   );
 
-  const start = useCallback(() => post('start'), [post]);
+  const start = useCallback(
+    (request?: WikiJobRequest) => post('start', request),
+    [post]
+  );
   const stop = useCallback(() => post('stop'), [post]);
 
   return { busy, message, start, stop };

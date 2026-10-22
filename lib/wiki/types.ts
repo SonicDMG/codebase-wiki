@@ -97,8 +97,11 @@ export interface WikiSnapshotDoc {
 
 export type WikiJobStatus = 'running' | 'completed' | 'completed-with-errors' | 'cancelled' | 'failed';
 
-/** What a job was asked to do. Union is open for later variants. */
-export type WikiJobRequest = { kind: 'refresh-stale' };
+/** What a job was asked to do. */
+export type WikiJobRequest =
+  | { kind: 'refresh-stale' }
+  | { kind: 'refresh-field-guide'; onlyStale?: boolean }
+  | { kind: 'refresh-page'; slug: string; mode: 'wiki' | 'picture' };
 export type WikiJobKind = WikiJobRequest['kind'];
 
 /** One step of a job; the runner loops over stages in order. */

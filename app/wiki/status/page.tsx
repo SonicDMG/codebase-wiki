@@ -6,7 +6,7 @@ import type { StalenessState } from '@/lib/wiki/status-types';
 import { paletteCss } from '../palettes';
 import { StatusDot } from '../StatusDot';
 import { useWikiStatus } from '../useWikiStatus';
-import { useJobActions } from '../useJobActions';
+import { useJobActions, jobKindLabel } from '../useJobActions';
 
 // ── State labels (matching WikiStatusPill) ─────────────────────────────────
 
@@ -76,6 +76,12 @@ function StatusPageInner() {
   const staleCount = status
     ? (status.counts.wiki['files-changed'] + status.counts.wiki['older-template'] + status.counts.wiki['missing-or-failed']) +
       (status.counts.picture['files-changed'] + status.counts.picture['older-template'] + status.counts.picture['missing-or-failed'])
+    : 0;
+
+  const picStaleCount = status
+    ? status.counts.picture['files-changed'] +
+      status.counts.picture['older-template'] +
+      status.counts.picture['missing-or-failed']
     : 0;
 
   const progressPct =
@@ -201,6 +207,30 @@ function StatusPageInner() {
                 >
                   Refresh stale ({staleCount})
                 </button>
+                <button
+                  type="button"
+                  onClick={() => void start({ kind: 'refresh-field-guide', onlyStale: true })}
+                  disabled={busy || running || picStaleCount === 0}
+                  style={{
+                    ...btnBase,
+                    ...(busy || running || picStaleCount === 0 ? btnDisabled : {}),
+                  }}
+                  aria-label={`Refresh ${picStaleCount} stale Field Guide pages`}
+                >
+                  Refresh stale Field Guide pages ({picStaleCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void start({ kind: 'refresh-field-guide', onlyStale: false })}
+                  disabled={busy || running}
+                  style={{
+                    ...btnBase,
+                    ...(busy || running ? btnDisabled : {}),
+                  }}
+                  aria-label="Regenerate all Field Guide pages"
+                >
+                  Regenerate all Field Guide pages
+                </button>
                 {running && (
                   <button
                     type="button"
@@ -314,7 +344,7 @@ function StatusPageInner() {
                     <tbody>
                       {status.recentJobs.map((rj) => (
                         <tr key={rj.id} style={{ borderBottom: '1px solid rgba(128,128,128,0.1)' }}>
-                          <td style={tdStyle}>{rj.kind}</td>
+                          <td style={tdStyle}>{jobKindLabel(rj.kind)}</td>
                           <td style={tdStyle}>{rj.status}</td>
                           <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>
                             {rj.finished}/{rj.total}
@@ -371,6 +401,15 @@ function StatusPageInner() {
                               <span style={{ color: 'var(--w-textMuted)', fontSize: '12px' }}>
                                 {topic.wiki.reason}
                               </span>
+                              <button
+                                type="button"
+                                onClick={() => void start({ kind: 'refresh-page', slug: topic.slug, mode: 'wiki' })}
+                                disabled={busy || running}
+                                style={{ ...btnSmall, ...(busy || running ? btnDisabled : {}) }}
+                                aria-label={`Refresh Wiki page for ${topic.title}`}
+                              >
+                                Refresh
+                              </button>
                             </span>
                           </td>
                           <td style={tdStyle}>
@@ -379,6 +418,15 @@ function StatusPageInner() {
                               <span style={{ color: 'var(--w-textMuted)', fontSize: '12px' }}>
                                 {topic.picture.reason}
                               </span>
+                              <button
+                                type="button"
+                                onClick={() => void start({ kind: 'refresh-page', slug: topic.slug, mode: 'picture' })}
+                                disabled={busy || running}
+                                style={{ ...btnSmall, ...(busy || running ? btnDisabled : {}) }}
+                                aria-label={`Refresh Field Guide page for ${topic.title}`}
+                              >
+                                Refresh
+                              </button>
                             </span>
                           </td>
                         </tr>
@@ -429,6 +477,12 @@ const btnBase: React.CSSProperties = {
   color: 'var(--w-text)',
   cursor: 'pointer',
   fontWeight: 500,
+};
+
+const btnSmall: React.CSSProperties = {
+  ...btnBase,
+  fontSize: '11px',
+  padding: '2px 8px',
 };
 
 const btnDisabled: React.CSSProperties = {

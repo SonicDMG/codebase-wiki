@@ -73,6 +73,10 @@ export function WikiStatusPill({
       ? picCounts['files-changed'] + picCounts['older-template'] + picCounts['missing-or-failed']
       : 0);
 
+  const picStaleCount = picCounts
+    ? picCounts['files-changed'] + picCounts['older-template'] + picCounts['missing-or-failed']
+    : 0;
+
   const totalPages = currentCount + staleCount;
 
   // Ring arc calculations
@@ -275,19 +279,34 @@ export function WikiStatusPill({
                 {job?.cancelRequested ? 'Stopping…' : 'Stop'}
               </button>
             ) : (
-              <button
-                type="button"
-                style={{
-                  ...s.refreshBtn,
-                  ...(staleCount === 0 || busy ? s.btnDisabled : {}),
-                }}
-                onClick={() => void start()}
-                disabled={staleCount === 0 || busy}
-                title={staleCount === 0 ? 'All pages are up to date' : undefined}
-                aria-label={`Refresh ${staleCount} stale pages across Wiki and Field Guide`}
-              >
-                Refresh stale ({staleCount})
-              </button>
+              <>
+                <button
+                  type="button"
+                  style={{
+                    ...s.refreshBtn,
+                    ...(picStaleCount === 0 || busy ? s.btnDisabled : {}),
+                  }}
+                  onClick={() => void start({ kind: 'refresh-field-guide', onlyStale: true })}
+                  disabled={picStaleCount === 0 || busy}
+                  title={picStaleCount === 0 ? 'All Field Guide pages are up to date' : undefined}
+                  aria-label={`Refresh ${picStaleCount} stale Field Guide pages only`}
+                >
+                  Refresh Field Guide only
+                </button>
+                <button
+                  type="button"
+                  style={{
+                    ...s.refreshBtn,
+                    ...(staleCount === 0 || busy ? s.btnDisabled : {}),
+                  }}
+                  onClick={() => void start()}
+                  disabled={staleCount === 0 || busy}
+                  title={staleCount === 0 ? 'All pages are up to date' : undefined}
+                  aria-label={`Refresh ${staleCount} stale pages across Wiki and Field Guide`}
+                >
+                  Refresh stale ({staleCount})
+                </button>
+              </>
             )}
           </div>
 
