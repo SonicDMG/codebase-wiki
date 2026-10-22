@@ -101,16 +101,20 @@ the code really does.
 
 # Page format
 
-The page is ONLY picture cards, one after another, in this order. Each card is its own fenced block: a line
-with three backticks and the word picture, the card's JSON on one line, then a line with three backticks
-(exactly like the examples under "Cards"). Leave one blank line between cards and write nothing else.
+The page is ONLY picture cards, one after another, in this order, plus one diagram. Each card is its own
+fenced block: a line with three backticks and the word picture, the card's JSON on one line, then a line
+with three backticks (exactly like the examples under "Cards"). Leave one blank line between blocks and
+write nothing else.
 
 1. One "words" card: a title like "How the wiki sync works", then the 2–4 words the reader must learn,
    each with its own colour. "word" is a plain word or two for the idea (Snapshot, Topic, Checkpoint,
    Buffer), never a code identifier, path or endpoint; "real" is the name in the code (WikiSnapshotDoc);
    "means" says what it is in one short sentence.
-2. 4–8 "lesson" cards, in the order a reader should learn them. The UI numbers them.
-3. One "breath" card: the whole thing in one breath.
+2. One diagram block (see "Diagram") showing how the parts fit together. Always include it for overview,
+   architecture, data-flow or "how does X work" questions; skip it only for narrow questions about a
+   single function or value.
+3. 4–8 "lesson" cards, in the order a reader should learn them. The UI numbers them.
+4. One "breath" card: the whole thing in one breath.
 
 Lesson rules:
 - The title is a short claim in plain words, not a topic label: "Every file gets a topic", "Only changed
@@ -135,8 +139,8 @@ Writing rules:
 - Sentences under 15 words. Everyday words, except the words from the "words" card, which you use often
   and always spelled the same way.
 - Inside text, \`backticks\` mark a real name (a file, function or value) and **double stars** mark bold.
-- No source code, HTML, Mermaid, headings or prose outside the cards. Never put the whole answer inside
-  one fence: every card gets its own \`\`\`picture fence.
+- No source code, HTML, Mermaid, headings or prose outside the cards and the diagram. Never put the whole
+  answer inside one fence: every card gets its own \`\`\`picture fence.
 - Colours are names from this list: orange, cyan, purple, green, yellow, red, blue, grey. Give each word
   from the "words" card one colour and reuse that colour wherever that thing appears in a picture. Use
   green for things that work and red for things that fail.
@@ -149,6 +153,22 @@ Writing rules:
 using the line numbers printed at the start of each source line. Cite the whole function or block, never a
 single line. Every lesson that is about specific code has a "cite". When a lesson spans several blocks, "cite" is a
 list: ["path/a.ts:10-40","path/b.ts:5-30"].
+
+# Diagram
+
+The diagram is a fenced block with the language "diagram" containing JSON (not Mermaid, not a picture card).
+The UI draws it. Use 4–10 nodes or steps, labels of at most four plain words (real names go in the
+lessons, not the labels). Two kinds:
+
+Flow — how the parts connect. Optional "group" clusters related nodes.
+\`\`\`diagram
+{"type":"flow","direction":"LR","nodes":[{"id":"gh","label":"GitHub","group":"Outside"},{"id":"sync","label":"Sync job","group":"Server"},{"id":"db","label":"Saved topics","group":"Server"}],"edges":[{"from":"gh","to":"sync","label":"new commits"},{"from":"sync","to":"db","label":"save"}]}
+\`\`\`
+
+Sequence — a request or process unfolding over time. "reply": true draws a dashed return arrow.
+\`\`\`diagram
+{"type":"sequence","actors":["App","Server","Database"],"steps":[{"from":"App","to":"Server","label":"Send audio"},{"from":"Server","to":"Database","label":"Save it"},{"from":"Server","to":"App","label":"All done","reply":true}]}
+\`\`\`
 
 # Cards
 
@@ -198,7 +218,8 @@ ${filesBlock}
 ---
 
 Reminder before you answer: Field Guide mode, Lumentide style — each card in its own \`\`\`picture fence:
-one "words" card (plain words, code names in "real"), 4–8 "lesson" cards, one "breath" card. At least three
+one "words" card (plain words, code names in "real"), one \`\`\`diagram JSON block (flow or sequence), 4–8
+"lesson" cards, one "breath" card. At least three
 picture kinds and "flow" at most twice; plain-word labels; no analogy; real limits from the code, made-up
 examples start with "Say"; "cite" as "path:START-END" or a list of them; no prose outside cards, never 【】.`;
 }

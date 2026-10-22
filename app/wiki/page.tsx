@@ -19,7 +19,7 @@
  * current mode is generated when its conversation is open.
  */
 
-import { Fragment, isValidElement, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -483,29 +483,7 @@ export default function WikiPage() {
       const script = document.createElement('script');
       script.id = 'mermaid-script';
       script.src = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
-      script.onload = () =>
-        window.mermaid?.initialize({
-          startOnLoad: false,
-          theme: 'base',
-          securityLevel: 'strict',
-          // Don't inject the "Syntax error" bomb SVG into document.body.
-          suppressErrorRendering: true,
-          fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
-          flowchart: { curve: 'basis', padding: 12 },
-          themeVariables: {
-            primaryColor: PALETTES.wiki.amberLight,
-            primaryBorderColor: PALETTES.wiki.amberBorder,
-            primaryTextColor: PALETTES.wiki.text,
-            lineColor: PALETTES.wiki.textFaint,
-            clusterBkg: PALETTES.wiki.surface,
-            clusterBorder: PALETTES.wiki.border,
-            edgeLabelBackground: PALETTES.wiki.bg,
-            actorBkg: PALETTES.wiki.amberLight,
-            actorBorder: PALETTES.wiki.amberBorder,
-            noteBkgColor: PALETTES.wiki.surface,
-            fontSize: '13px',
-          },
-        });
+      script.onload = () => window.mermaid?.initialize(mermaidConfig('wiki'));
       document.head.appendChild(script);
     }
   }, []);
@@ -741,6 +719,7 @@ export default function WikiPage() {
 
   return (
     <div className="wiki-root" data-mode={answerMode} style={styles.root}>
+      <AnswerModeContext.Provider value={answerMode}>
       <GlobalMdStyles />
       {/* ── Header ── */}
       <header style={styles.header}>
@@ -970,6 +949,7 @@ export default function WikiPage() {
         </div>
         <p style={styles.hint}>Grounded in the current GitHub source — citations open in GitHub.</p>
       </footer>
+      </AnswerModeContext.Provider>
     </div>
   );
 }
@@ -1148,8 +1128,78 @@ function sequenceToMermaid(actors: unknown, steps: unknown[]): string {
   return ['sequenceDiagram', 'autonumber', ...participants, ...stepLines].join('\n');
 }
 
+/**
+ * Mermaid config for a mode. Mermaid needs real colours (not CSS variables), so the
+ * wiki gets its light amber look and the Field Guide the night-sky Lumentide look.
+ */
+function mermaidConfig(mode: AnswerMode): Record<string, unknown> {
+  const base = {
+    startOnLoad: false,
+    theme: 'base',
+    securityLevel: 'strict',
+    // Don't inject the "Syntax error" bomb SVG into document.body.
+    suppressErrorRendering: true,
+  };
+  if (mode === 'picture') {
+    const p = PALETTES.picture;
+    return {
+      ...base,
+      fontFamily: '"Nunito", "Segoe UI", system-ui, sans-serif',
+      flowchart: { curve: 'basis', padding: 14 },
+      themeVariables: {
+        primaryColor: p.amberLight,
+        primaryBorderColor: '#5ef2ff',
+        primaryTextColor: p.text,
+        textColor: p.text,
+        titleColor: p.text,
+        lineColor: '#ffe066',
+        clusterBkg: p.codeBg,
+        clusterBorder: p.border,
+        edgeLabelBackground: p.codeBg,
+        actorBkg: p.amberLight,
+        actorBorder: '#5ef2ff',
+        actorTextColor: p.text,
+        actorLineColor: p.amberBorder,
+        signalColor: '#ffe066',
+        signalTextColor: p.text,
+        labelBoxBkgColor: p.amberLight,
+        labelBoxBorderColor: p.border,
+        labelTextColor: p.text,
+        sequenceNumberColor: p.onAccent,
+        noteBkgColor: p.surface,
+        noteBorderColor: p.border,
+        noteTextColor: p.text,
+        fontSize: '15px',
+      },
+    };
+  }
+  const p = PALETTES.wiki;
+  return {
+    ...base,
+    fontFamily: '-apple-system, "Segoe UI", system-ui, sans-serif',
+    flowchart: { curve: 'basis', padding: 12 },
+    themeVariables: {
+      primaryColor: p.amberLight,
+      primaryBorderColor: p.amberBorder,
+      primaryTextColor: p.text,
+      lineColor: p.textFaint,
+      clusterBkg: p.surface,
+      clusterBorder: p.border,
+      edgeLabelBackground: p.bg,
+      actorBkg: p.amberLight,
+      actorBorder: p.amberBorder,
+      noteBkgColor: p.surface,
+      fontSize: '13px',
+    },
+  };
+}
+
+/** The answer mode, so diagrams can draw themselves in the matching look. */
+const AnswerModeContext = createContext<AnswerMode>('wiki');
+
 /** Renders Mermaid source to an inline SVG. Waits until the answer has finished streaming. */
 function MermaidBlock({ definition, streaming }: { definition: string | null; streaming: boolean }) {
+  const mode = useContext(AnswerModeContext);
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -1166,6 +1216,7 @@ function MermaidBlock({ definition, streaming }: { definition: string | null; st
       // Unique id per render: mermaid leaves temp elements keyed by id in <body>.
       const id = `mermaid-${Math.random().toString(36).slice(2)}`;
       try {
+        window.mermaid.initialize(mermaidConfig(mode));
         const result = await window.mermaid.render(id, definition);
         if (!cancelled) {
           setError(null);
@@ -1180,7 +1231,7 @@ function MermaidBlock({ definition, streaming }: { definition: string | null; st
     };
     void tryRender();
     return () => { cancelled = true; };
-  }, [definition, streaming]);
+  }, [definition, streaming, mode]);
 
   if (streaming || (!svg && !error && definition)) {
     return <div style={styles.diagramLoading}>drawing diagram…</div>;
@@ -2217,6 +2268,13 @@ const paletteVars = (mode: AnswerMode) =>
 const THEME_CSS = `
 .wiki-root { ${paletteVars('wiki')} }
 .wiki-root[data-mode="picture"] { ${paletteVars('picture')} }
+/* Field Guide scrollbars: square night-sky thumbs, like the lesson panels. */
+.wiki-root[data-mode="picture"], .wiki-root[data-mode="picture"] * { scrollbar-width: thin; scrollbar-color: #3a4a7a #0b1020; }
+.wiki-root[data-mode="picture"] *::-webkit-scrollbar { width: 14px; height: 14px; }
+.wiki-root[data-mode="picture"] *::-webkit-scrollbar-track { background: #0b1020; border-left: 3px solid #26325a; }
+.wiki-root[data-mode="picture"] *::-webkit-scrollbar-thumb { background: #3a4a7a; border: 3px solid #0b1020; border-radius: 0; }
+.wiki-root[data-mode="picture"] *::-webkit-scrollbar-thumb:hover { background: #5ef2ff; }
+.wiki-root[data-mode="picture"] *::-webkit-scrollbar-corner { background: #0b1020; }
 .wiki-root ::placeholder { color: var(--w-textFaint); }
 `;
 
@@ -2443,7 +2501,7 @@ const styles = {
     flexShrink: 0,
   },
 
-  // Reading pane — a centred article column keeps line length readable.
+  // Reading pane — the article fills the pane's width.
   chatPane: {
     flex: 1,
     overflowY: 'auto' as const,
@@ -2454,8 +2512,7 @@ const styles = {
   messageList: {
     display: 'flex',
     flexDirection: 'column' as const,
-    maxWidth: '760px',
-    margin: '0 auto',
+    width: '100%',
   },
   divider: { width: '4px', flexShrink: 0, cursor: 'col-resize', background: w.border },
 
@@ -2688,7 +2745,7 @@ const styles = {
     margin: '4px 0 20px',
     padding: '20px',
     background: w.bg,
-    border: `1px solid ${w.border}`,
+    border: `${w.panelBorder} solid ${w.border}`,
     borderRadius: '10px',
     overflowX: 'auto' as const,
     textAlign: 'center' as const,

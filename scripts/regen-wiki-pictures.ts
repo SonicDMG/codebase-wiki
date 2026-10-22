@@ -23,7 +23,9 @@ const branch = args.find((a) => !a.startsWith('--')) ?? 'main';
 const onlyBroken = args.includes('--broken');
 
 function hasBrokenCard(page: string | undefined): boolean {
-  return [...(page ?? '').matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)].some(([, source]) => {
+  const cards = [...(page ?? '').matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)];
+  if (cards.length === 0) return true;
+  return cards.some(([, source]) => {
     try {
       JSON.parse(source);
       return false;

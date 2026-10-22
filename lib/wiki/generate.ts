@@ -453,9 +453,11 @@ export async function generatePagesForTopic(
 
 const PICTURE_RETRIES = 2;
 
-/** True when every ```picture card on the page is valid JSON (a final card may lack its closing fence). */
+/** True when the page has at least one ```picture card and every card is valid JSON (a final card may lack its closing fence). */
 function pictureCardsParse(page: string): boolean {
-  for (const [, source] of page.matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)) {
+  const cards = [...page.matchAll(/```picture\n([\s\S]*?)(?:```|$)/g)];
+  if (cards.length === 0) return false;
+  for (const [, source] of cards) {
     try {
       JSON.parse(source);
     } catch {
