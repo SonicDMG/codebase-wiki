@@ -30,7 +30,7 @@ export function WikiStatusPill({
   const [open, setOpen] = useState(false);
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const rebuildOpenerRef = useRef<HTMLButtonElement>(null);
-  const { busy, message, start, stop } = useJobActions(branch, refresh);
+  const { busy, message, start, stop, resume } = useJobActions(branch, refresh);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -62,7 +62,8 @@ export function WikiStatusPill({
   }, [open]);
 
   const job = status?.job ?? null;
-  const running = job?.status === 'running';
+  const interrupted = !!status?.interrupted;
+  const running = job?.status === 'running' && !interrupted;
 
   const wikiCounts = status?.counts.wiki;
   const picCounts = status?.counts.picture;
@@ -98,7 +99,7 @@ export function WikiStatusPill({
   // Health color
   const isWiki = mode === 'wiki';
   let healthColor = isWiki ? '#1a7f37' : '#7dff9a'; // green
-  if (running) {
+  if (running || (interrupted && job)) {
     healthColor = isWiki ? '#b35900' : '#ffb347'; // amber
   } else if (
     (wikiCounts?.['missing-or-failed'] ?? 0) > 0 ||
@@ -136,6 +137,9 @@ export function WikiStatusPill({
       pillText = `${job.finished}/${job.total}`;
       pillAriaLabel = `Refreshing ${job.finished} of ${job.total} topics`;
     }
+  } else if (interrupted && job) {
+    pillText = `Interrupted · ${job.finished}/${job.total}`;
+    pillAriaLabel = `Wiki job interrupted at ${job.finished} of ${job.total} topics; open to resume`;
   } else if (staleCount === 0) {
     pillText = (
       <>
@@ -257,6 +261,11 @@ export function WikiStatusPill({
                         Refreshing {job.finished}/{job.total}
                         {job.currentSlugs.length > 0 && ` (${job.currentSlugs.join(', ')})`}
                       </span>
+                    ) : interrupted ? (
+                      <span>
+                        The last job was interrupted at {job.finished} of {job.total} topics
+                        (server restarted or stopped).
+                      </span>
                     ) : (
                       <span>
                         Last job: {job.status} ({job.finished}/{job.total} finished)
@@ -290,6 +299,17 @@ export function WikiStatusPill({
               </button>
             ) : (
               <>
+                {interrupted && (
+                  <button
+                    type="button"
+                    style={{ ...s.resumeBtn, ...(busy ? s.btnDisabled : {}) }}
+                    onClick={() => void resume()}
+                    disabled={busy}
+                    aria-label="Resume the interrupted job"
+                  >
+                    Resume
+                  </button>
+                )}
                 <button
                   type="button"
                   style={{
@@ -501,6 +521,16 @@ const s: Record<string, CSSProperties> = {
     border: '1px solid var(--w-border, #e2e4e8)',
     background: 'var(--w-surface, #f7f8fa)',
     color: 'var(--w-text, #1a1a1f)',
+    cursor: 'pointer',
+    fontWeight: 500,
+  },
+  resumeBtn: {
+    fontSize: '11px',
+    padding: '4px 12px',
+    borderRadius: '6px',
+    border: '1px solid #0f62fe',
+    background: '#0f62fe',
+    color: '#ffffff',
     cursor: 'pointer',
     fontWeight: 500,
   },

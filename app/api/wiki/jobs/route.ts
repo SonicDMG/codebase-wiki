@@ -2,7 +2,7 @@
  * POST /api/wiki/jobs
  *   {
  *     branch?: string,
- *     action: 'start' | 'stop',
+ *     action: 'start' | 'stop' | 'resume',
  *     kind?: 'refresh-stale' | 'refresh-field-guide' | 'refresh-page' | 'rebuild',
  *     onlyStale?: boolean,
  *     slug?: string,
@@ -12,6 +12,9 @@
  * 'start' returns immediately with { jobId } — the job runs detached on the
  * server. 409 when a job is already running on the branch.
  * 'stop' sets the cancel flag (checked between topics); 200 even if nothing runs.
+ * 'resume' continues an interrupted (running-but-stale) job under the same
+ * jobId and returns { status: 'resumed', jobId }. 409 when the job is live,
+ * there is nothing to resume, or the job cannot be resumed.
  */
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -90,10 +93,21 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return NextResponse.json({ error: 'action must be "start" or "stop".' }, { status: 400 });
+    if (body.action === 'resume') {
+      const result = await runner.resume(branch);
+      return NextResponse.json({ status: 'resumed', jobId: result.jobId });
+    }
+
+    return NextResponse.json({ error: 'action must be "start", "stop" or "resume".' }, { status: 400 });
   } catch (err) {
     if (err instanceof JobAlreadyRunningError) {
       return NextResponse.json({ error: err.message, jobId: err.jobId }, { status: 409 });
+    }
+    if (
+      err instanceof Error &&
+      (err.message === 'Nothing to resume' || err.message.includes('cannot be resumed'))
+    ) {
+      return NextResponse.json({ error: err.message }, { status: 409 });
     }
     if (err instanceof Error && err.message.startsWith('Unknown topic')) {
       return NextResponse.json({ error: err.message }, { status: 400 });

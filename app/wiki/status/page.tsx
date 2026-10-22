@@ -63,7 +63,7 @@ function StatusPageInner() {
   const rebuildBtnRef = useRef<HTMLButtonElement>(null);
 
   const { status, error, refresh } = useWikiStatus(branch);
-  const { busy, message, start, stop } = useJobActions(branch ?? '', refresh);
+  const { busy, message, start, stop, resume } = useJobActions(branch ?? '', refresh);
 
   // Scroll highlighted topic into view once status loads
   const highlightRef = useRef<HTMLTableRowElement | null>(null);
@@ -75,7 +75,8 @@ function StatusPageInner() {
   }, [paramTopic, status]);
 
   const job = status?.job ?? null;
-  const running = job?.status === 'running';
+  const interrupted = !!status?.interrupted;
+  const running = job?.status === 'running' && !interrupted;
 
   const staleCount = status
     ? (status.counts.wiki['files-changed'] + status.counts.wiki['older-template'] + status.counts.wiki['missing-or-failed']) +
@@ -248,6 +249,23 @@ function StatusPageInner() {
                 >
                   Rebuild from scratch
                 </button>
+                {interrupted && (
+                  <button
+                    type="button"
+                    onClick={() => void resume()}
+                    disabled={busy}
+                    style={{
+                      ...btnBase,
+                      border: '1px solid #0f62fe',
+                      background: '#0f62fe',
+                      color: '#fff',
+                      ...(busy ? btnDisabled : {}),
+                    }}
+                    aria-label="Resume the interrupted job"
+                  >
+                    Resume
+                  </button>
+                )}
                 {running && (
                   <button
                     type="button"
@@ -286,11 +304,17 @@ function StatusPageInner() {
             {job && (
               <section aria-labelledby="job-heading" style={{ marginBottom: '28px' }}>
                 <h2 id="job-heading" style={{ fontSize: '15px', fontWeight: 600, marginBottom: '10px' }}>
-                  {running ? 'Running Job' : 'Latest Job'}
+                  {interrupted ? 'Interrupted job' : running ? 'Running Job' : 'Latest Job'}
                 </h2>
+                {interrupted && (
+                  <p style={{ fontSize: '13px', margin: '0 0 10px' }}>
+                    The last job was interrupted at {job.finished} of {job.total} topics (server
+                    restarted or stopped).
+                  </p>
+                )}
                 <div style={{ fontSize: '13px', display: 'flex', gap: '16px', flexWrap: 'wrap', marginBottom: '10px' }}>
                   <span>
-                    Status: <strong>{job.status}</strong>
+                    Status: <strong>{interrupted ? 'Interrupted' : job.status}</strong>
                   </span>
                   <span>
                     Progress: {job.finished}/{job.total}

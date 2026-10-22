@@ -134,6 +134,10 @@ export interface WikiJob {
   finishedAt?: string; // ISO-8601
   heartbeatAt: string; // ISO-8601
   cancelRequested?: boolean;
+  /** The original request that created this job (written at start for all kinds). */
+  request?: WikiJobRequest;
+  /** Slugs whose topics have finished (succeeded OR failed); used for resume. */
+  doneSlugs?: string[];
 }
 
 export interface WikiJobSummary {

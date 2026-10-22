@@ -195,8 +195,154 @@ class LocalDetachedRunner implements JobRunner {
     return flagged;
   }
 
-  async resume(_branch: string): Promise<{ jobId: string }> {
-    throw new Error('resume arrives in phase 7');
+  async resume(branch: string): Promise<{ jobId: string }> {
+    const snap = await getSnapshot(branch);
+    const job = snap?.job ?? null;
+
+    if (!job) {
+      throw new Error('Nothing to resume');
+    }
+    if (isJobLive(job)) {
+      throw new JobAlreadyRunningError(job.id);
+    }
+    if (job.status !== 'running') {
+      throw new Error('Nothing to resume');
+    }
+    // job.status === 'running' and not live → interrupted
+    if (!job.request) {
+      throw new Error('This job cannot be resumed; start a new one.');
+    }
+
+    const jobId = job.id;
+
+    // Acquire lease for this existing job id (interrupted job is not live, so it works).
+    if (!(await this.acquireLease(branch, jobId))) {
+      throw new JobAlreadyRunningError(this.active.get(branch) ?? jobId);
+    }
+
+    try {
+      // Bump heartbeat to show it's alive again.
+      await updateJobFields(branch, jobId, { heartbeatAt: new Date().toISOString() });
+
+      if (job.kind === 'rebuild') {
+        // Staged pages were in memory only; restart the rebuild phase from scratch.
+        await updateJobFields(branch, jobId, {
+          finished: 0,
+          succeeded: 0,
+          failures: [],
+          doneSlugs: [],
+          currentSlugs: [],
+          heartbeatAt: new Date().toISOString(),
+        });
+        const freshJob: WikiJob = {
+          ...job,
+          finished: 0,
+          succeeded: 0,
+          failures: [],
+          doneSlugs: [],
+          currentSlugs: [],
+          heartbeatAt: new Date().toISOString(),
+        };
+        console.log(`${LOG} ${jobId} resume rebuild on ${branch}`);
+        void this.runRebuild(branch, freshJob).catch((e) =>
+          console.error(`${LOG} ${jobId} rebuild runner crashed unexpectedly:`, e),
+        );
+        return { jobId };
+      }
+
+      // For refresh kinds: re-plan and skip already-done slugs.
+      const plan = await planFor(branch, job.request);
+      const doneSlugs = new Set(job.doneSlugs ?? []);
+
+      if (!plan || plan.items.length === 0) {
+        // Nothing to do at all — finish the job now.
+        const finalStatus: WikiJobStatus = job.failures.length > 0 ? 'completed-with-errors' : 'completed';
+        const finishedAt = new Date().toISOString();
+        await updateJobFields(branch, jobId, {
+          status: finalStatus,
+          finished: job.finished,
+          succeeded: job.succeeded,
+          failures: job.failures,
+          currentSlugs: [],
+          finishedAt,
+          heartbeatAt: finishedAt,
+        });
+        await appendRecentJob(branch, {
+          id: jobId,
+          kind: job.kind,
+          status: finalStatus,
+          total: job.total,
+          finished: job.finished,
+          succeeded: job.succeeded,
+          failed: job.failures.length,
+          startedAt: job.startedAt,
+          finishedAt,
+        });
+        await this.releaseLease(branch, jobId);
+        return { jobId };
+      }
+
+      // Filter out already-done items.
+      const remainingItems = plan.items.filter((item) => !doneSlugs.has(item.topic.slug));
+
+      if (remainingItems.length === 0) {
+        // All items already done — finish.
+        const finalStatus: WikiJobStatus = job.failures.length > 0 ? 'completed-with-errors' : 'completed';
+        const finishedAt = new Date().toISOString();
+        await updateJobFields(branch, jobId, {
+          status: finalStatus,
+          finished: job.finished,
+          succeeded: job.succeeded,
+          failures: job.failures,
+          currentSlugs: [],
+          finishedAt,
+          heartbeatAt: finishedAt,
+        });
+        await appendRecentJob(branch, {
+          id: jobId,
+          kind: job.kind,
+          status: finalStatus,
+          total: job.total,
+          finished: job.finished,
+          succeeded: job.succeeded,
+          failed: job.failures.length,
+          startedAt: job.startedAt,
+          finishedAt,
+        });
+        await this.releaseLease(branch, jobId);
+        return { jobId };
+      }
+
+      const resumedPlan: Plan = { ...plan, items: remainingItems };
+      // total = finished so far + remaining items so progress bar is coherent.
+      const newTotal = job.finished + remainingItems.length;
+      await updateJobFields(branch, jobId, {
+        total: newTotal,
+        heartbeatAt: new Date().toISOString(),
+      });
+      const resumedJob: WikiJob = {
+        ...job,
+        total: newTotal,
+        heartbeatAt: new Date().toISOString(),
+      };
+
+      console.log(
+        `${LOG} ${jobId} resume on ${branch}: ${remainingItems.length} remaining (${doneSlugs.size} already done)`,
+      );
+
+      void this.run(branch, resumedJob, resumedPlan, {
+        initFinished: job.finished,
+        initSucceeded: job.succeeded,
+        initFailures: [...job.failures],
+        initDoneSlugs: [...doneSlugs],
+      }).catch((e) =>
+        console.error(`${LOG} ${jobId} runner crashed unexpectedly:`, e),
+      );
+      return { jobId };
+    } catch (err) {
+      await this.releaseLease(branch, jobId);
+      throw err;
+    }
   }
 
   async start(branch: string, request: WikiJobRequest): Promise<StartResult> {
@@ -229,6 +375,8 @@ class LocalDetachedRunner implements JobRunner {
           startedAt: now,
           heartbeatAt: now,
           cancelRequested: false,
+          request,
+          doneSlugs: [],
         };
         await updateSnapshotJob(branch, job);
         console.log(`${LOG} ${jobId} rebuild started on ${branch}`);
@@ -261,6 +409,8 @@ class LocalDetachedRunner implements JobRunner {
         startedAt: now,
         heartbeatAt: now,
         cancelRequested: false,
+        request,
+        doneSlugs: [],
       };
       await updateSnapshotJob(branch, job);
       console.log(`${LOG} ${jobId} started on ${branch}: ${job.total} topic(s)`);
@@ -276,13 +426,25 @@ class LocalDetachedRunner implements JobRunner {
     }
   }
 
-  /** Whole job body. Never rejects; always writes a final status. */
-  private async run(branch: string, job: WikiJob, plan: Plan): Promise<void> {
+  /** Whole job body. Never rejects; always writes a final status.
+   *  Pass `init` when resuming to seed counters from the interrupted job. */
+  private async run(
+    branch: string,
+    job: WikiJob,
+    plan: Plan,
+    init?: {
+      initFinished: number;
+      initSucceeded: number;
+      initFailures: WikiJobFailure[];
+      initDoneSlugs: string[];
+    },
+  ): Promise<void> {
     const jobId = job.id;
     let status: WikiJobStatus = 'failed';
-    let finished = 0;
-    let succeeded = 0;
-    const failures: WikiJobFailure[] = [];
+    let finished = init?.initFinished ?? 0;
+    let succeeded = init?.initSucceeded ?? 0;
+    const failures: WikiJobFailure[] = init?.initFailures ? [...init.initFailures] : [];
+    const doneSlugs: string[] = init?.initDoneSlugs ? [...init.initDoneSlugs] : [];
     const inFlight = new Set<string>();
 
     const beat = () => {
@@ -301,6 +463,7 @@ class LocalDetachedRunner implements JobRunner {
           succeeded,
           failures: [...failures],
           currentSlugs: [...inFlight],
+          doneSlugs: [...doneSlugs],
           heartbeatAt: new Date().toISOString(),
         });
       } catch (e) {
@@ -314,10 +477,11 @@ class LocalDetachedRunner implements JobRunner {
           const cancelled = await this.refreshPages(branch, jobId, plan, {
             inFlight,
             writeProgress,
-            onResult: (ok, failure) => {
+            onResult: (ok, failure, slug) => {
               finished++;
               if (ok) succeeded++;
               else if (failure) failures.push(failure);
+              if (slug) doneSlugs.push(slug);
             },
           });
           if (cancelled) {
@@ -345,6 +509,7 @@ class LocalDetachedRunner implements JobRunner {
           succeeded,
           failures,
           currentSlugs: [],
+          doneSlugs: [...doneSlugs],
           finishedAt,
           heartbeatAt: finishedAt,
         });
@@ -377,7 +542,7 @@ class LocalDetachedRunner implements JobRunner {
     ctx: {
       inFlight: Set<string>;
       writeProgress: () => Promise<void>;
-      onResult: (ok: boolean, failure?: WikiJobFailure) => void;
+      onResult: (ok: boolean, failure?: WikiJobFailure, slug?: string) => void;
     },
   ): Promise<boolean> {
     const queue = [...plan.items];
@@ -400,7 +565,7 @@ class LocalDetachedRunner implements JobRunner {
         await ctx.writeProgress();
         const failure = await this.refreshTopic(branch, plan, item);
         ctx.inFlight.delete(slug);
-        ctx.onResult(!failure, failure ?? undefined);
+        ctx.onResult(!failure, failure ?? undefined, slug);
         await ctx.writeProgress();
       }
     };
@@ -445,6 +610,7 @@ class LocalDetachedRunner implements JobRunner {
     let finished = 0;
     let succeeded = 0;
     const failures: WikiJobFailure[] = [];
+    const doneSlugs: string[] = [];
     const inFlight = new Set<string>();
 
     const beat = () => {
@@ -461,6 +627,7 @@ class LocalDetachedRunner implements JobRunner {
           succeeded,
           failures: [...failures],
           currentSlugs: [...inFlight],
+          doneSlugs: [...doneSlugs],
           heartbeatAt: new Date().toISOString(),
         });
       } catch (e) {

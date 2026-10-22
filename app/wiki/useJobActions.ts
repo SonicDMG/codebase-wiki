@@ -27,19 +27,20 @@ export function useJobActions(
   message: string | null;
   start: (request?: WikiJobRequest) => Promise<void>;
   stop: () => Promise<void>;
+  resume: () => Promise<void>;
 } {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const post = useCallback(
-    async (action: 'start' | 'stop', request: WikiJobRequest = { kind: 'refresh-stale' }) => {
+    async (action: 'start' | 'stop' | 'resume', request: WikiJobRequest = { kind: 'refresh-stale' }) => {
       setBusy(true);
       setMessage(null);
       try {
         const res = await fetch('/api/wiki/jobs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ branch, action, ...request }),
+          body: JSON.stringify(action === 'resume' ? { branch, action } : { branch, action, ...request }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -64,6 +65,7 @@ export function useJobActions(
     [post]
   );
   const stop = useCallback(() => post('stop'), [post]);
+  const resume = useCallback(() => post('resume'), [post]);
 
-  return { busy, message, start, stop };
+  return { busy, message, start, stop, resume };
 }

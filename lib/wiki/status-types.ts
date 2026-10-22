@@ -25,6 +25,8 @@ export interface WikiStatusTopic {
 export interface WikiStatusResponse {
   /** Current or latest job on this branch, or null. */
   job: WikiJob | null;
+  /** True when job.status==='running' but the heartbeat is stale (>30 s). */
+  interrupted: boolean;
   /** Last (up to 10) finished jobs, newest first. */
   recentJobs: WikiJobSummary[];
   branch: string;

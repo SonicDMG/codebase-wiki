@@ -20,7 +20,8 @@ export function useWikiStatus(branch: string | null): {
   const [error, setError] = useState<string | null>(null);
   const loadRef = useRef<() => void>(() => {});
 
-  const jobRunning = status?.job?.status === 'running';
+  // Fast polling only for live jobs; an interrupted job is not progressing.
+  const jobRunning = status?.job?.status === 'running' && !status.interrupted;
 
   useEffect(() => {
     if (!branch) return;

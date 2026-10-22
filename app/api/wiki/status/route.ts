@@ -12,6 +12,7 @@ import { decodeFileList } from '@/lib/wiki/snapshot';
 import { classifyStaleness } from '@/lib/wiki/staleness';
 import { TEMPLATE_VERSION } from '@/lib/wiki/prompts';
 import { backfillBranch, hasUnfingerprintedPages } from '@/lib/wiki/backfill';
+import { isJobLive } from '@/lib/wiki/runner';
 import type { StateCounts, WikiStatusResponse } from '@/lib/wiki/status-types';
 
 export const runtime = 'nodejs';
@@ -50,8 +51,10 @@ export async function GET(req: NextRequest) {
     const counts = { wiki: zeroCounts(), picture: zeroCounts() };
 
     if (!snapshot || topics.length === 0) {
+      const emptyJob = snapshot?.job ?? null;
       const empty: WikiStatusResponse = {
-        job: snapshot?.job ?? null,
+        job: emptyJob,
+        interrupted: emptyJob?.status === 'running' && !isJobLive(emptyJob),
         recentJobs: snapshot?.recentJobs ?? [],
         branch,
         headSha: '',
@@ -63,8 +66,10 @@ export async function GET(req: NextRequest) {
     }
 
     const entries = decodeFileList(snapshot.fileListText);
+    const snapshotJob = snapshot.job ?? null;
     const result: WikiStatusResponse = {
-      job: snapshot.job ?? null,
+      job: snapshotJob,
+      interrupted: snapshotJob?.status === 'running' && !isJobLive(snapshotJob),
       recentJobs: snapshot.recentJobs ?? [],
       branch,
       headSha: snapshot.headSha,
