@@ -39,6 +39,7 @@ export interface PublicTopic {
   generatedPage?: string;
   generatedPagePicture?: string;
   pageCommitSha?: string;
+  updatedAt?: string;
 }
 
 /** Topics grouped by section (stable — stored order is kept within a section). */
@@ -53,6 +54,7 @@ export function toPublicTopics(topics: WikiTopicDoc[]): PublicTopic[] {
     generatedPage: t.generatedPage,
     generatedPagePicture: t.generatedPagePicture,
     pageCommitSha: t.pageCommitSha,
+    updatedAt: t.updatedAt,
   }));
 }
 

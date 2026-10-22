@@ -81,7 +81,7 @@ export async function GET(req: NextRequest) {
         const picture = classifyStaleness(t, 'picture', entries);
         counts.wiki[wiki.state]++;
         counts.picture[picture.state]++;
-        return { slug: t.slug, title: t.title, wiki, picture };
+        return { slug: t.slug, title: t.title, wiki, picture, updatedAt: t.updatedAt };
       }),
     };
     return NextResponse.json(result);

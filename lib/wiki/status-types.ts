@@ -20,6 +20,7 @@ export interface WikiStatusTopic {
   title: string;
   wiki: StatusEntry;
   picture: StatusEntry;
+  updatedAt?: string;
 }
 
 export interface WikiStatusResponse {
