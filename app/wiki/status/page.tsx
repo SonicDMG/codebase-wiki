@@ -7,6 +7,7 @@ import { paletteCss } from '../palettes';
 import { StatusDot } from '../StatusDot';
 import { useWikiStatus } from '../useWikiStatus';
 import { useJobActions, jobKindLabel } from '../useJobActions';
+import { JobProgress } from '../JobProgress';
 import { ConfirmRebuildDialog } from '../ConfirmRebuildDialog';
 
 // ── State labels (matching WikiStatusPill) ─────────────────────────────────
@@ -89,10 +90,7 @@ function StatusPageInner() {
       status.counts.picture['missing-or-failed']
     : 0;
 
-  const progressPct =
-    running && job && job.total > 0
-      ? Math.round((job.finished / job.total) * 100)
-      : null;
+  const workingSlugs = running && job ? job.currentSlugs : [];
 
   return (
     <div
@@ -337,46 +335,8 @@ function StatusPageInner() {
                   )}
                 </div>
 
-                {/* Progress bar or "designing topics" placeholder */}
-                {running && (
-                  job.total === 0 ? (
-                    <div
-                      style={{
-                        fontSize: '12px',
-                        color: 'var(--w-textMuted)',
-                        marginBottom: '12px',
-                        fontStyle: 'italic',
-                      }}
-                    >
-                      Designing topics…
-                    </div>
-                  ) : (
-                    <div
-                      role="progressbar"
-                      aria-valuenow={job.finished}
-                      aria-valuemin={0}
-                      aria-valuemax={job.total}
-                      aria-label={`${job.kind === 'integrity-check' ? 'Checking' : 'Refreshing'} ${job.finished} of ${job.total}`}
-                      style={{
-                        height: '8px',
-                        background: 'var(--w-border)',
-                        borderRadius: '4px',
-                        overflow: 'hidden',
-                        marginBottom: '12px',
-                      }}
-                    >
-                      <div
-                        style={{
-                          height: '100%',
-                          width: `${progressPct ?? 0}%`,
-                          background: 'var(--w-accentText)',
-                          borderRadius: '4px',
-                          transition: 'width 0.4s ease',
-                        }}
-                      />
-                    </div>
-                  )
-                )}
+                {/* Progress bar (also mounted after the job ends so the final announcement fires) */}
+                <JobProgress job={job} mode={mode} interrupted={interrupted} announce hideVisual={!running} />
 
                 {/* Failures */}
                 {job.failures.length > 0 && (
@@ -506,18 +466,35 @@ function StatusPageInner() {
                   <tbody>
                     {status.topics.map((topic) => {
                       const isHighlighted = paramTopic === topic.slug;
+                      const isWorking = workingSlugs.includes(topic.slug);
                       return (
                         <tr
                           key={topic.slug}
                           id={`topic-${topic.slug}`}
                           ref={isHighlighted ? highlightRef : undefined}
                           aria-current={isHighlighted ? 'true' : undefined}
+                          aria-busy={isWorking ? true : undefined}
                           style={{
                             borderBottom: '1px solid rgba(128,128,128,0.1)',
-                            background: isHighlighted ? 'var(--w-amberLight)' : undefined,
+                            background: isHighlighted || isWorking ? 'var(--w-amberLight)' : undefined,
+                            boxShadow: isWorking ? 'inset 3px 0 0 var(--w-amber, #F5A623)' : undefined,
                           }}
                         >
-                          <td style={tdStyle}>{topic.title}</td>
+                          <td style={tdStyle}>
+                            {topic.title}
+                            {isWorking && (
+                              <span
+                                style={{
+                                  marginLeft: '8px',
+                                  fontSize: '11px',
+                                  fontWeight: 600,
+                                  color: 'var(--w-accentText)',
+                                }}
+                              >
+                                Working…
+                              </span>
+                            )}
+                          </td>
                           <td style={tdStyle}>
                             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
                               <StatusDot state={topic.wiki.state} mode="wiki" reason={topic.wiki.reason} />

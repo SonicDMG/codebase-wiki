@@ -838,10 +838,12 @@ export default function WikiPage() {
                       <div style={styles.tocSection}>{topic.section}</div>
                     )}
                     <div
+                      aria-busy={wikiStatus?.job?.status === 'running' && !wikiStatus.interrupted && wikiStatus.job.currentSlugs.includes(topic.slug) ? true : undefined}
                       style={{
                         display: 'flex',
                         alignItems: 'center',
                         ...(activeSlug === topic.slug ? styles.tocItemActive : {}),
+                        ...(wikiStatus?.job?.status === 'running' && !wikiStatus.interrupted && wikiStatus.job.currentSlugs.includes(topic.slug) ? { background: 'var(--w-amberLight)' } : {}),
                         paddingLeft: activeSlug === topic.slug ? '10px' : '13px',
                       }}
                     >

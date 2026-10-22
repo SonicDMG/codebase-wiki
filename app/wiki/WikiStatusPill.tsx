@@ -5,6 +5,7 @@ import type { CSSProperties } from 'react';
 import type { WikiStatusResponse, StalenessState } from '@/lib/wiki/status-types';
 import { StatusDot } from './StatusDot';
 import { useJobActions } from './useJobActions';
+import { JobProgress } from './JobProgress';
 import { ConfirmRebuildDialog } from './ConfirmRebuildDialog';
 
 type AnswerMode = 'wiki' | 'picture';
@@ -202,6 +203,17 @@ export function WikiStatusPill({
         </span>
       </button>
 
+      {job && (
+        <JobProgress
+          job={job}
+          mode={mode}
+          interrupted={interrupted}
+          compact
+          announce
+          hideVisual={!running}
+        />
+      )}
+
       {open && (
         <div
           id="wiki-status-dropdown-dialog"
@@ -257,6 +269,7 @@ export function WikiStatusPill({
               <div style={s.divider} />
               <div style={s.section}>
                 <div style={s.jobSection}>
+                  {running && <JobProgress job={job} mode={mode} />}
                   <div style={s.jobTitle}>
                     {running ? (
                       <span>
@@ -382,7 +395,9 @@ export function WikiStatusPill({
 const s: Record<string, CSSProperties> = {
   pillWrapper: {
     position: 'relative',
-    display: 'inline-block',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '8px',
     marginRight: '10px',
   },
   pillButton: {
