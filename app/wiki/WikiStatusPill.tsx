@@ -38,12 +38,13 @@ export function WikiStatusPill({
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
 
-  // Close dropdown on outside click or Escape
+  // Close dropdown on outside click or Escape. While the rebuild confirm dialog
+  // is open, Escape belongs to the dialog alone.
   useEffect(() => {
     if (!open) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
+      if (e.key === 'Escape' && !rebuildDialogOpen) {
         e.preventDefault();
         setOpen(false);
         buttonRef.current?.focus();
@@ -62,7 +63,7 @@ export function WikiStatusPill({
       document.removeEventListener('keydown', handleKeyDown);
       document.removeEventListener('mousedown', handleClickOutside);
     };
-  }, [open]);
+  }, [open, rebuildDialogOpen]);
 
   const job = status?.job ?? null;
   const interrupted = !!status?.interrupted;
