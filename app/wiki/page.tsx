@@ -29,6 +29,7 @@ import type { Root } from 'mdast';
 import { StatusDot } from './StatusDot';
 import { useWikiStatus } from './useWikiStatus';
 import { WikiStatusPill } from './WikiStatusPill';
+import { PALETTES } from './palettes';
 
 const mdParser = unified().use(remarkParse).use(remarkGfm);
 
@@ -858,27 +859,57 @@ export default function WikiPage() {
             ) : tocTopics.length === 0 ? (
               <div style={styles.tocLoading}>No topics available.</div>
             ) : (
-              tocTopics.map((topic, idx) => (
-                <div key={topic.slug}>
-                  {topic.section && topic.section !== tocTopics[idx - 1]?.section && (
-                    <div style={styles.tocSection}>{topic.section}</div>
-                  )}
-                  <button
-                    style={{ ...styles.tocItem, ...(activeSlug === topic.slug ? styles.tocItemActive : {}) }}
-                    onClick={() => handleTopicClick(topic)}
-                    title={topic.description}
-                    disabled={loading}
-                  >
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      {(() => {
-                        const entry = wikiStatus?.topics.find((s) => s.slug === topic.slug)?.[answerMode];
-                        return entry ? <StatusDot state={entry.state} mode={answerMode} reason={entry.reason} /> : null;
-                      })()}
-                      <span>{topic.title}</span>
-                    </span>
-                  </button>
-                </div>
-              ))
+              tocTopics.map((topic, idx) => {
+                const entry = wikiStatus?.topics.find((s) => s.slug === topic.slug)?.[answerMode];
+                return (
+                  <div key={topic.slug}>
+                    {topic.section && topic.section !== tocTopics[idx - 1]?.section && (
+                      <div style={styles.tocSection}>{topic.section}</div>
+                    )}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        ...(activeSlug === topic.slug ? styles.tocItemActive : {}),
+                        paddingLeft: activeSlug === topic.slug ? '10px' : '13px',
+                      }}
+                    >
+                      {entry ? (
+                        <a
+                          href={`/wiki/status?branch=${encodeURIComponent(wikiBranch ?? '')}&topic=${encodeURIComponent(topic.slug)}`}
+                          title={`Status details for ${topic.title}`}
+                          aria-label={`Status details for ${topic.title}`}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            padding: '4px 3px',
+                            flexShrink: 0,
+                            textDecoration: 'none',
+                          }}
+                        >
+                          <StatusDot state={entry.state} mode={answerMode} reason={entry.reason} />
+                        </a>
+                      ) : null}
+                      <button
+                        style={{
+                          ...styles.tocItem,
+                          background: 'none',
+                          borderLeft: 'none',
+                          paddingLeft: '5px',
+                          flex: 1,
+                          minWidth: 0,
+                        }}
+                        onClick={() => handleTopicClick(topic)}
+                        title={topic.description}
+                        disabled={loading}
+                      >
+                        <span>{topic.title}</span>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
             )
           )}
         </nav>
@@ -2218,57 +2249,6 @@ function GlobalMdStyles() {
 // the root (THEME_CSS): the wiki's light amber look, or the Field Guide's
 // night-sky Lumentide look. Mermaid needs real colours, so it reads the
 // wiki palette directly.
-const PALETTES = {
-  wiki: {
-    bg:          '#ffffff',
-    surface:     '#f7f8fa',
-    border:      '#e2e4e8',
-    text:        '#1a1a1f',
-    textMuted:   '#57606a',
-    textFaint:   '#8b949e',
-    amber:       c.amber,
-    amberLight:  '#fff7e6',
-    amberBorder: '#fcd389',
-    amberGlow:   c.amberGlow,
-    accentText:  '#92600a',
-    onAccent:    '#1a1a1f',
-    codeBg:      '#1E1E22',
-    codeBorder:  '#2A2A2F',
-    codeText:    '#e2e4e8',
-    fontBody:    '-apple-system, "Segoe UI", system-ui, sans-serif',
-    fontHeading: 'Georgia, "Times New Roman", serif',
-    titleSize:   '17px',
-    questionSize: '26px',
-    questionLine: '1.3',
-    fontLabel:   'inherit',
-    panelBorder: '1px',
-  },
-  picture: {
-    bg:          '#0b1020',
-    surface:     '#141c33',
-    border:      '#26325a',
-    text:        '#f3f5ff',
-    textMuted:   '#a8b3d6',
-    textFaint:   '#7d88ad',
-    amber:       '#ffb347',
-    amberLight:  '#1f2a48',
-    amberBorder: '#3a4a7a',
-    amberGlow:   '#ffb34733',
-    accentText:  '#ffe066',
-    onAccent:    '#0b1020',
-    codeBg:      '#0a0f1d',
-    codeBorder:  '#26325a',
-    codeText:    '#f3f5ff',
-    fontBody:    '"Nunito", "Segoe UI", system-ui, sans-serif',
-    fontHeading: '"Press Start 2P", "Courier New", monospace',
-    titleSize:   '13px',
-    questionSize: '17px',
-    questionLine: '1.7',
-    fontLabel:   '"Press Start 2P", "Courier New", monospace',
-    panelBorder: '3px',
-  },
-} as const;
-
 type PaletteKey = keyof typeof PALETTES.wiki;
 
 const w = Object.fromEntries(

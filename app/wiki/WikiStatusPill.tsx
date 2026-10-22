@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import type { CSSProperties } from 'react';
 import type { WikiStatusResponse, StalenessState } from '@/lib/wiki/status-types';
 import { StatusDot } from './StatusDot';
+import { useJobActions } from './useJobActions';
 
 type AnswerMode = 'wiki' | 'picture';
 
@@ -26,8 +27,7 @@ export function WikiStatusPill({
   refresh: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const { busy, message, start, stop } = useJobActions(branch, refresh);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -99,34 +99,6 @@ export function WikiStatusPill({
   } else if (staleCount > 0) {
     healthColor = isWiki ? '#b35900' : '#ffb347'; // amber
   }
-
-  const post = useCallback(
-    async (action: 'start' | 'stop') => {
-      setBusy(true);
-      setMessage(null);
-      try {
-        const res = await fetch('/api/wiki/jobs', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ branch, action, kind: 'refresh-stale' }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          setMessage(data?.error ?? `Request failed (${res.status})`);
-        } else if (data?.status === 'nothing-to-do') {
-          setMessage('Nothing to refresh.');
-        } else if (action === 'stop' && data?.message) {
-          setMessage(data.message);
-        }
-      } catch (err) {
-        setMessage(err instanceof Error ? err.message : 'Request failed');
-      } finally {
-        setBusy(false);
-        refresh();
-      }
-    },
-    [branch, refresh]
-  );
 
   if (!status) {
     return (
@@ -296,7 +268,7 @@ export function WikiStatusPill({
               <button
                 type="button"
                 style={s.stopBtn}
-                onClick={() => void post('stop')}
+                onClick={() => void stop()}
                 disabled={busy || !!job?.cancelRequested}
                 aria-label="Stop refreshing stale pages"
               >
@@ -309,7 +281,7 @@ export function WikiStatusPill({
                   ...s.refreshBtn,
                   ...(staleCount === 0 || busy ? s.btnDisabled : {}),
                 }}
-                onClick={() => void post('start')}
+                onClick={() => void start()}
                 disabled={staleCount === 0 || busy}
                 title={staleCount === 0 ? 'All pages are up to date' : undefined}
                 aria-label={`Refresh ${staleCount} stale pages across Wiki and Field Guide`}
@@ -317,6 +289,16 @@ export function WikiStatusPill({
                 Refresh stale ({staleCount})
               </button>
             )}
+          </div>
+
+          <div style={s.divider} />
+          <div style={s.statusPageRow}>
+            <a
+              href={`/wiki/status?branch=${encodeURIComponent(branch)}`}
+              style={s.statusPageLink}
+            >
+              Status page →
+            </a>
           </div>
         </div>
       )}
@@ -484,5 +466,15 @@ const s: Record<string, CSSProperties> = {
   btnDisabled: {
     opacity: 0.5,
     cursor: 'not-allowed',
+  },
+  statusPageRow: {
+    padding: '4px 6px',
+    textAlign: 'center',
+  },
+  statusPageLink: {
+    fontSize: '11px',
+    color: 'var(--w-accentText, #92600a)',
+    textDecoration: 'none',
+    fontWeight: 500,
   },
 };
