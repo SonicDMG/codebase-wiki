@@ -28,7 +28,7 @@ import { visit } from 'unist-util-visit';
 import type { Root } from 'mdast';
 import { StatusDot } from './StatusDot';
 import { useWikiStatus } from './useWikiStatus';
-import { RefreshStaleButton } from './RefreshStaleButton';
+import { WikiStatusPill } from './WikiStatusPill';
 
 const mdParser = unified().use(remarkParse).use(remarkGfm);
 
@@ -818,7 +818,7 @@ export default function WikiPage() {
           </div>
         )}
         {wikiBranch && (
-          <RefreshStaleButton branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
+          <WikiStatusPill branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
         )}
         {syncWarning && (
           <span
