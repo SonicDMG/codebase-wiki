@@ -17,7 +17,7 @@
 import { getFileTreeResult } from '@/lib/github';
 import { computeFingerprint } from './fingerprint';
 import { FETCH_FAILED_PAGE, NO_SOURCE_FILES_PAGE, REPO_NAME, REPO_OWNER } from './generate';
-import { TEMPLATE_VERSION } from './prompts';
+import { ORIGINAL_TEMPLATE_VERSION } from './prompts';
 import { hasPictureCards } from './staleness';
 import { getStoredTopics, updateTopicFields } from './store';
 import type { SnapshotEntry, WikiTopicDoc } from './types';
@@ -112,15 +112,15 @@ async function runBackfill(branch: string): Promise<BackfillResult> {
       continue;
     }
 
-    // Assumption: existing pages were generated with the current template, so
-    // stamp the current TEMPLATE_VERSION (the old template version wasn't recorded).
+    // Pages without a fingerprint predate version tracking, so they came from the
+    // original templates: stamp ORIGINAL_TEMPLATE_VERSION, not the current one.
     const fingerprint = computeFingerprint(topic.scope, tree);
     try {
       await updateTopicFields(
         topic._id,
         mode === 'wiki'
-          ? { pageFingerprint: fingerprint, pageTemplateVersion: TEMPLATE_VERSION }
-          : { pagePictureFingerprint: fingerprint, pagePictureTemplateVersion: TEMPLATE_VERSION },
+          ? { pageFingerprint: fingerprint, pageTemplateVersion: ORIGINAL_TEMPLATE_VERSION }
+          : { pagePictureFingerprint: fingerprint, pagePictureTemplateVersion: ORIGINAL_TEMPLATE_VERSION },
       );
       result.filled++;
     } catch (err) {

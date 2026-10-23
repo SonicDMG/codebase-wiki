@@ -4,13 +4,13 @@
  * Returns one of four states:
  *   'current'           — fingerprint and template version both match.
  *   'files-changed'     — fingerprint differs (files in scope changed content).
- *   'older-template'    — template version differs from TEMPLATE_VERSION.
+ *   'older-template'    — template version differs from the mode's TEMPLATE_VERSIONS entry.
  *   'missing-or-failed' — page is absent, empty, or (picture) has no valid cards.
  *
  * A different head commit alone is NOT stale (fingerprints are content-based).
  */
 
-import { TEMPLATE_VERSION } from './prompts';
+import { TEMPLATE_VERSIONS } from './prompts';
 import { computeFingerprint } from './fingerprint';
 import type { SnapshotEntry, WikiTopicDoc } from './types';
 
@@ -70,10 +70,11 @@ export function classifyStaleness(
   }
 
   // 4. Template version mismatch.
-  if (storedTemplateVersion !== TEMPLATE_VERSION) {
+  const currentTemplateVersion = TEMPLATE_VERSIONS[mode];
+  if (storedTemplateVersion !== currentTemplateVersion) {
     return {
       state: 'older-template',
-      reason: `generated with template v${storedTemplateVersion ?? '?'}, current is v${TEMPLATE_VERSION}`,
+      reason: `generated with template v${storedTemplateVersion ?? '?'}, current is v${currentTemplateVersion}`,
     };
   }
 

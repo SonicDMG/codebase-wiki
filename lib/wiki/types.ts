@@ -1,7 +1,7 @@
 /**
  * types.ts — shared data shapes for the wiki topic persistence layer.
  *
- * Two document kinds share the `wiki_toc` Astra collection:
+ * Two document kinds share the `wiki_toc_v2` Astra collection:
  *   - topic:    one per topic per branch, vector-indexed on title+description.
  *   - snapshot: one per branch, not vector-indexed; tracks the file list and
  *               the 2-minute sync lease.

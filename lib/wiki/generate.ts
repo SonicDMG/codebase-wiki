@@ -20,7 +20,7 @@ import {
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
 import { TOPIC_SECTIONS } from './types';
-import { wikiPrompt, picturePrompt, TEMPLATE_VERSION } from './prompts';
+import { wikiPrompt, picturePrompt, TEMPLATE_VERSIONS } from './prompts';
 import { computeFingerprint } from './fingerprint';
 import { hasPictureCards } from './staleness';
 import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
@@ -408,12 +408,12 @@ export function pageFieldsToStore(
   if (pages.wiki !== undefined) {
     fields.generatedPage = pages.wiki;
     fields.pageFingerprint = pages.fingerprint;
-    fields.pageTemplateVersion = TEMPLATE_VERSION;
+    fields.pageTemplateVersion = TEMPLATE_VERSIONS.wiki;
   }
   if (pages.picture !== undefined) {
     fields.generatedPagePicture = pages.picture;
     fields.pagePictureFingerprint = pages.fingerprint;
-    fields.pagePictureTemplateVersion = TEMPLATE_VERSION;
+    fields.pagePictureTemplateVersion = TEMPLATE_VERSIONS.picture;
   }
   return fields;
 }

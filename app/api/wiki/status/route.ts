@@ -10,7 +10,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getStoredTopics, getSnapshot } from '@/lib/wiki/store';
 import { decodeFileList } from '@/lib/wiki/snapshot';
 import { classifyStaleness } from '@/lib/wiki/staleness';
-import { TEMPLATE_VERSION } from '@/lib/wiki/prompts';
+import { TEMPLATE_VERSIONS } from '@/lib/wiki/prompts';
 import { backfillBranch, hasUnfingerprintedPages } from '@/lib/wiki/backfill';
 import { isJobLive } from '@/lib/wiki/runner';
 import type { StateCounts, WikiStatusResponse } from '@/lib/wiki/status-types';
@@ -58,7 +58,7 @@ export async function GET(req: NextRequest) {
         recentJobs: snapshot?.recentJobs ?? [],
         branch,
         headSha: '',
-        templateVersion: TEMPLATE_VERSION,
+        templateVersion: TEMPLATE_VERSIONS,
         counts,
         topics: [],
       };
@@ -73,7 +73,7 @@ export async function GET(req: NextRequest) {
       recentJobs: snapshot.recentJobs ?? [],
       branch,
       headSha: snapshot.headSha,
-      templateVersion: TEMPLATE_VERSION,
+      templateVersion: TEMPLATE_VERSIONS,
       counts,
       ...(backfill ? { backfill } : {}),
       topics: topics.map((t) => {

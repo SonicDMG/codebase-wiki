@@ -19,7 +19,7 @@
  * current mode is generated when its conversation is open.
  */
 
-import { Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Children, Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -1821,6 +1821,23 @@ function buildComponents(streaming: boolean, commit: string | undefined, anchorO
       }
       return <pre {...rest}>{children}</pre>;
     },
+    // Wiki-page conventions: a "Sources: …" line closes each section and an
+    // "*Figure N: …*" line captions a diagram. They only get a class here; the
+    // look lives in MD_CSS and applies to Wiki mode alone.
+    p({ children }: { children?: React.ReactNode }) {
+      const kids = Children.toArray(children);
+      const first = kids[0];
+      if (typeof first === 'string' && /^Sources?:/.test(first.trimStart())) {
+        return <p className="md-sources">{children}</p>;
+      }
+      if (kids.length === 1 && isValidElement<{ children?: React.ReactNode }>(first) && first.type === 'em') {
+        const lead = Children.toArray(first.props.children)[0];
+        if (typeof lead === 'string' && /^Figure \d+/.test(lead)) {
+          return <p className="md-figcaption">{children}</p>;
+        }
+      }
+      return <p>{children}</p>;
+    },
     code({ className, children, ...rest }: React.HTMLAttributes<HTMLElement>) {
       const text = String(children ?? '').trimEnd();
       if (className === 'language-diagram') return <DiagramBlock source={text} streaming={streaming} />;
@@ -2166,6 +2183,19 @@ const MD_CSS = `
 
 .md-prose a { color: #b7791f; text-decoration: none; border-bottom: 1px solid #fcd389; }
 .md-prose a:hover { border-bottom-color: #F5A623; }
+
+/* Wiki mode only (the Field Guide is .md-picture): reference-page structure.
+   Sections are separated by a rule, tables carry the detail, every section
+   ends with a quiet "Sources:" line and diagrams are captioned "Figure N". */
+.md-prose:not(.md-picture) h2 { font-family: inherit; font-size: 20px; margin: 2em 0 0.7em; padding-bottom: 8px; }
+.md-prose:not(.md-picture) > h2:first-child { margin-top: 0; }
+.md-prose:not(.md-picture) h3 { font-size: 16.5px; font-weight: 700; margin: 1.6em 0 0.5em; color: #1a1a1f; }
+.md-prose:not(.md-picture) h4 { font-size: 15px; font-weight: 700; margin: 1.3em 0 0.4em; }
+.md-prose:not(.md-picture) td:first-child { font-weight: 500; }
+.md-prose:not(.md-picture) td code, .md-prose:not(.md-picture) th code { white-space: nowrap; }
+.md-prose:not(.md-picture) .md-sources { margin: -0.2em 0 0; padding-top: 10px; border-top: 1px dashed #e2e4e8; font-size: 12.5px; line-height: 1.9; color: #57606a; }
+.md-prose:not(.md-picture) .md-figcaption { margin: 0.6em 0 1.4em; text-align: center; font-size: 13px; color: #57606a; }
+.md-prose:not(.md-picture) .md-figcaption em { font-style: normal; }
 .md-prose figure svg { max-width: 100%; height: auto; }
 .diagram-zoom svg { width: 100%; max-width: none !important; height: auto; }
 

@@ -17,7 +17,22 @@ import { getDb } from '@walfly/db';
 import { VECTOR_DIMENSION, VECTOR_MODEL, VECTORIZE_MAX_CHARS } from '@walfly/db';
 import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult, WikiJob, WikiJobSummary } from './types';
 
-const WIKI_TOC_COLLECTION = 'wiki_toc';
+const WIKI_TOC_COLLECTION = 'wiki_toc_v2';
+
+/**
+ * The first collection. Its indexing options (fixed at creation) left the
+ * generated pages indexed, so a page over 8,000 bytes was rejected. It is
+ * copied into WIKI_TOC_COLLECTION once and then left untouched.
+ */
+const LEGACY_WIKI_TOC_COLLECTION = 'wiki_toc';
+
+/** Fields too large to index (Astra caps an indexed string at 8,000 bytes). */
+const WIKI_TOC_INDEXING_DENY = [
+  'fileListText',
+  'unclassifiedPaths',
+  'generatedPage',
+  'generatedPagePicture',
+];
 
 /** 2-minute lease in milliseconds. */
 const LEASE_DURATION_MS = 2 * 60 * 1000;
@@ -28,7 +43,28 @@ let collectionEnsured = false;
 let ensurePromise: Promise<void> | null = null;
 
 /**
- * Lazily create the `wiki_toc` collection if it does not exist yet.
+ * Copy every document of the legacy collection into the new one, so existing
+ * topics, pages and snapshots survive the switch without regenerating anything.
+ * Topics get their $vectorize back (reads do not return it).
+ */
+async function copyLegacyDocuments(db: ReturnType<typeof getDb>): Promise<number> {
+  const from = db.collection(LEGACY_WIKI_TOC_COLLECTION);
+  const to = db.collection(WIKI_TOC_COLLECTION);
+  let copied = 0;
+  for await (const doc of from.find({})) {
+    const copy: Record<string, unknown> = { ...doc };
+    if (copy.kind === 'topic') {
+      copy.$vectorize = `${copy.title} ${copy.description}`.slice(0, VECTORIZE_MAX_CHARS);
+    }
+    await to.findOneAndReplace({ _id: copy._id } as any, copy as any, { upsert: true });
+    copied++;
+  }
+  return copied;
+}
+
+/**
+ * Lazily create the `wiki_toc_v2` collection if it does not exist yet, filling
+ * it from the legacy `wiki_toc` collection when that exists.
  * Safe to call concurrently — the promise is deduped.
  */
 async function ensureWikiTocCollection(): Promise<Collection<WikiTopicDoc | WikiSnapshotDoc>> {
@@ -49,10 +85,21 @@ async function ensureWikiTocCollection(): Promise<Collection<WikiTopicDoc | Wiki
               },
               // Deny indexing for the large text fields.
               indexing: {
-                deny: ['fileListText', 'unclassifiedPaths'],
+                deny: WIKI_TOC_INDEXING_DENY,
               },
             } as any);
             console.log(`[wiki] "${WIKI_TOC_COLLECTION}" collection created.`);
+
+            if (collections.some((c) => c.name === LEGACY_WIKI_TOC_COLLECTION)) {
+              try {
+                const copied = await copyLegacyDocuments(db);
+                console.log(`[wiki] copied ${copied} documents from "${LEGACY_WIKI_TOC_COLLECTION}".`);
+              } catch (copyErr) {
+                // Drop the half-filled collection so the next call starts the copy again.
+                await db.dropCollection(WIKI_TOC_COLLECTION).catch(() => undefined);
+                throw copyErr;
+              }
+            }
           }
           collectionEnsured = true;
         } catch (err: any) {

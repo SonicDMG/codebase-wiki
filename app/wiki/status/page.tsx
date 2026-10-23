@@ -140,7 +140,7 @@ function StatusPageInner() {
                 </span>
               )}
               {status?.templateVersion !== undefined && (
-                <span>Template v{status.templateVersion}</span>
+                <span>Template v{status.templateVersion[mode]}</span>
               )}
             </div>
           )}

@@ -230,7 +230,7 @@ export function WikiStatusPill({
               <span style={s.branchName}>{status.branch}</span>
               <span style={s.sha}>@{status.headSha ? status.headSha.slice(0, 7) : '…'}</span>
             </div>
-            <div style={s.templateVer}>Template v{status.templateVersion}</div>
+            <div style={s.templateVer}>Template v{status.templateVersion[mode]}</div>
           </div>
 
           <div style={s.divider} />

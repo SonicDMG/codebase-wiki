@@ -32,7 +32,8 @@ export interface WikiStatusResponse {
   recentJobs: WikiJobSummary[];
   branch: string;
   headSha: string;
-  templateVersion: number;
+  /** Current prompt template version of each mode. */
+  templateVersion: { wiki: number; picture: number };
   counts: { wiki: StateCounts; picture: StateCounts };
   /** Present only on the read that ran the one-time fingerprint backfill. */
   backfill?: { filled: number; unverifiable: number };

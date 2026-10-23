@@ -1,20 +1,28 @@
 /**
  * prompts.ts — Shared LLM prompts for wiki page generation (Wiki & Field Guide modes).
  *
- * TEMPLATE_VERSION — bump this by hand whenever the prompt changes in a way
- * that makes previously-generated pages "old". Every page generated from now on
- * records this value; the staleness classifier treats a mismatch as
- * 'older-template'.
+ * TEMPLATE_VERSIONS — bump a mode's version by hand whenever its prompt changes
+ * in a way that makes previously-generated pages "old". Every page generated
+ * from now on records its mode's value; the staleness classifier treats a
+ * mismatch as 'older-template'. The modes are versioned separately so changing
+ * one prompt never marks the other mode's pages as old.
  */
 
-/** Hand-bumped version stamp for the generation prompts. Increment when prompts change. */
-export const TEMPLATE_VERSION = 1;
+/** Hand-bumped version stamps for the generation prompts. Increment a mode when its prompt changes. */
+export const TEMPLATE_VERSIONS = { wiki: 2, picture: 1 } as const;
+
+/** Version stamped on pages that predate version tracking (they were made by the first templates). */
+export const ORIGINAL_TEMPLATE_VERSION = 1;
 
 
 const REPO_OWNER = 'SonicDMG';
 const REPO_NAME = 'walfly';
 
-/** The default technical page: Overview, diagram, How it works, Key files, Gotchas. */
+/**
+ * The default technical page, organised like a DeepWiki page: Purpose and Scope,
+ * then topic sections of short prose, tables and numbered figures, each closed
+ * by a "Sources:" line.
+ */
 export function wikiPrompt(githubBase: string, commitSha: string, filesBlock: string): string {
   const example = `${githubBase}/packages/api/lib/llm.ts#L24-L42`;
 
@@ -25,37 +33,58 @@ say so in one sentence and name the part of the codebase most likely to have it.
 
 # Page format
 
-Write a scannable wiki page, not an essay. Use this outline, dropping any section that does not fit the question:
+Write a reference page in the style of a code wiki, not an essay and not a chat reply. Do not write a
+top-level "#" title: the UI already shows the question as the page title. Use "##" for sections and
+"###" for sub-sections inside them.
 
-## Overview
-One or two sentences: what this is and why it exists. **Bold** the single most important concept.
+1. Start with \`## Purpose and Scope\`. Two to four sentences: what this part of the codebase is, why it
+   exists, and what the page covers. **Bold** the single most important concept. Say what is out of scope
+   only if a reader would likely expect it here. End the section with a Sources line (see below).
 
-(Then one diagram block — see "Diagrams". Always include one for overview, architecture, data-flow or
-"how does X work" questions; skip it only for narrow questions about a single function or value.)
+2. Then 2–5 topic sections, each a \`##\` heading naming a concept or component in plain nouns
+   ("Request lifecycle", "Environment variables", "Storage layout"), never a question and never
+   "Overview" or "Conclusion". Order them so each builds on the one before. Inside a section:
+   - open with one or two sentences that say what the section establishes;
+   - then the detail, in whichever shape fits: a short paragraph, a bulleted list, a numbered list of
+     steps in the order they happen (each step "**Short bold title** — one or two sentences"), or a table;
+   - use a table whenever you list three or more things that share attributes, for example
+     | Component | Role | Details | or | Variable | Purpose | Notes |. Cells are short phrases;
+   - close the section with a Sources line.
 
-## How it works
-A numbered list of 3–7 steps in the order things actually happen. Each step is
-**A short bold title** — one or two sentences that end with a citation.
+3. Diagrams are numbered figures. Put the first diagram (see "Diagrams") in the first topic section that
+   describes structure or flow, then a caption on its own line directly below it, in the form
+   \`*Figure 1: one sentence saying what the diagram shows.*\` Number figures in the order they appear.
+   Include a diagram for overview, architecture, data-flow or "how does X work" questions; skip it only
+   for narrow questions about a single function or value.
 
-## Key files
-A two-column table: | File | Responsibility |. One row per file, 3–8 rows. The File cell is a citation;
-the Responsibility cell is a short phrase, not a sentence.
+4. For broad or orientation questions (an overview, a package, a subsystem), include a table of the
+   parts in this area ("Repository layout" or "Components") with a short Role column, so a new reader
+   can see where everything lives before reading the detail.
 
-## Gotchas
-Only if there is something non-obvious (limits, retries, failure modes, footguns). At most three, each
-one a blockquote starting with **Note:**.
+5. A non-obvious limit, retry, failure mode or footgun is a blockquote starting with **Note:**, placed
+   in the section it belongs to. At most three on the page.
+
+# Sources lines
+
+Every section ends with one line that begins with the word "Sources:" followed by the citations it
+relied on, separated by commas, for example:
+Sources: [llm.ts:24-42](${example}), [config.ts:5-18](${githubBase}/packages/api/lib/config.ts#L5-L18)
+Cite the whole function or block that supports the section, 1–4 citations per line. A Sources line is
+plain text on its own line, not a list item and not bold.
 
 Style rules:
-- No paragraph longer than three sentences. Prefer a list whenever you are enumerating.
+- No paragraph longer than three sentences. Prefer a list or table whenever you are enumerating.
 - Use \`inline code\` for identifiers, file paths, env vars and endpoints.
 - No preamble, no closing summary, no restating the question.
-- For narrow follow-up questions, answer in the same style but use only the sections that help.
+- For narrow follow-up questions, answer in the same style but use only the parts that help: skip
+  "Purpose and Scope" and give a single section or just the answer, still ending with a Sources line.
 - Output Markdown directly. Never wrap the whole answer in a code fence. Never use HTML tags.
 - Never include source code in the answer — the UI shows cited code beside the text automatically.
 
 # Citations
 
-Every mention of a specific function, type, constant or block of code gets a citation link:
+Every mention of a specific function, type, constant or block of code gets a citation link, in the text
+and again in the section's Sources line:
   [file.ts:START-END](${githubBase}/<path>#L<START>-L<END>)
 - Use the line numbers printed at the start of each source line (the "N| " prefix).
 - Always cite a range covering the whole function or block, never a single line.
@@ -68,7 +97,8 @@ Example: The client is a lazily created singleton [llm.ts:24-42](${example}).
 # Diagrams
 
 Diagrams are written as a fenced block with the language "diagram" containing JSON (not Mermaid). The UI
-draws it. Use 4–12 nodes or steps, labels of at most five words. Two kinds:
+draws it. Use 4–12 nodes or steps, labels of at most five words. Each one is followed by its
+"*Figure N: …*" caption line. Two kinds:
 
 Flow — architecture, pipelines, module dependencies. Optional "group" clusters related nodes.
 \`\`\`diagram
@@ -86,9 +116,11 @@ ${filesBlock}
 
 ---
 
-Reminder before you answer: follow the page format above; every citation is a Markdown link
+Reminder before you answer: follow the page format above — "## Purpose and Scope" first, then topic
+sections that each end with a "Sources:" line; tables for lists of three or more; figures captioned
+"*Figure N: …*". Every citation is a Markdown link
 [file:START-END](${githubBase}/<path>#L<START>-L<END>) — including for README and other docs — never 【】;
-diagrams go in a \`\`\`diagram JSON block; no HTML, no source code.`;
+diagrams go in a \`\`\`diagram JSON block; no top-level "#" title, no HTML, no source code.`;
 }
 
 /**
