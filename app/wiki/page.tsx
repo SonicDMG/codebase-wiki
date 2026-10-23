@@ -19,7 +19,7 @@
  * current mode is generated when its conversation is open.
  */
 
-import { Children, Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { Children, Fragment, createContext, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
@@ -1856,9 +1856,12 @@ function buildComponents(streaming: boolean, commit: string | undefined, anchorO
 // ── MarkdownContent — plain react-markdown render (older messages) ─────────
 
 function MarkdownContent({ content, commit, className }: { content: string; commit?: string; className: string }) {
+  // Stable component identities: new ones make react-markdown remount the whole
+  // rendered answer (diagrams flash back to "drawing diagram…") on every parent render.
+  const components = useMemo(() => buildComponents(false, commit), [commit]);
   return (
     <div className={className}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(false, commit)}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={components}>
         {content}
       </ReactMarkdown>
     </div>
@@ -1905,9 +1908,18 @@ function ProseContent({ className, prose, commit, refs, streaming, activeRef, on
     );
   };
 
+  // The anchor depends on activeRef/refs, which change often. Route it through a
+  // ref so the components object (and every block's identity) stays stable.
+  const anchorRef = useRef(anchorOverride);
+  anchorRef.current = anchorOverride;
+  const components = useMemo(
+    () => buildComponents(streaming, commit, (props) => anchorRef.current(props)),
+    [streaming, commit],
+  );
+
   return (
     <div className={className}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={buildComponents(streaming, commit, anchorOverride)}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml components={components}>
         {prose}
       </ReactMarkdown>
     </div>
