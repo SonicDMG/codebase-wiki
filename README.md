@@ -71,5 +71,5 @@ and `branch`, falling back to the repo's default branch.
 ## Not built yet
 
 - **Auth.** The API is unauthenticated. Run it locally or behind your own access control.
-- Design notes for a faster index live in [`wiki-index-plan.md`](wiki-index-plan.md); it was written
+- Design notes for a faster index live in [`docs/wiki-index-plan.md`](docs/wiki-index-plan.md); it was written
   for a single repo.
