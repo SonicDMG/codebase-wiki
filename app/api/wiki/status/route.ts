@@ -1,5 +1,5 @@
 /**
- * GET /api/wiki/status?branch=main
+ * GET /api/wiki/status?repo=owner/name&branch=main
  *
  * Read-only: reports, per topic and per mode, whether the stored page is
  * current, built from older files, built with an older template, or missing.
@@ -8,6 +8,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getStoredTopics, getSnapshot } from '@/lib/wiki/store';
+import { resolveBranch, resolveRepo } from '@/lib/wiki/repo';
 import { decodeFileList } from '@/lib/wiki/snapshot';
 import { classifyStaleness } from '@/lib/wiki/staleness';
 import { TEMPLATE_VERSIONS } from '@/lib/wiki/prompts';
@@ -17,9 +18,7 @@ import type { StateCounts, WikiStatusResponse } from '@/lib/wiki/status-types';
 
 export const runtime = 'nodejs';
 
-const DEFAULT_BRANCH = 'main';
-
-/** Branches whose backfill this server process has already attempted (even if some pages stayed unverifiable). */
+/** `repo:branch` pairs whose backfill this server process has already attempted (even if some pages stayed unverifiable). */
 const backfillAttempted = new Set<string>();
 
 const zeroCounts = (): StateCounts => ({
@@ -30,20 +29,24 @@ const zeroCounts = (): StateCounts => ({
 });
 
 export async function GET(req: NextRequest) {
-  const branch = req.nextUrl.searchParams.get('branch')?.trim() || DEFAULT_BRANCH;
+  const resolved = resolveRepo(req.nextUrl.searchParams.get('repo'));
+  if (!resolved.ok) return resolved.response;
+  const { repo } = resolved;
+  const branch = await resolveBranch(repo, req.nextUrl.searchParams.get('branch'));
+  const attemptKey = `${repo}:${branch}`;
 
   try {
-    let [topics, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+    let [topics, snapshot] = await Promise.all([getStoredTopics(repo, branch), getSnapshot(repo, branch)]);
 
     // One-time fingerprint backfill for pre-fingerprint pages. GitHub only, no LLM;
     // failures never fail the status response.
     let backfill: WikiStatusResponse['backfill'];
-    if (!backfillAttempted.has(branch) && hasUnfingerprintedPages(topics)) {
-      backfillAttempted.add(branch);
+    if (!backfillAttempted.has(attemptKey) && hasUnfingerprintedPages(topics)) {
+      backfillAttempted.add(attemptKey);
       try {
-        const res = await backfillBranch(branch);
+        const res = await backfillBranch(repo, branch);
         backfill = { filled: res.filled, unverifiable: res.unverifiable.length };
-        topics = await getStoredTopics(branch);
+        topics = await getStoredTopics(repo, branch);
       } catch (err) {
         console.error('[wiki/status] backfill failed:', err);
       }
@@ -56,6 +59,7 @@ export async function GET(req: NextRequest) {
         job: emptyJob,
         interrupted: emptyJob?.status === 'running' && !isJobLive(emptyJob),
         recentJobs: snapshot?.recentJobs ?? [],
+        repo,
         branch,
         headSha: '',
         templateVersion: TEMPLATE_VERSIONS,
@@ -71,6 +75,7 @@ export async function GET(req: NextRequest) {
       job: snapshotJob,
       interrupted: snapshotJob?.status === 'running' && !isJobLive(snapshotJob),
       recentJobs: snapshot.recentJobs ?? [],
+      repo,
       branch,
       headSha: snapshot.headSha,
       templateVersion: TEMPLATE_VERSIONS,

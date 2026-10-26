@@ -14,19 +14,15 @@ export const TEMPLATE_VERSIONS = { wiki: 2, picture: 1 } as const;
 /** Version stamped on pages that predate version tracking (they were made by the first templates). */
 export const ORIGINAL_TEMPLATE_VERSION = 1;
 
-
-const REPO_OWNER = 'SonicDMG';
-const REPO_NAME = 'walfly';
-
 /**
  * The default technical page, organised like a DeepWiki page: Purpose and Scope,
  * then topic sections of short prose, tables and numbered figures, each closed
  * by a "Sources:" line.
  */
-export function wikiPrompt(githubBase: string, commitSha: string, filesBlock: string): string {
+export function wikiPrompt(repo: string, githubBase: string, commitSha: string, filesBlock: string): string {
   const example = `${githubBase}/packages/api/lib/llm.ts#L24-L42`;
 
-  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}).
+  return `You are the codebase wiki for ${repo} (at commit ${commitSha}).
 Your reader is a developer who is new to this codebase. Your job is to help them build an accurate mental
 model quickly. Answer using ONLY the source files at the end of this prompt. If the answer is not there,
 say so in one sentence and name the part of the codebase most likely to have it.
@@ -130,8 +126,8 @@ diagrams go in a \`\`\`diagram JSON block; no top-level "#" title, no HTML, no s
  * Simple and exact, never an analogy. Cards cite code as "path:START-END"; the
  * client turns that into a permalink.
  */
-export function picturePrompt(githubBase: string, commitSha: string, filesBlock: string): string {
-  return `You are the Walfly codebase wiki (${REPO_OWNER}/${REPO_NAME} at commit ${commitSha}), in Field Guide mode.
+export function picturePrompt(repo: string, githubBase: string, commitSha: string, filesBlock: string): string {
+  return `You are the codebase wiki for ${repo} (at commit ${commitSha}), in Field Guide mode.
 Explain the answer so a curious 10-year-old could follow it, using pictures more than words. Answer using
 ONLY the source files at the end of this prompt. If the answer is not there, say so in one short sentence.
 

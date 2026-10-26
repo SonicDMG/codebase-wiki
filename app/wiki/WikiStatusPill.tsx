@@ -19,11 +19,13 @@ const STATES: Array<{ key: StalenessState; label: string }> = [
 ];
 
 export function WikiStatusPill({
+  repo,
   branch,
   status,
   mode,
   refresh,
 }: {
+  repo: string;
   branch: string;
   status: WikiStatusResponse | null;
   mode: AnswerMode;
@@ -32,8 +34,8 @@ export function WikiStatusPill({
   const [open, setOpen] = useState(false);
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const rebuildOpenerRef = useRef<HTMLButtonElement>(null);
-  const { busy, message, start, stop, resume } = useJobActions(branch, refresh);
-  const { enabled: autoEnabled, setEnabled: setAutoEnabled, pendingPrompt, confirmPrompt, dismissPrompt, staleTopicCount } = useAutoRefresh({ branch, status, start, busy });
+  const { busy, message, start, stop, resume } = useJobActions(repo, branch, refresh);
+  const { enabled: autoEnabled, setEnabled: setAutoEnabled, pendingPrompt, confirmPrompt, dismissPrompt, staleTopicCount } = useAutoRefresh({ repo, branch, status, start, busy });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -227,7 +229,7 @@ export function WikiStatusPill({
           {/* Branch & Template info */}
           <div style={s.section}>
             <div style={s.branchHeader}>
-              <span style={s.branchName}>{status.branch}</span>
+              <span style={s.branchName}>{status.repo} · {status.branch}</span>
               <span style={s.sha}>@{status.headSha ? status.headSha.slice(0, 7) : '…'}</span>
             </div>
             <div style={s.templateVer}>Template v{status.templateVersion[mode]}</div>
@@ -389,7 +391,7 @@ export function WikiStatusPill({
           <div style={s.divider} />
           <div style={s.statusPageRow}>
             <a
-              href={`/wiki/status?branch=${encodeURIComponent(branch)}`}
+              href={`/wiki/status?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch)}`}
               style={s.statusPageLink}
             >
               Status page →

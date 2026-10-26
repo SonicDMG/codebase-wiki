@@ -1,7 +1,7 @@
 /**
  * generate.ts — Full initial topic generation + incremental extension via LLM.
  *
- * generateTopics(branch)  — Full generation from scratch.
+ * generateTopics(repo, branch)  — Full generation from scratch.
  * extendTopics(branch, unclassifiedPaths, currentTopics, allPaths)
  *                         — Incremental call: creates new topics or extends
  *                           existing scopes for unclassified paths, without
@@ -19,15 +19,12 @@ import {
 } from '@/lib/github';
 import { repairGeneratedTopics, findUnclassifiedPaths } from './validate';
 import { promoteDirectoryPrefixes, pathMatchesScope } from './scope';
-import { TOPIC_SECTIONS } from './types';
+import { TOPIC_SECTIONS, splitRepo, topicId, snapshotId } from './types';
 import { wikiPrompt, picturePrompt, TEMPLATE_VERSIONS } from './prompts';
 import { computeFingerprint } from './fingerprint';
 import { hasPictureCards } from './staleness';
-import type { TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
+import type { RepoKey, TopicSection, WikiTopicDoc, WikiSnapshotDoc, SnapshotEntry, SyncResult } from './types';
 import { encodeFileList } from './snapshot';
-
-export const REPO_OWNER = 'SonicDMG';
-export const REPO_NAME = 'walfly';
 
 /** Placeholder pages stored when generation had nothing to work with. */
 export const NO_SOURCE_FILES_PAGE = `No source files found matching this topic's scope.`;
@@ -72,7 +69,7 @@ function stringArray(value: unknown): string[] {
 }
 
 /** Map one raw LLM topic to a stored doc, or null if required fields are missing. */
-function toTopicDoc(raw: RawTopic, branch: string, order: number, now: string): WikiTopicDoc | null {
+function toTopicDoc(raw: RawTopic, repo: RepoKey, branch: string, order: number, now: string): WikiTopicDoc | null {
   if (typeof raw?.title !== 'string' || typeof raw.description !== 'string') return null;
   if (typeof raw.suggestedQuery !== 'string') return null;
   const title = raw.title.trim();
@@ -81,8 +78,9 @@ function toTopicDoc(raw: RawTopic, branch: string, order: number, now: string): 
     ? (raw.section as TopicSection)
     : 'How it works';
   return {
-    _id: `${branch}:${slug}`,
+    _id: topicId(repo, branch, slug),
     kind: 'topic',
+    repo,
     branch,
     slug,
     order,
@@ -140,13 +138,14 @@ async function completeJsonObject(system: string, user: string): Promise<Record<
  * Fetches the file tree and README, calls the LLM, repairs the output, and
  * returns a SyncResult plus the snapshot data needed to persist it.
  */
-export async function generateTopics(branch: string): Promise<{
+export async function generateTopics(repo: RepoKey, branch: string): Promise<{
   result: SyncResult;
   snapshotEntries: SnapshotEntry[];
   unclassifiedPaths: string[];
   treeSha: string;
 }> {
-  const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch);
+  const { owner, name } = splitRepo(repo);
+  const head = await getBranchHead(owner, name, branch);
   if (head.status !== 'ok') {
     throw new Error(
       head.status === 'rate-limited'
@@ -154,15 +153,15 @@ export async function generateTopics(branch: string): Promise<{
         : `Could not resolve head of branch "${branch}"`,
     );
   }
-  const { entries, treeSha } = await getFileTreeResult(REPO_OWNER, REPO_NAME, head.sha);
+  const { entries, treeSha } = await getFileTreeResult(owner, name, head.sha);
   const treeText = formatTreeForPrompt(entries);
   const allPaths = entries.filter((e) => e.type === 'blob' && !isIgnoredPath(e.path)).map((e) => e.path);
-  const readme = (await fetchFileContents(REPO_OWNER, REPO_NAME, ['README.md'], head.sha))['README.md'] ?? '';
+  const readme = (await fetchFileContents(owner, name, ['README.md'], head.sha))['README.md'] ?? '';
 
   console.log(`[wiki] generating topics for branch "${branch}" — ${allPaths.length} files`);
 
   const parsed = await completeJsonObject(
-    `You design the table of contents for a developer wiki about the Walfly monorepo.
+    `You design the table of contents for a developer wiki about the ${repo} repository.
 A newcomer reads these topics top to bottom to learn the codebase. Clicking a topic sends its
 suggestedQuery to a Q&A assistant that reads the source and writes a page.
 
@@ -178,19 +177,19 @@ Rules:
 - The LAST topic is title "Repo Config & Tooling", section "Reference", scope.prefixes [] and
   scope.files listing root config files, CI files and package.json files.
 - Output ONLY a JSON object: {"topics": [ ... ]}. No markdown fences, no prose.`,
-    `README.md:\n${readme.slice(0, README_CHARS)}\n\nFile tree for ${REPO_OWNER}/${REPO_NAME} (branch: ${branch}):\n\n${treeText}`,
+    `README.md:\n${readme.slice(0, README_CHARS)}\n\nFile tree for ${repo} (branch: ${branch}):\n\n${treeText}`,
   );
 
   const now = new Date().toISOString();
   const sectionRank = (t: WikiTopicDoc) => TOPIC_SECTIONS.indexOf(t.section ?? 'How it works');
   const mappedTopics = (Array.isArray(parsed?.topics) ? (parsed.topics as RawTopic[]) : [])
-    .map((t, i) => toTopicDoc(t, branch, i, now))
+    .map((t, i) => toTopicDoc(t, repo, branch, i, now))
     .filter((t): t is WikiTopicDoc => t !== null)
     // Stable sort: keeps the model's order within each section.
     .sort((a, b) => sectionRank(a) - sectionRank(b));
 
   // Repair: drop empty/duplicate topics, reject over-broad prefixes, ensure catch-all.
-  const repairedTopics = repairGeneratedTopics(mappedTopics, allPaths, branch);
+  const repairedTopics = repairGeneratedTopics(mappedTopics, allPaths, repo, branch);
   const unclassifiedPaths = findUnclassifiedPaths(allPaths, repairedTopics);
 
   if (unclassifiedPaths.length > 0) {
@@ -206,6 +205,7 @@ Rules:
     result: {
       topics: repairedTopics,
       headSha: head.sha,
+      repo,
       branch,
     },
     snapshotEntries,
@@ -231,6 +231,7 @@ Rules:
  * with extended scopes) plus the paths that remain unclassified after extension.
  */
 export async function extendTopics(
+  repo: RepoKey,
   branch: string,
   unclassifiedPaths: string[],
   currentTopics: WikiTopicDoc[],
@@ -249,7 +250,7 @@ export async function extendTopics(
   );
 
   const parsed = await completeJsonObject(
-    `You maintain the table of contents of a developer wiki for the Walfly monorepo.
+    `You maintain the table of contents of a developer wiki for the ${repo} repository.
 You are given file paths that do not yet belong to any wiki topic.
 
 Almost always, assign each path to the EXISTING topic it most relates to by extending that topic's scope.
@@ -300,7 +301,7 @@ Rules:
   );
   const newTopics = Array.isArray(parsed?.newTopics) ? (parsed.newTopics as RawTopic[]) : [];
   for (const raw of newTopics.slice(0, 1)) {
-    const topic = toTopicDoc(raw, branch, updatedTopics.length, now);
+    const topic = toTopicDoc(raw, repo, branch, updatedTopics.length, now);
     if (!topic || taken.has(topic.slug) || taken.has(slugify(topic.suggestedQuery))) continue;
     updatedTopics.push(topic);
   }
@@ -358,6 +359,7 @@ Rules:
 
 /** Build a WikiSnapshotDoc from generation output. */
 export function buildSnapshotDoc(
+  repo: RepoKey,
   branch: string,
   snapshotEntries: SnapshotEntry[],
   unclassifiedPaths: string[],
@@ -366,8 +368,9 @@ export function buildSnapshotDoc(
 ): WikiSnapshotDoc {
   const now = new Date().toISOString();
   return {
-    _id: `${branch}:snapshot`,
+    _id: snapshotId(repo, branch),
     kind: 'snapshot',
+    repo,
     branch,
     headSha,
     treeSha,
@@ -382,7 +385,7 @@ export function buildSnapshotDoc(
 
 type PageMode = 'wiki' | 'picture';
 
-const PAGE_PROMPTS: Record<PageMode, (githubBase: string, commitSha: string, filesBlock: string) => string> = {
+const PAGE_PROMPTS: Record<PageMode, (repo: string, githubBase: string, commitSha: string, filesBlock: string) => string> = {
   wiki: wikiPrompt,
   picture: picturePrompt,
 };
@@ -427,12 +430,12 @@ export function pageFieldsToStore(
  */
 export async function generatePagesForTopic(
   topic: WikiTopicDoc,
-  branch: string,
   commitSha: string,
   allPaths: string[],
   modes: PageMode[] = ['wiki', 'picture'],
   snapshotEntries?: SnapshotEntry[],
 ): Promise<GeneratedPages> {
+  const { owner, name } = splitRepo(topic.repo);
   const allModes = (text: string) => Object.fromEntries(modes.map((m) => [m, text]));
 
   // 1. Find matching files in topic scope.
@@ -442,7 +445,7 @@ export async function generatePagesForTopic(
   if (matchedPaths.length === 0) return allModes(NO_SOURCE_FILES_PAGE);
 
   // 2. Fetch matched file contents.
-  const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, matchedPaths, commitSha);
+  const contents = await fetchFileContents(owner, name, matchedPaths, commitSha);
   const fetchedPaths = Object.keys(contents);
   if (fetchedPaths.length === 0) return allModes(FETCH_FAILED_PAGE);
 
@@ -464,13 +467,13 @@ export async function generatePagesForTopic(
   // 4. Generate each mode's page in parallel.
   const client = llmClient();
   const model = getLlmModel();
-  const githubBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${commitSha}`;
+  const githubBase = `https://github.com/${topic.repo}/blob/${commitSha}`;
 
   const generate = async (mode: PageMode) => {
     const response = await client.chat.completions.create({
       model,
       messages: [
-        { role: 'system', content: PAGE_PROMPTS[mode](githubBase, commitSha, filesBlock) },
+        { role: 'system', content: PAGE_PROMPTS[mode](topic.repo, githubBase, commitSha, filesBlock) },
         { role: 'user', content: topic.suggestedQuery },
       ],
     });
@@ -502,7 +505,6 @@ const PICTURE_RETRIES = 2;
  */
 export async function rebuildTopicPages(
   topics: WikiTopicDoc[],
-  branch: string,
   commitSha: string,
   allPaths: string[],
   entries?: SnapshotEntry[],
@@ -515,7 +517,7 @@ export async function rebuildTopicPages(
     topics.map(async (topic) => {
       try {
         console.log(`[wiki] Rebuilding page for topic "${topic.title}"...`);
-        const pages = await generatePagesForTopic(topic, branch, commitSha, allPaths, ['wiki', 'picture'], entries);
+        const pages = await generatePagesForTopic(topic, commitSha, allPaths, ['wiki', 'picture'], entries);
         updatedTopics.push({ ...topic, ...pageFieldsToStore(pages, commitSha) });
       } catch (err) {
         console.error(`[wiki] Failed to generate pages for topic "${topic.title}":`, err);

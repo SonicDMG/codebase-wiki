@@ -6,19 +6,19 @@
  *   2. If none exist, generates topics via LLM, stores them in Astra, then returns.
  *
  * Query params:
- *   ?branch=<branch>  — defaults to "main"
+ *   ?repo=<owner/name> — defaults to WIKI_DEFAULT_REPO
+ *   ?branch=<branch>   — defaults to the repo's default branch
  *
  * Response shape:
- *   { topics: TocTopic[], branch: string, headSha: string }
+ *   { topics: TocTopic[], repo: string, branch: string, headSha: string }
  */
 
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureTopics, toPublicTopics } from '@/lib/wiki/sync';
+import { resolveBranch, resolveRepo } from '@/lib/wiki/repo';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
-
-const DEFAULT_BRANCH = 'main';
 
 /** Minimal shape the wiki page consumes (backwards-compatible). */
 export interface TocTopic {
@@ -28,11 +28,14 @@ export interface TocTopic {
 }
 
 export async function GET(req: NextRequest) {
-  const branch = req.nextUrl.searchParams.get('branch')?.trim() || DEFAULT_BRANCH;
+  const resolved = resolveRepo(req.nextUrl.searchParams.get('repo'));
+  if (!resolved.ok) return resolved.response;
+  const { repo } = resolved;
+  const branch = await resolveBranch(repo, req.nextUrl.searchParams.get('branch'));
 
   try {
-    const { topics, snapshot } = await ensureTopics(branch);
-    return NextResponse.json({ topics: toPublicTopics(topics), branch, headSha: snapshot.headSha });
+    const { topics, snapshot } = await ensureTopics(repo, branch);
+    return NextResponse.json({ topics: toPublicTopics(topics), repo, branch, headSha: snapshot.headSha });
   } catch (err) {
     console.error('[wiki/toc] failed:', err);
     return NextResponse.json(

@@ -16,15 +16,17 @@
 
 import { getFileTreeResult } from '@/lib/github';
 import { computeFingerprint } from './fingerprint';
-import { FETCH_FAILED_PAGE, NO_SOURCE_FILES_PAGE, REPO_NAME, REPO_OWNER } from './generate';
+import { FETCH_FAILED_PAGE, NO_SOURCE_FILES_PAGE } from './generate';
 import { ORIGINAL_TEMPLATE_VERSION } from './prompts';
 import { hasPictureCards } from './staleness';
 import { getStoredTopics, updateTopicFields } from './store';
-import type { SnapshotEntry, WikiTopicDoc } from './types';
+import { splitRepo } from './types';
+import type { RepoKey, SnapshotEntry, WikiTopicDoc } from './types';
 
 type Mode = 'wiki' | 'picture';
 
 export interface BackfillResult {
+  repo: RepoKey;
   branch: string;
   checked: number;
   filled: number;
@@ -53,17 +55,19 @@ export function hasUnfingerprintedPages(topics: WikiTopicDoc[]): boolean {
 const inFlight = new Map<string, Promise<BackfillResult>>();
 
 /** Fill in missing fingerprints for a branch's existing pages. Concurrent calls per branch share one run. */
-export function backfillBranch(branch: string): Promise<BackfillResult> {
-  const existing = inFlight.get(branch);
+export function backfillBranch(repo: RepoKey, branch: string): Promise<BackfillResult> {
+  const key = `${repo}:${branch}`;
+  const existing = inFlight.get(key);
   if (existing) return existing;
-  const run = runBackfill(branch).finally(() => inFlight.delete(branch));
-  inFlight.set(branch, run);
+  const run = runBackfill(repo, branch).finally(() => inFlight.delete(key));
+  inFlight.set(key, run);
   return run;
 }
 
-async function runBackfill(branch: string): Promise<BackfillResult> {
-  const result: BackfillResult = { branch, checked: 0, filled: 0, unverifiable: [] };
-  const topics = await getStoredTopics(branch);
+async function runBackfill(repo: RepoKey, branch: string): Promise<BackfillResult> {
+  const { owner, name } = splitRepo(repo);
+  const result: BackfillResult = { repo, branch, checked: 0, filled: 0, unverifiable: [] };
+  const topics = await getStoredTopics(repo, branch);
 
   // Collect pages needing a fingerprint, rejecting the unverifiable ones up front.
   const work: Array<{ topic: WikiTopicDoc; mode: Mode; commitSha: string }> = [];
@@ -91,7 +95,7 @@ async function runBackfill(branch: string): Promise<BackfillResult> {
   for (const { topic, mode, commitSha } of work) {
     if (!trees.has(commitSha)) {
       try {
-        const tree = await getFileTreeResult(REPO_OWNER, REPO_NAME, commitSha);
+        const tree = await getFileTreeResult(owner, name, commitSha);
         trees.set(
           commitSha,
           tree.truncated
@@ -133,7 +137,7 @@ async function runBackfill(branch: string): Promise<BackfillResult> {
   }
 
   console.log(
-    `[wiki/backfill] branch=${branch} checked=${result.checked} filled=${result.filled} unverifiable=${result.unverifiable.length}`,
+    `[wiki/backfill] repo=${repo} branch=${branch} checked=${result.checked} filled=${result.filled} unverifiable=${result.unverifiable.length}`,
   );
   for (const u of result.unverifiable) {
     console.log(`[wiki/backfill]   unverifiable ${u.slug} (${u.mode}): ${u.reason}`);

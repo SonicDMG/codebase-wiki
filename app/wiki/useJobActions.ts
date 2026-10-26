@@ -22,6 +22,7 @@ export function jobKindLabel(kind: WikiJobKind): string {
 }
 
 export function useJobActions(
+  repo: string,
   branch: string,
   refresh: () => void
 ): {
@@ -42,7 +43,7 @@ export function useJobActions(
         const res = await fetch('/api/wiki/jobs', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(action === 'resume' ? { branch, action } : { branch, action, ...request }),
+          body: JSON.stringify(action === 'resume' ? { repo, branch, action } : { repo, branch, action, ...request }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -59,7 +60,7 @@ export function useJobActions(
         refresh();
       }
     },
-    [branch, refresh]
+    [repo, branch, refresh]
   );
 
   const start = useCallback(

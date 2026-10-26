@@ -1,8 +1,8 @@
 /**
  * sync.ts — Diff-driven incremental sync of stored wiki topics.
  *
- *   ensureTopics(branch)  — stored topics + snapshot, or initial generation.
- *   syncBranch(branch)    — checks branch head, diffs snapshot, absorbs matched
+ *   ensureTopics(repo, branch)  — stored topics + snapshot, or initial generation.
+ *   syncBranch(repo, branch)    — checks branch head, diffs snapshot, absorbs matched
  *                           files, classifies unmatched via JEV, and runs
  *                           incremental LLM extension when the unclassified
  *                           threshold is crossed.
@@ -22,10 +22,10 @@ import {
   saveSnapshot,
   saveTopics,
 } from './store';
-import { buildSnapshotDoc, extendTopics, generateTopics, REPO_NAME, REPO_OWNER, generatePagesForTopic, rebuildTopicPages, pageFieldsToStore } from './generate';
+import { buildSnapshotDoc, extendTopics, generateTopics, generatePagesForTopic, rebuildTopicPages, pageFieldsToStore } from './generate';
 import { classifyFile } from './classify';
-import { TOPIC_SECTIONS } from './types';
-import type { SnapshotEntry, SyncOutcome, WikiSnapshotDoc, WikiTopicDoc } from './types';
+import { TOPIC_SECTIONS, snapshotId, splitRepo, topicId } from './types';
+import type { RepoKey, SnapshotEntry, SyncOutcome, WikiSnapshotDoc, WikiTopicDoc } from './types';
 
 const CATCH_ALL_SLUG = 'repo-config-tooling';
 
@@ -58,23 +58,24 @@ export function toPublicTopics(topics: WikiTopicDoc[]): PublicTopic[] {
   }));
 }
 
+/** Branches being seeded, keyed `${repo}:${branch}`. */
 const seedingBranches = new Set<string>();
 
 /**
- * In-flight initial generations, per branch. The wiki page fires /toc and
+ * In-flight initial generations, per repo + branch (key `${repo}:${branch}`). The wiki page fires /toc and
  * /sync together on load (twice in dev StrictMode); without this, each call
  * ran its own LLM generation and stored a separate topic set.
  */
 const generating = new Map<string, Promise<{ topics: WikiTopicDoc[]; snapshot: WikiSnapshotDoc }>>();
 
-async function generateAndStore(branch: string) {
-  const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
+async function generateAndStore(repo: RepoKey, branch: string) {
+  const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(repo, branch);
   const allPaths = snapshotEntries.map((e) => e.path);
-  const topicsWithPages = await rebuildTopicPages(result.topics, branch, result.headSha, allPaths, snapshotEntries);
-  await replaceTopics(branch, topicsWithPages);
-  const snapshot = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
+  const topicsWithPages = await rebuildTopicPages(result.topics, result.headSha, allPaths, snapshotEntries);
+  await replaceTopics(repo, branch, topicsWithPages);
+  const snapshot = buildSnapshotDoc(repo, branch, snapshotEntries, unclassifiedPaths, result.headSha, treeSha);
   await saveSnapshot(snapshot);
-  console.log(`[wiki] generated and stored ${topicsWithPages.length} topics for branch "${branch}"`);
+  console.log(`[wiki] generated and stored ${topicsWithPages.length} topics for ${repo}@${branch}`);
   return { topics: topicsWithPages, snapshot };
 }
 
@@ -87,10 +88,13 @@ async function generateAndStore(branch: string) {
  * branches exist, runs initial generation and persists the result.
  */
 export async function ensureTopics(
+  repo: RepoKey,
   branch: string,
 ): Promise<{ topics: WikiTopicDoc[]; snapshot: WikiSnapshotDoc; generated: boolean }> {
+  const { owner, name } = splitRepo(repo);
+  const key = `${repo}:${branch}`;
   try {
-    const [stored, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+    const [stored, snapshot] = await Promise.all([getStoredTopics(repo, branch), getSnapshot(repo, branch)]);
     if (stored.length > 0 && snapshot) {
       // Check if any topic lacks page content (due to older codebase wiki generation)
       const missingPages = stored.filter((t) => !t.generatedPage);
@@ -100,7 +104,7 @@ export async function ensureTopics(
         // Run backfilling completely asynchronously to keep TOC loading instant (takes < 5ms)
         void (async () => {
           try {
-            const { entries } = await getFileTreeResult(REPO_OWNER, REPO_NAME, snapshot.headSha);
+            const { entries } = await getFileTreeResult(owner, name, snapshot.headSha);
             const allPaths = entries.filter((e) => e.type === 'blob' && !isIgnoredPath(e.path)).map((e) => e.path);
             const blobEntries = entries
               .filter((e) => e.type === 'blob')
@@ -111,7 +115,7 @@ export async function ensureTopics(
               missingPages.map(async (topic) => {
                 try {
                   console.log(`[wiki] Background backfilling page content for topic "${topic.title}"...`);
-                  const pages = await generatePagesForTopic(topic, branch, snapshot.headSha, allPaths, ['wiki', 'picture'], blobEntries);
+                  const pages = await generatePagesForTopic(topic, snapshot.headSha, allPaths, ['wiki', 'picture'], blobEntries);
                   Object.assign(topic, pageFieldsToStore(pages, snapshot.headSha));
                   await saveTopics([topic]);
                   console.log(`[wiki] Background backfill complete for topic "${topic.title}".`);
@@ -133,39 +137,39 @@ export async function ensureTopics(
   }
 
   // Branch seeding: when branch has no stored topics/snapshot, copy from nearest stored branch
-  if (!seedingBranches.has(branch)) {
-    seedingBranches.add(branch);
+  if (!seedingBranches.has(key)) {
+    seedingBranches.add(key);
     try {
-      const storedBranches = (await getStoredBranches()).filter((b) => b !== branch);
+      const storedBranches = (await getStoredBranches(repo)).filter((b) => b !== branch);
       const donor = storedBranches.includes('main') ? 'main' : storedBranches[0];
       if (donor) {
         const [donorTopics, donorSnapshot] = await Promise.all([
-          getStoredTopics(donor),
-          getSnapshot(donor),
+          getStoredTopics(repo, donor),
+          getSnapshot(repo, donor),
         ]);
         if (donorTopics.length > 0 && donorSnapshot) {
           const now = new Date().toISOString();
           const seededTopics: WikiTopicDoc[] = donorTopics.map((t) => ({
             ...t,
-            _id: `${branch}:${t.slug}`,
+            _id: topicId(repo, branch, t.slug),
             branch,
           }));
           const seededSnapshot: WikiSnapshotDoc = {
             ...donorSnapshot,
-            _id: `${branch}:snapshot`,
+            _id: snapshotId(repo, branch),
             branch,
             lastEtag: null,
             leaseUntil: null,
             lastCheckedAt: now,
           };
-          await replaceTopics(branch, seededTopics);
+          await replaceTopics(repo, branch, seededTopics);
           await saveSnapshot(seededSnapshot);
-          console.log(`[wiki] seeded branch "${branch}" from "${donor}" (${seededTopics.length} topics)`);
+          console.log(`[wiki] seeded ${repo}@${branch} from "${donor}" (${seededTopics.length} topics)`);
 
           // Run syncBranch to diff against the new branch head
           try {
-            const outcome = await syncBranch(branch);
-            const finalSnapshot = (await getSnapshot(branch)) ?? seededSnapshot;
+            const outcome = await syncBranch(repo, branch);
+            const finalSnapshot = (await getSnapshot(repo, branch)) ?? seededSnapshot;
             return { topics: outcome.topics, snapshot: finalSnapshot, generated: false };
           } catch (syncErr) {
             console.warn(`[wiki] syncBranch after seeding failed for "${branch}", returning seeded topics:`, syncErr);
@@ -176,15 +180,15 @@ export async function ensureTopics(
     } catch (seedErr) {
       console.warn('[wiki] branch seeding failed, falling back to full generation:', seedErr);
     } finally {
-      seedingBranches.delete(branch);
+      seedingBranches.delete(key);
     }
   }
 
   // Topics without a snapshot cannot be diffed — replace them wholesale.
-  let pending = generating.get(branch);
+  let pending = generating.get(key);
   if (!pending) {
-    pending = generateAndStore(branch).finally(() => generating.delete(branch));
-    generating.set(branch, pending);
+    pending = generateAndStore(repo, branch).finally(() => generating.delete(key));
+    generating.set(key, pending);
   }
   return { ...(await pending), generated: true };
 }
@@ -194,24 +198,26 @@ export async function ensureTopics(
 function unmodified(
   topics: WikiTopicDoc[],
   headSha: string,
+  repo: RepoKey,
   branch: string,
   extra?: { rateLimited?: boolean; retryAfterSeconds?: number | null; warning?: string },
 ): SyncOutcome {
-  return { status: 'unmodified', headSha, branch, topics, ...extra };
+  return { status: 'unmodified', headSha, repo, branch, topics, ...extra };
 }
 
-export async function syncBranch(branch: string): Promise<SyncOutcome> {
-  const { topics: storedTopics, snapshot, generated } = await ensureTopics(branch);
-  if (generated) return unmodified(storedTopics, snapshot.headSha, branch);
+export async function syncBranch(repo: RepoKey, branch: string): Promise<SyncOutcome> {
+  const { owner, name } = splitRepo(repo);
+  const { topics: storedTopics, snapshot, generated } = await ensureTopics(repo, branch);
+  if (generated) return unmodified(storedTopics, snapshot.headSha, repo, branch);
 
   // ── 1. Cheap head check (conditional request) ──────────────────────────────
-  const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch, snapshot.lastEtag);
+  const head = await getBranchHead(owner, name, branch, snapshot.lastEtag);
   if (head.status === 'not-modified') {
-    return unmodified(storedTopics, snapshot.headSha, branch);
+    return unmodified(storedTopics, snapshot.headSha, repo, branch);
   }
   if (head.status === 'rate-limited') {
     // Treat as no change — serve stored topics with a backoff hint.
-    return unmodified(storedTopics, snapshot.headSha, branch, {
+    return unmodified(storedTopics, snapshot.headSha, repo, branch, {
       rateLimited: true,
       retryAfterSeconds: head.retryAfterSeconds,
     });
@@ -221,34 +227,34 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
     if (head.etag && head.etag !== snapshot.lastEtag) {
       await saveSnapshot({ ...snapshot, lastEtag: head.etag, lastCheckedAt: new Date().toISOString() });
     }
-    return unmodified(storedTopics, snapshot.headSha, branch);
+    return unmodified(storedTopics, snapshot.headSha, repo, branch);
   }
 
   // ── 2. Lease ───────────────────────────────────────────────────────────────
-  if (!(await acquireLease(branch))) {
-    return { status: 'locked', headSha: snapshot.headSha, branch, topics: storedTopics };
+  if (!(await acquireLease(repo, branch))) {
+    return { status: 'locked', headSha: snapshot.headSha, repo, branch, topics: storedTopics };
   }
 
   try {
     // Re-read under the lease: another sync may have completed since our first read.
-    const [topics, base] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
-    if (!base || topics.length === 0) return unmodified(storedTopics, snapshot.headSha, branch);
-    if (base.headSha === head.sha) return unmodified(topics, base.headSha, branch);
+    const [topics, base] = await Promise.all([getStoredTopics(repo, branch), getSnapshot(repo, branch)]);
+    if (!base || topics.length === 0) return unmodified(storedTopics, snapshot.headSha, repo, branch);
+    if (base.headSha === head.sha) return unmodified(topics, base.headSha, repo, branch);
 
     const now = new Date().toISOString();
 
     // Identical tree (e.g. empty / revert commit): just advance headSha.
     if (head.treeSha && head.treeSha === base.treeSha) {
       await saveSnapshot({ ...base, headSha: head.sha, lastEtag: head.etag, lastCheckedAt: now, leaseUntil: null });
-      return unmodified(topics, head.sha, branch);
+      return unmodified(topics, head.sha, repo, branch);
     }
 
     // ── 3. Diff ──────────────────────────────────────────────────────────────
-    const tree = await getFileTreeResult(REPO_OWNER, REPO_NAME, head.sha);
+    const tree = await getFileTreeResult(owner, name, head.sha);
     if (tree.truncated) {
       // A truncated tree would look like mass deletions — keep stored state.
       console.warn(`[wiki/sync] truncated tree for "${branch}" — skipping incremental sync`);
-      return unmodified(topics, base.headSha, branch, {
+      return unmodified(topics, base.headSha, repo, branch, {
         warning: 'GitHub returned a truncated file tree — incremental sync skipped; stored topics served.',
       });
     }
@@ -392,6 +398,7 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
     if (unclassifiedPaths.length >= 3 || hasNewTopLevelDir) {
       try {
         const { updatedTopics, remainingUnclassified } = await extendTopics(
+          repo,
           branch,
           unclassifiedPaths,
           current,
@@ -436,7 +443,7 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
       for (const topic of topicsToRebuild) {
         try {
           console.log(`[wiki/sync] Rebuilding page for topic "${topic.title}"...`);
-          const pages = await generatePagesForTopic(topic, branch, head.sha, newPaths, ['wiki', 'picture'], newEntries);
+          const pages = await generatePagesForTopic(topic, head.sha, newPaths, ['wiki', 'picture'], newEntries);
           Object.assign(topic, pageFieldsToStore(pages, head.sha, now));
           if (!topicsToSave.some((ts) => ts._id === topic._id)) {
             topicsToSave.push(topic);
@@ -470,10 +477,10 @@ export async function syncBranch(branch: string): Promise<SyncOutcome> {
       unclassifiedPaths.length && `${unclassifiedPaths.length} unclassified`,
     ].filter(Boolean);
     const changeSummary = parts.length > 0 ? parts.join(', ') : 'no file changes';
-    console.log(`[wiki/sync] "${branch}" → ${head.sha.slice(0, 7)}: ${changeSummary}`);
+    console.log(`[wiki/sync] ${repo}@${branch} → ${head.sha.slice(0, 7)}: ${changeSummary}`);
 
-    return { status: 'synced', headSha: head.sha, branch, topics: current, changeSummary };
+    return { status: 'synced', headSha: head.sha, repo, branch, topics: current, changeSummary };
   } finally {
-    await releaseLease(branch).catch((err) => console.warn('[wiki/sync] lease release failed:', err));
+    await releaseLease(repo, branch).catch((err) => console.warn('[wiki/sync] lease release failed:', err));
   }
 }

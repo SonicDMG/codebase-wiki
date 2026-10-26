@@ -24,13 +24,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getLlmModel, llmClient } from '@/lib/llm';
 import { fetchFileContents, formatTreeForPrompt, getBranchHead, getFileTree } from '@/lib/github';
 import { wikiPrompt, picturePrompt } from '@/lib/wiki/prompts';
+import { resolveBranch, resolveRepo } from '@/lib/wiki/repo';
+import { splitRepo, type RepoKey } from '@/lib/wiki/types';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
 
-const REPO_OWNER = 'SonicDMG';
-const REPO_NAME = 'walfly';
-const DEFAULT_BRANCH = 'main';
 
 const MAX_FILES_TO_FETCH = 15;
 const MAX_FILE_CHARS = 8_000; // per-file content cap to stay within context budget
@@ -44,6 +43,7 @@ interface ChatMessage {
 type AnswerMode = 'wiki' | 'picture';
 
 interface WikiChatRequest {
+  repo?: string;
   branch?: string;
   mode?: AnswerMode;
   messages: ChatMessage[];
@@ -91,10 +91,14 @@ export async function POST(req: NextRequest) {
   }
 
   // ── Resolve the branch head commit ONCE; the whole request stays anchored to it ──
-  const branch = typeof body.branch === 'string' && body.branch.trim() ? body.branch.trim() : DEFAULT_BRANCH;
+  const resolved = resolveRepo(body.repo);
+  if (!resolved.ok) return resolved.response;
+  const { repo } = resolved;
+  const { owner, name } = splitRepo(repo);
+  const branch = await resolveBranch(repo, body.branch);
   let commitSha: string;
   try {
-    const head = await getBranchHead(REPO_OWNER, REPO_NAME, branch);
+    const head = await getBranchHead(owner, name, branch);
     if (head.status === 'rate-limited') {
       return NextResponse.json({ error: 'GitHub rate limit reached — try again shortly' }, { status: 503 });
     }
@@ -115,7 +119,7 @@ export async function POST(req: NextRequest) {
   // ── Stage 1: fetch file tree + select relevant files ──────────────────────
   let systemPrompt: string;
   try {
-    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model, commitSha, mode);
+    systemPrompt = await buildSystemPrompt(lastUserMessage, client, model, repo, commitSha, mode);
   } catch (err) {
     console.error('[wiki/chat] context build failed:', err instanceof Error ? err.message : err);
     return NextResponse.json(
@@ -177,13 +181,15 @@ async function buildSystemPrompt(
   question: string,
   client: ReturnType<typeof llmClient>,
   model: string,
+  repo: RepoKey,
   commitSha: string,
   mode: AnswerMode,
 ): Promise<string> {
-  const githubBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/blob/${commitSha}`;
+  const { owner, name } = splitRepo(repo);
+  const githubBase = `https://github.com/${repo}/blob/${commitSha}`;
 
   // 1. File tree
-  const entries = await getFileTree(REPO_OWNER, REPO_NAME, commitSha);
+  const entries = await getFileTree(owner, name, commitSha);
   const treeText = formatTreeForPrompt(entries);
   console.log(`[wiki/chat] tree has ${entries.length} files after filtering`);
 
@@ -195,8 +201,8 @@ async function buildSystemPrompt(
       {
         role: 'system',
         content: `You are a file selector for a code Q&A system.
-Given a developer's question and a list of files in the Walfly monorepo, return ONLY a JSON array of up to ${MAX_FILES_TO_FETCH} file paths that are most likely to contain the answer.
-Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/lib/llm.ts","apps/mobile/app/(tabs)/chat.tsx"]`,
+Given a developer's question and a list of files in the ${repo} repository, return ONLY a JSON array of up to ${MAX_FILES_TO_FETCH} file paths that are most likely to contain the answer.
+Output ONLY valid JSON. No prose, no markdown fences. Example: ["src/index.ts","lib/config.ts"]`,
       },
       {
         role: 'user',
@@ -221,16 +227,16 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
   console.log(`[wiki/chat] selected ${selectedPaths.length} files:`, selectedPaths);
 
   if (selectedPaths.length === 0) {
-    return FALLBACK_SYSTEM_PROMPT;
+    return fallbackPrompt(repo);
   }
 
   // 3. Fetch file contents live from GitHub
-  const contents = await fetchFileContents(REPO_OWNER, REPO_NAME, selectedPaths, commitSha);
+  const contents = await fetchFileContents(owner, name, selectedPaths, commitSha);
   const fetchedPaths = Object.keys(contents);
   console.log(`[wiki/chat] fetched ${fetchedPaths.length}/${selectedPaths.length} files`);
 
   if (fetchedPaths.length === 0) {
-    return FALLBACK_SYSTEM_PROMPT;
+    return fallbackPrompt(repo);
   }
 
   // 4. Assemble system prompt. Lines are numbered so citations can use real
@@ -249,13 +255,13 @@ Output ONLY valid JSON. No prose, no markdown fences. Example: ["packages/api/li
     .join('\n\n');
 
   return mode === 'picture'
-    ? picturePrompt(githubBase, commitSha, filesBlock)
-    : wikiPrompt(githubBase, commitSha, filesBlock);
+    ? picturePrompt(repo, githubBase, commitSha, filesBlock)
+    : wikiPrompt(repo, githubBase, commitSha, filesBlock);
 }
 
 
-const FALLBACK_SYSTEM_PROMPT = `You are a live documentation assistant for the Walfly codebase.
-No file contents could be loaded for this question. Tell the user honestly and suggest they check the repository directly at https://github.com/${REPO_OWNER}/${REPO_NAME}.`;
+const fallbackPrompt = (repo: RepoKey) => `You are a live documentation assistant for the ${repo} codebase.
+No file contents could be loaded for this question. Tell the user honestly and suggest they check the repository directly at https://github.com/${repo}.`;
 
 export async function OPTIONS(): Promise<Response> {
   return new Response(null, { status: 204 });

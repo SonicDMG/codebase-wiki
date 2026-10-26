@@ -43,6 +43,7 @@ import {
 } from './generate';
 import type {
   IntegrityProblem,
+  RepoKey,
   WikiJob,
   WikiJobFailure,
   WikiJobRequest,
@@ -52,6 +53,9 @@ import type {
 } from './types';
 
 const LOG = '[wiki/job]';
+
+/** Key of the one-job-per-branch slot. */
+const slot = (repo: RepoKey, branch: string) => `${repo}:${branch}`;
 
 /** A job counts as running only while its heartbeat is this fresh. */
 export const JOB_HEARTBEAT_STALE_MS = 30_000;
@@ -74,17 +78,17 @@ export class JobAlreadyRunningError extends Error {
 
 export interface JobRunner {
   /** Start a job and return immediately. Throws JobAlreadyRunningError if one runs. */
-  start(branch: string, request: WikiJobRequest): Promise<StartResult>;
+  start(repo: RepoKey, branch: string, request: WikiJobRequest): Promise<StartResult>;
   /** Ask the running job (if any) to stop after in-flight topics finish. */
-  stop(branch: string): Promise<boolean>;
+  stop(repo: RepoKey, branch: string): Promise<boolean>;
   /** Resume an interrupted job. Not implemented locally until phase 7. */
-  resume(branch: string): Promise<{ jobId: string }>;
+  resume(repo: RepoKey, branch: string): Promise<{ jobId: string }>;
   /** Write a fresh heartbeat for the job. */
-  heartbeat(branch: string, jobId: string): Promise<void>;
+  heartbeat(repo: RepoKey, branch: string, jobId: string): Promise<void>;
   /** Claim the branch's job slot for `jobId`. False if another live job holds it. */
-  acquireLease(branch: string, jobId: string): Promise<boolean>;
+  acquireLease(repo: RepoKey, branch: string, jobId: string): Promise<boolean>;
   /** Release the in-process claim for `jobId`. */
-  releaseLease(branch: string, jobId: string): Promise<void>;
+  releaseLease(repo: RepoKey, branch: string, jobId: string): Promise<void>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,8 +116,8 @@ interface Plan {
 }
 
 /** Build the generation plan for a job request. */
-async function planFor(branch: string, request: WikiJobRequest): Promise<Plan | null> {
-  const [topics, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+async function planFor(repo: RepoKey, branch: string, request: WikiJobRequest): Promise<Plan | null> {
+  const [topics, snapshot] = await Promise.all([getStoredTopics(repo, branch), getSnapshot(repo, branch)]);
   if (!snapshot || topics.length === 0) {
     if (request.kind === 'refresh-page') {
       throw new Error(`Unknown topic "${request.slug}"`);
@@ -167,40 +171,40 @@ function validatePage(mode: PageMode, page: string | undefined): string | null {
 // ── Local implementation ──────────────────────────────────────────────────────
 
 class LocalDetachedRunner implements JobRunner {
-  /** branch -> jobId for jobs running in THIS process. Survives HMR via globalThis. */
+  /** `repo:branch` -> jobId for jobs running in THIS process. Survives HMR via globalThis. */
   private get active(): Map<string, string> {
     const g = globalThis as { __wikiActiveJobs?: Map<string, string> };
     return (g.__wikiActiveJobs ??= new Map());
   }
 
-  async acquireLease(branch: string, jobId: string): Promise<boolean> {
-    const held = this.active.get(branch);
+  async acquireLease(repo: RepoKey, branch: string, jobId: string): Promise<boolean> {
+    const held = this.active.get(slot(repo, branch));
     if (held && held !== jobId) return false;
-    const snap = await getSnapshot(branch);
+    const snap = await getSnapshot(repo, branch);
     if (isJobLive(snap?.job) && snap?.job?.id !== jobId) return false;
     // Re-check after the await: another start() in this process may have won.
-    const heldNow = this.active.get(branch);
+    const heldNow = this.active.get(slot(repo, branch));
     if (heldNow && heldNow !== jobId) return false;
-    this.active.set(branch, jobId);
+    this.active.set(slot(repo, branch), jobId);
     return true;
   }
 
-  async releaseLease(branch: string, jobId: string): Promise<void> {
-    if (this.active.get(branch) === jobId) this.active.delete(branch);
+  async releaseLease(repo: RepoKey, branch: string, jobId: string): Promise<void> {
+    if (this.active.get(slot(repo, branch)) === jobId) this.active.delete(slot(repo, branch));
   }
 
-  async heartbeat(branch: string, jobId: string): Promise<void> {
-    await updateJobFields(branch, jobId, { heartbeatAt: new Date().toISOString() });
+  async heartbeat(repo: RepoKey, branch: string, jobId: string): Promise<void> {
+    await updateJobFields(repo, branch, jobId, { heartbeatAt: new Date().toISOString() });
   }
 
-  async stop(branch: string): Promise<boolean> {
-    const flagged = await requestJobCancel(branch);
+  async stop(repo: RepoKey, branch: string): Promise<boolean> {
+    const flagged = await requestJobCancel(repo, branch);
     console.log(`${LOG} stop requested for ${branch}: ${flagged ? 'flagged' : 'no running job'}`);
     return flagged;
   }
 
-  async resume(branch: string): Promise<{ jobId: string }> {
-    const snap = await getSnapshot(branch);
+  async resume(repo: RepoKey, branch: string): Promise<{ jobId: string }> {
+    const snap = await getSnapshot(repo, branch);
     const job = snap?.job ?? null;
 
     if (!job) {
@@ -220,17 +224,17 @@ class LocalDetachedRunner implements JobRunner {
     const jobId = job.id;
 
     // Acquire lease for this existing job id (interrupted job is not live, so it works).
-    if (!(await this.acquireLease(branch, jobId))) {
-      throw new JobAlreadyRunningError(this.active.get(branch) ?? jobId);
+    if (!(await this.acquireLease(repo, branch, jobId))) {
+      throw new JobAlreadyRunningError(this.active.get(slot(repo, branch)) ?? jobId);
     }
 
     try {
       // Bump heartbeat to show it's alive again.
-      await updateJobFields(branch, jobId, { heartbeatAt: new Date().toISOString() });
+      await updateJobFields(repo, branch, jobId, { heartbeatAt: new Date().toISOString() });
 
       if (job.kind === 'rebuild') {
         // Staged pages were in memory only; restart the rebuild phase from scratch.
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           finished: 0,
           succeeded: 0,
           failures: [],
@@ -248,7 +252,7 @@ class LocalDetachedRunner implements JobRunner {
           heartbeatAt: new Date().toISOString(),
         };
         console.log(`${LOG} ${jobId} resume rebuild on ${branch}`);
-        void this.runRebuild(branch, freshJob).catch((e) =>
+        void this.runRebuild(repo, branch, freshJob).catch((e) =>
           console.error(`${LOG} ${jobId} rebuild runner crashed unexpectedly:`, e),
         );
         return { jobId };
@@ -256,7 +260,7 @@ class LocalDetachedRunner implements JobRunner {
 
       if (job.kind === 'integrity-check') {
         // Cheap, read-only: restart the check from scratch.
-        const freshPlan = await planFor(branch, job.request);
+        const freshPlan = await planFor(repo, branch, job.request);
         const total = freshPlan?.items.length ?? 0;
         const reset = {
           total,
@@ -267,16 +271,16 @@ class LocalDetachedRunner implements JobRunner {
           currentSlugs: [] as string[],
           heartbeatAt: new Date().toISOString(),
         };
-        await updateJobFields(branch, jobId, reset);
+        await updateJobFields(repo, branch, jobId, reset);
         if (!freshPlan || total === 0) {
           const finishedAt = new Date().toISOString();
-          await updateJobFields(branch, jobId, {
+          await updateJobFields(repo, branch, jobId, {
             status: 'completed',
             integrity: { checkedAt: finishedAt, problems: [] },
             finishedAt,
             heartbeatAt: finishedAt,
           });
-          await appendRecentJob(branch, {
+          await appendRecentJob(repo, branch, {
             id: jobId,
             kind: job.kind,
             status: 'completed',
@@ -287,25 +291,25 @@ class LocalDetachedRunner implements JobRunner {
             startedAt: job.startedAt,
             finishedAt,
           });
-          await this.releaseLease(branch, jobId);
+          await this.releaseLease(repo, branch, jobId);
           return { jobId };
         }
         console.log(`${LOG} ${jobId} resume integrity-check on ${branch}`);
-        void this.run(branch, { ...job, ...reset }, freshPlan).catch((e) =>
+        void this.run(repo, branch, { ...job, ...reset }, freshPlan).catch((e) =>
           console.error(`${LOG} ${jobId} runner crashed unexpectedly:`, e),
         );
         return { jobId };
       }
 
       // For refresh kinds: re-plan and skip already-done slugs.
-      const plan = await planFor(branch, job.request);
+      const plan = await planFor(repo, branch, job.request);
       const doneSlugs = new Set(job.doneSlugs ?? []);
 
       if (!plan || plan.items.length === 0) {
         // Nothing to do at all — finish the job now.
         const finalStatus: WikiJobStatus = job.failures.length > 0 ? 'completed-with-errors' : 'completed';
         const finishedAt = new Date().toISOString();
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           status: finalStatus,
           finished: job.finished,
           succeeded: job.succeeded,
@@ -314,7 +318,7 @@ class LocalDetachedRunner implements JobRunner {
           finishedAt,
           heartbeatAt: finishedAt,
         });
-        await appendRecentJob(branch, {
+        await appendRecentJob(repo, branch, {
           id: jobId,
           kind: job.kind,
           status: finalStatus,
@@ -325,7 +329,7 @@ class LocalDetachedRunner implements JobRunner {
           startedAt: job.startedAt,
           finishedAt,
         });
-        await this.releaseLease(branch, jobId);
+        await this.releaseLease(repo, branch, jobId);
         return { jobId };
       }
 
@@ -336,7 +340,7 @@ class LocalDetachedRunner implements JobRunner {
         // All items already done — finish.
         const finalStatus: WikiJobStatus = job.failures.length > 0 ? 'completed-with-errors' : 'completed';
         const finishedAt = new Date().toISOString();
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           status: finalStatus,
           finished: job.finished,
           succeeded: job.succeeded,
@@ -345,7 +349,7 @@ class LocalDetachedRunner implements JobRunner {
           finishedAt,
           heartbeatAt: finishedAt,
         });
-        await appendRecentJob(branch, {
+        await appendRecentJob(repo, branch, {
           id: jobId,
           kind: job.kind,
           status: finalStatus,
@@ -356,14 +360,14 @@ class LocalDetachedRunner implements JobRunner {
           startedAt: job.startedAt,
           finishedAt,
         });
-        await this.releaseLease(branch, jobId);
+        await this.releaseLease(repo, branch, jobId);
         return { jobId };
       }
 
       const resumedPlan: Plan = { ...plan, items: remainingItems };
       // total = finished so far + remaining items so progress bar is coherent.
       const newTotal = job.finished + remainingItems.length;
-      await updateJobFields(branch, jobId, {
+      await updateJobFields(repo, branch, jobId, {
         total: newTotal,
         heartbeatAt: new Date().toISOString(),
       });
@@ -377,7 +381,7 @@ class LocalDetachedRunner implements JobRunner {
         `${LOG} ${jobId} resume on ${branch}: ${remainingItems.length} remaining (${doneSlugs.size} already done)`,
       );
 
-      void this.run(branch, resumedJob, resumedPlan, {
+      void this.run(repo, branch, resumedJob, resumedPlan, {
         initFinished: job.finished,
         initSucceeded: job.succeeded,
         initFailures: [...job.failures],
@@ -387,21 +391,21 @@ class LocalDetachedRunner implements JobRunner {
       );
       return { jobId };
     } catch (err) {
-      await this.releaseLease(branch, jobId);
+      await this.releaseLease(repo, branch, jobId);
       throw err;
     }
   }
 
-  async start(branch: string, request: WikiJobRequest): Promise<StartResult> {
+  async start(repo: RepoKey, branch: string, request: WikiJobRequest): Promise<StartResult> {
     // Fast in-process reject, then DB check (inside acquireLease).
-    const held = this.active.get(branch);
+    const held = this.active.get(slot(repo, branch));
     if (held) throw new JobAlreadyRunningError(held);
 
     const jobId = randomUUID();
-    const snapBefore = await getSnapshot(branch);
+    const snapBefore = await getSnapshot(repo, branch);
     if (isJobLive(snapBefore?.job)) throw new JobAlreadyRunningError(snapBefore!.job!.id);
-    if (!(await this.acquireLease(branch, jobId))) {
-      throw new JobAlreadyRunningError(this.active.get(branch) ?? snapBefore?.job?.id ?? 'unknown');
+    if (!(await this.acquireLease(repo, branch, jobId))) {
+      throw new JobAlreadyRunningError(this.active.get(slot(repo, branch)) ?? snapBefore?.job?.id ?? 'unknown');
     }
 
     try {
@@ -425,18 +429,18 @@ class LocalDetachedRunner implements JobRunner {
           request,
           doneSlugs: [],
         };
-        await updateSnapshotJob(branch, job);
+        await updateSnapshotJob(repo, branch, job);
         console.log(`${LOG} ${jobId} rebuild started on ${branch}`);
-        void this.runRebuild(branch, job).catch((e) =>
+        void this.runRebuild(repo, branch, job).catch((e) =>
           console.error(`${LOG} ${jobId} rebuild runner crashed unexpectedly:`, e),
         );
         return { status: 'started', jobId };
       }
 
       // Plan up front so "nothing to do" never creates a running job.
-      const plan = await planFor(branch, request);
+      const plan = await planFor(repo, branch, request);
       if (!plan || plan.items.length === 0) {
-        await this.releaseLease(branch, jobId);
+        await this.releaseLease(repo, branch, jobId);
         console.log(`${LOG} nothing to do for ${branch}`);
         return { status: 'nothing-to-do' };
       }
@@ -460,16 +464,16 @@ class LocalDetachedRunner implements JobRunner {
         request,
         doneSlugs: [],
       };
-      await updateSnapshotJob(branch, job);
+      await updateSnapshotJob(repo, branch, job);
       console.log(`${LOG} ${jobId} started on ${branch}: ${job.total} topic(s)`);
 
       // Detached: not awaited by the request.
-      void this.run(branch, job, plan).catch((e) =>
+      void this.run(repo, branch, job, plan).catch((e) =>
         console.error(`${LOG} ${jobId} runner crashed unexpectedly:`, e),
       );
       return { status: 'started', jobId };
     } catch (err) {
-      await this.releaseLease(branch, jobId);
+      await this.releaseLease(repo, branch, jobId);
       throw err;
     }
   }
@@ -477,6 +481,7 @@ class LocalDetachedRunner implements JobRunner {
   /** Whole job body. Never rejects; always writes a final status.
    *  Pass `init` when resuming to seed counters from the interrupted job. */
   private async run(
+    repo: RepoKey,
     branch: string,
     job: WikiJob,
     plan: Plan,
@@ -497,7 +502,7 @@ class LocalDetachedRunner implements JobRunner {
     const integrityProblems: IntegrityProblem[] = [];
 
     const beat = () => {
-      void this.heartbeat(branch, jobId).catch((e) =>
+      void this.heartbeat(repo, branch, jobId).catch((e) =>
         console.warn(`${LOG} ${jobId} heartbeat failed:`, errMsg(e)),
       );
     };
@@ -507,7 +512,7 @@ class LocalDetachedRunner implements JobRunner {
     // never the whole `job` object — so a concurrent cancel flag survives.
     const writeProgress = async () => {
       try {
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           finished,
           succeeded,
           failures: [...failures],
@@ -535,8 +540,8 @@ class LocalDetachedRunner implements JobRunner {
           };
           const cancelled =
             stage.kind === 'integrity-check'
-              ? await this.checkIntegrity(branch, jobId, plan, ctx, integrityProblems)
-              : await this.refreshPages(branch, jobId, plan, ctx);
+              ? await this.checkIntegrity(repo, branch, jobId, plan, ctx, integrityProblems)
+              : await this.refreshPages(repo, branch, jobId, plan, ctx);
           if (cancelled) {
             status = 'cancelled';
             break;
@@ -556,7 +561,7 @@ class LocalDetachedRunner implements JobRunner {
       inFlight.clear();
       const finishedAt = new Date().toISOString();
       try {
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           status,
           finished,
           succeeded,
@@ -569,7 +574,7 @@ class LocalDetachedRunner implements JobRunner {
             ? { integrity: { checkedAt: finishedAt, problems: integrityProblems } }
             : {}),
         });
-        await appendRecentJob(branch, {
+        await appendRecentJob(repo, branch, {
           id: jobId,
           kind: job.kind,
           status,
@@ -583,7 +588,7 @@ class LocalDetachedRunner implements JobRunner {
       } catch (e) {
         console.error(`${LOG} ${jobId} could not write final status:`, e);
       }
-      await this.releaseLease(branch, jobId);
+      await this.releaseLease(repo, branch, jobId);
       console.log(
         `${LOG} ${jobId} ${status}: ${succeeded}/${job.total} succeeded, ${failures.length} failure(s)`,
       );
@@ -592,6 +597,7 @@ class LocalDetachedRunner implements JobRunner {
 
   /** Stage: read-only integrity check, sequential, no LLM. Returns true if cancelled. */
   private async checkIntegrity(
+    repo: RepoKey,
     branch: string,
     jobId: string,
     plan: Plan,
@@ -604,7 +610,7 @@ class LocalDetachedRunner implements JobRunner {
   ): Promise<boolean> {
     for (const { topic } of plan.items) {
       // Re-read the cancel flag from the DB before each topic.
-      const snap = await getSnapshot(branch);
+      const snap = await getSnapshot(repo, branch);
       if (snap?.job?.id === jobId && snap.job.cancelRequested) {
         console.log(`${LOG} ${jobId} cancel requested; stopping integrity check`);
         return true;
@@ -634,6 +640,7 @@ class LocalDetachedRunner implements JobRunner {
 
   /** Stage: regenerate stale pages, concurrency 2. Returns true if cancelled. */
   private async refreshPages(
+    repo: RepoKey,
     branch: string,
     jobId: string,
     plan: Plan,
@@ -650,7 +657,7 @@ class LocalDetachedRunner implements JobRunner {
       for (;;) {
         if (cancelled) return;
         // Re-read the cancel flag from the DB BEFORE starting each topic.
-        const snap = await getSnapshot(branch);
+        const snap = await getSnapshot(repo, branch);
         if (snap?.job?.id === jobId && snap.job.cancelRequested) {
           cancelled = true;
           console.log(`${LOG} ${jobId} cancel requested; not starting new topics`);
@@ -661,7 +668,7 @@ class LocalDetachedRunner implements JobRunner {
         const slug = item.topic.slug;
         ctx.inFlight.add(slug);
         await ctx.writeProgress();
-        const failure = await this.refreshTopic(branch, plan, item);
+        const failure = await this.refreshTopic(repo, branch, plan, item);
         ctx.inFlight.delete(slug);
         ctx.onResult(!failure, failure ?? undefined, slug);
         await ctx.writeProgress();
@@ -674,6 +681,7 @@ class LocalDetachedRunner implements JobRunner {
 
   /** Generate, validate and save one topic. Returns a failure record or null. */
   private async refreshTopic(
+    repo: RepoKey,
     branch: string,
     plan: Plan,
     { topic, modes }: WorkItem,
@@ -681,7 +689,6 @@ class LocalDetachedRunner implements JobRunner {
     try {
       const pages = await generatePagesForTopic(
         topic,
-        branch,
         plan.commit,
         plan.allPaths,
         modes,
@@ -702,7 +709,7 @@ class LocalDetachedRunner implements JobRunner {
     }
   }
   /** Full rebuild: generateTopics -> generate all pages in memory -> swap. Never rejects. */
-  private async runRebuild(branch: string, job: WikiJob): Promise<void> {
+  private async runRebuild(repo: RepoKey, branch: string, job: WikiJob): Promise<void> {
     const jobId = job.id;
     let status: WikiJobStatus = 'failed';
     let finished = 0;
@@ -712,7 +719,7 @@ class LocalDetachedRunner implements JobRunner {
     const inFlight = new Set<string>();
 
     const beat = () => {
-      void this.heartbeat(branch, jobId).catch((e) =>
+      void this.heartbeat(repo, branch, jobId).catch((e) =>
         console.warn(`${LOG} ${jobId} heartbeat failed:`, errMsg(e)),
       );
     };
@@ -720,7 +727,7 @@ class LocalDetachedRunner implements JobRunner {
 
     const writeProgress = async () => {
       try {
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           finished,
           succeeded,
           failures: [...failures],
@@ -740,7 +747,7 @@ class LocalDetachedRunner implements JobRunner {
     try {
       // (a) Generate topic list.
       console.log(`${LOG} ${jobId} rebuild: generating topics for ${branch}`);
-      const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(branch);
+      const { result, snapshotEntries, unclassifiedPaths, treeSha } = await generateTopics(repo, branch);
       const newTopics = result.topics;
       const headSha = result.headSha;
       const allPaths = snapshotEntries.map((e) => e.path);
@@ -752,7 +759,7 @@ class LocalDetachedRunner implements JobRunner {
       }
 
       // Update job total now that we know it.
-      await updateJobFields(branch, jobId, { total: newTopics.length, heartbeatAt: new Date().toISOString() });
+      await updateJobFields(repo, branch, jobId, { total: newTopics.length, heartbeatAt: new Date().toISOString() });
       job.total = newTopics.length;
 
       // (b) Generate pages for every new topic in memory, concurrency 2.
@@ -762,7 +769,7 @@ class LocalDetachedRunner implements JobRunner {
         for (;;) {
           if (cancelled) return;
           // Re-read cancel flag from DB before each topic (matches refreshPages behaviour).
-          const snap = await getSnapshot(branch);
+          const snap = await getSnapshot(repo, branch);
           if (snap?.job?.id === jobId && snap.job.cancelRequested) {
             cancelled = true;
             console.log(`${LOG} ${jobId} rebuild cancel requested`);
@@ -780,7 +787,6 @@ class LocalDetachedRunner implements JobRunner {
           try {
             const pages = await generatePagesForTopic(
               topic,
-              branch,
               headSha,
               allPaths,
               modes,
@@ -835,7 +841,7 @@ class LocalDetachedRunner implements JobRunner {
       // (d) Swap: acquire sync lease (up to 3 retries, 5 s apart).
       let leaseAcquired = false;
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (await acquireSyncLease(branch)) {
+        if (await acquireSyncLease(repo, branch)) {
           leaseAcquired = true;
           break;
         }
@@ -853,12 +859,12 @@ class LocalDetachedRunner implements JobRunner {
 
       try {
         console.log(`${LOG} ${jobId} rebuild swapping ${stagedTopics.length} topics`);
-        await replaceTopics(branch, stagedTopics);
-        const snapshotDoc = buildSnapshotDoc(branch, snapshotEntries, unclassifiedPaths, headSha, treeSha);
+        await replaceTopics(repo, branch, stagedTopics);
+        const snapshotDoc = buildSnapshotDoc(repo, branch, snapshotEntries, unclassifiedPaths, headSha, treeSha);
         await saveSnapshot({ ...snapshotDoc, leaseUntil: null });
         console.log(`${LOG} ${jobId} rebuild swap complete`);
       } finally {
-        await releaseSyncLease(branch).catch((e) =>
+        await releaseSyncLease(repo, branch).catch((e) =>
           console.warn(`${LOG} ${jobId} sync lease release failed:`, errMsg(e)),
         );
       }
@@ -873,7 +879,7 @@ class LocalDetachedRunner implements JobRunner {
       inFlight.clear();
       const finishedAt = new Date().toISOString();
       try {
-        await updateJobFields(branch, jobId, {
+        await updateJobFields(repo, branch, jobId, {
           status,
           finished,
           succeeded,
@@ -882,7 +888,7 @@ class LocalDetachedRunner implements JobRunner {
           finishedAt,
           heartbeatAt: finishedAt,
         });
-        await appendRecentJob(branch, {
+        await appendRecentJob(repo, branch, {
           id: jobId,
           kind: job.kind,
           status,
@@ -896,7 +902,7 @@ class LocalDetachedRunner implements JobRunner {
       } catch (e) {
         console.error(`${LOG} ${jobId} could not write final status:`, e);
       }
-      await this.releaseLease(branch, jobId);
+      await this.releaseLease(repo, branch, jobId);
       console.log(
         `${LOG} ${jobId} rebuild ${status}: ${succeeded}/${job.total} succeeded, ${failures.length} failure(s)`,
       );

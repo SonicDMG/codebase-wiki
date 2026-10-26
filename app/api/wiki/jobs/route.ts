@@ -1,6 +1,7 @@
 /**
  * POST /api/wiki/jobs
  *   {
+ *     repo?: string,   // owner/name; defaults to WIKI_DEFAULT_REPO
  *     branch?: string,
  *     action: 'start' | 'stop' | 'resume',
  *     kind?: 'refresh-stale' | 'refresh-field-guide' | 'refresh-page' | 'rebuild' | 'integrity-check',
@@ -19,14 +20,14 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getJobRunner, JobAlreadyRunningError } from '@/lib/wiki/runner';
+import { resolveBranch, resolveRepo } from '@/lib/wiki/repo';
 import type { WikiJobRequest } from '@/lib/wiki/types';
 
 export const runtime = 'nodejs';
 
-const DEFAULT_BRANCH = 'main';
-
 export async function POST(req: NextRequest) {
   let body: {
+    repo?: unknown;
     branch?: unknown;
     action?: unknown;
     kind?: unknown;
@@ -40,7 +41,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Request body must be JSON.' }, { status: 400 });
   }
 
-  const branch = typeof body.branch === 'string' && body.branch.trim() ? body.branch.trim() : DEFAULT_BRANCH;
+  const resolved = resolveRepo(body.repo);
+  if (!resolved.ok) return resolved.response;
+  const { repo } = resolved;
+  const branch = await resolveBranch(repo, body.branch);
   const runner = getJobRunner();
 
   try {
@@ -78,7 +82,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: `Unknown job kind "${String(kind)}".` }, { status: 400 });
       }
 
-      const result = await runner.start(branch, request);
+      const result = await runner.start(repo, branch, request);
       if (result.status === 'nothing-to-do') {
         return NextResponse.json({ status: 'nothing-to-do', message: 'No stale pages to refresh.' });
       }
@@ -86,7 +90,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === 'stop') {
-      const stopped = await runner.stop(branch);
+      const stopped = await runner.stop(repo, branch);
       return NextResponse.json({
         stopped,
         message: stopped
@@ -96,7 +100,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === 'resume') {
-      const result = await runner.resume(branch);
+      const result = await runner.resume(repo, branch);
       return NextResponse.json({ status: 'resumed', jobId: result.jobId });
     }
 

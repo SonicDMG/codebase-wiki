@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * /wiki — Live Walfly Codebase Q&A
+ * /wiki — Live GitHub Codebase Q&A (any repo)
  *
  * Three-column layout:
  *   Left   — persistent TOC nav (auto-generated topics)
@@ -50,9 +50,15 @@ declare global {
   }
 }
 
-const REPO_URL = 'https://github.com/SonicDMG/walfly';
+/** The GitHub URL for an "owner/name" repo, or null before one is chosen. */
+function repoUrl(repo: string | null): string | null {
+  return repo ? `https://github.com/${repo}` : null;
+}
 
-// ── Walfly design tokens ───────────────────────────────────────────────────
+/** The repo being read, so citation links can point at the right GitHub repo. */
+const RepoContext = createContext<string | null>(null);
+
+// ── Design tokens ───────────────────────────────────────────────────
 const c = {
   amber:     '#F5A623',
   amberGlow: '#F5A62326',
@@ -67,7 +73,7 @@ const ANSWER_MODES: { mode: AnswerMode; label: string; title: string }[] = [
   { mode: 'wiki', label: '📖 Wiki', title: 'Technical wiki pages' },
   { mode: 'picture', label: '🕹️ Field Guide', title: 'The real words and how things work, drawn in pictures' },
 ];
-const MODE_STORAGE_KEY = 'walfly_wiki_mode';
+const MODE_STORAGE_KEY = 'wiki_mode';
 
 interface Answer {
   content: string;
@@ -129,11 +135,11 @@ const WELCOME_MESSAGE: Message = {
   answers: {
     wiki: {
       content:
-        '## Welcome\nAsk anything about the Walfly codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Switch the whole wiki between **📖 Wiki** (technical pages) and **🕹️ Field Guide** (the real words and how things work, in pictures) at the top right\n- Click a citation chip to see the exact code in the references panel',
+        '## Welcome\nAsk anything about this codebase. Answers are read **live from the GitHub source**, so they always match the current commit.\n\n- Pick a topic on the left for a guided overview\n- Or type your own question below\n- Switch the whole wiki between **📖 Wiki** (technical pages) and **🕹️ Field Guide** (the real words and how things work, in pictures) at the top right\n- Click a citation chip to see the exact code in the references panel',
     },
     picture: {
       content: [
-        '{"type":"words","title":"Walfly Field Guide","words":[{"word":"Topic","color":"orange","means":"One part of the codebase, with a page already written for it."},{"word":"Citation","color":"cyan","means":"A link to the exact lines of code behind a picture."}]}',
+        '{"type":"words","title":"Codebase Field Guide","words":[{"word":"Topic","color":"orange","means":"One part of the codebase, with a page already written for it."},{"word":"Citation","color":"cyan","means":"A link to the exact lines of code behind a picture."}]}',
         '{"type":"lesson","title":"Every topic has its own page","picture":{"kind":"flow","steps":[{"label":"Pick a topic","color":"orange","note":"on the left"},{"label":"Read its page","color":"green"},{"label":"Ask more","color":"cyan","note":"in the box below"}]},"lines":["Each topic keeps its own conversation.","Your follow-up questions stay with their topic."]}',
         '{"type":"lesson","title":"Pictures come from the real code","picture":{"kind":"compare","rows":[{"items":["Wiki"],"ok":true,"verdict":"Technical pages, for reading closely"},{"items":["Field Guide"],"ok":true,"verdict":"The same facts, drawn in pictures"}]},"lines":["Switch modes once, at the top right. Every page follows.","Click a **Citation** to see the code beside the page."],"rule":"Pages are read live from GitHub, so they match the current commit."}',
       ].map((card) => '```picture\n' + card + '\n```').join('\n\n'),
@@ -141,11 +147,15 @@ const WELCOME_MESSAGE: Message = {
   },
 };
 
-const GENERAL_KEY = 'general';
-const CONVERSATIONS_STORAGE_KEY = 'walfly_wiki_conversations_v2';
+const CONVERSATIONS_STORAGE_KEY = 'wiki_conversations_v3';
 
-function topicKey(branch: string | null, slug: string): string {
-  return `${branch ?? ''}:${slug}`;
+/** The free-form conversation for a repo. */
+function generalKey(repo: string | null): string {
+  return `general:${repo ?? ''}`;
+}
+
+function topicKey(repo: string | null, branch: string | null, slug: string): string {
+  return `${repo ?? ''}:${branch ?? ''}:${slug}`;
 }
 
 /**
@@ -212,9 +222,9 @@ const SYNC_POLL_CAP_MS = 300_000;
 // ── Main component ─────────────────────────────────────────────────────────
 
 export default function WikiPage() {
-  // One conversation per topic (keyed `${branch}:${slug}`), plus GENERAL_KEY for free-form questions.
+  // One conversation per topic (keyed `${repo}:${branch}:${slug}`), plus generalKey(repo) for free-form questions.
   const [conversations, setConversations] = useState<Record<string, Message[]>>({
-    [GENERAL_KEY]: [WELCOME_MESSAGE],
+    [generalKey(null)]: [WELCOME_MESSAGE],
   });
   const conversationsRestored = useRef(false);
 
@@ -248,9 +258,12 @@ export default function WikiPage() {
   const [tocTopics, setTocTopics] = useState<TocTopic[]>([]);
   const [tocLoading, setTocLoading] = useState(true);
   const [activeSlug, setActiveSlug] = useState<string | null>(null);
+  const [wikiRepo, setWikiRepo] = useState<string | null>(null);
   const [wikiBranch, setWikiBranch] = useState<string | null>(null);
-  const { status: wikiStatus, refresh: refreshStatus } = useWikiStatus(wikiBranch);
+  const { status: wikiStatus, refresh: refreshStatus } = useWikiStatus(wikiRepo, wikiBranch);
   const [branches, setBranches] = useState<string[]>([]);
+  const [storedRepos, setStoredRepos] = useState<string[]>([]);
+  const [repoError, setRepoError] = useState<string | null>(null);
   const [headSha, setHeadSha] = useState<string | null>(null);
   const [syncState, setSyncState] = useState<SyncState>('idle');
   const [syncNote, setSyncNote] = useState<string | null>(null);
@@ -290,41 +303,69 @@ export default function WikiPage() {
     };
   }, [statusMenuOpen]);
 
-  // ── Fetch branches ────────────────────────────────────────────────────────
-  const fetchBranches = useCallback(async () => {
-    if (branches.length > 0) return;
-    try {
-      const res = await fetch('/api/wiki/branches');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { branches?: string[]; defaultBranch?: string };
-      if (Array.isArray(data.branches) && data.branches.length > 0) {
-        setBranches(data.branches);
+  // ── Branches and stored repos follow the repo ──────────────────────────────
+  useEffect(() => {
+    if (!wikiRepo) return;
+    let cancelled = false;
+    setBranches([]);
+    setActiveSlug(null);
+    (async () => {
+      try {
+        const res = await fetch(`/api/wiki/branches?repo=${encodeURIComponent(wikiRepo)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { branches?: string[] };
+        if (!cancelled && Array.isArray(data.branches)) setBranches(data.branches);
+      } catch (err) {
+        console.warn('[wiki] branches load failed:', err);
       }
-    } catch (err) {
-      console.warn('[wiki] branches load failed:', err);
-    }
-  }, [branches.length]);
+      try {
+        const res = await fetch('/api/wiki/repos');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { repos?: { repo: string }[] };
+        if (!cancelled && Array.isArray(data.repos)) setStoredRepos(data.repos.map((r) => r.repo));
+      } catch (err) {
+        console.warn('[wiki] repos load failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [wikiRepo]);
 
-  // ── Load TOC for a branch ─────────────────────────────────────────────────
-  const loadToc = useCallback(async (branch?: string, silent?: boolean) => {
+  // Keep the address bar shareable: ?repo=owner/name&branch=...
+  useEffect(() => {
+    if (!wikiRepo || !wikiBranch) return;
+    const params = new URLSearchParams({ repo: wikiRepo, branch: wikiBranch });
+    window.history.replaceState(null, '', `${window.location.pathname}?${params}`);
+  }, [wikiRepo, wikiBranch]);
+
+  // ── Load TOC for a repo and branch ────────────────────────────────────────
+  // With no repo it loads the server's default repo; with no branch, the repo's default branch.
+  const loadToc = useCallback(async (repo?: string | null, branch?: string | null, silent?: boolean) => {
     const reqId = ++tocReqIdRef.current;
     if (!silent) setTocLoading(true);
     try {
-      const url = branch ? `/api/wiki/toc?branch=${encodeURIComponent(branch)}` : '/api/wiki/toc';
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { topics?: TocTopic[]; branch?: string; headSha?: string };
+      const params = new URLSearchParams();
+      if (repo) params.set('repo', repo);
+      if (branch) params.set('branch', branch);
+      const res = await fetch(`/api/wiki/toc?${params}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error((err as { error?: string }).error ?? `HTTP ${res.status}`);
+      }
+      const data = (await res.json()) as { topics?: TocTopic[]; repo?: string; branch?: string; headSha?: string };
       if (reqId !== tocReqIdRef.current) return;
       if (Array.isArray(data.topics)) setTocTopics(data.topics);
-      if (data.branch) {
+      if (data.repo && data.branch) {
+        setWikiRepo(data.repo);
         setWikiBranch(data.branch);
         setHeadSha(data.headSha ?? null);
         setSyncState('up-to-date');
+        setRepoError(null);
       }
     } catch (err) {
       if (reqId === tocReqIdRef.current) {
         console.warn('[wiki] TOC load failed:', err);
         setSyncState('error');
+        if (!silent) setRepoError(err instanceof Error ? err.message : 'Failed to load the wiki');
       }
     } finally {
       if (reqId === tocReqIdRef.current && !silent) {
@@ -345,18 +386,18 @@ export default function WikiPage() {
       wikiStatus.job.status !== 'cancelled' &&
       wikiStatus.job.status !== 'failed'
     ) {
-      void loadToc(wikiBranch ?? undefined);
+      void loadToc(wikiRepo, wikiBranch);
     }
-  }, [wikiStatus?.job?.status, wikiStatus?.job?.kind, wikiBranch, loadToc]);
+  }, [wikiStatus?.job?.status, wikiStatus?.job?.kind, wikiRepo, wikiBranch, loadToc]);
 
   // Topics regenerated by a job, a single-page refresh or a rebuild: reload quietly.
-  useTopicVersionWatch(wikiStatus, () => { void loadToc(wikiBranch ?? undefined, true); });
+  useTopicVersionWatch(wikiStatus, () => { void loadToc(wikiRepo, wikiBranch, true); });
 
-  // ── Load branches and TOC on mount ─────────────────────────────────────────
+  // ── Load the TOC on mount, from ?repo=&branch= when present ───────────────
   useEffect(() => {
-    void fetchBranches();
-    void loadToc();
-  }, [fetchBranches, loadToc]);
+    const params = new URLSearchParams(window.location.search);
+    void loadToc(params.get('repo'), params.get('branch'));
+  }, [loadToc]);
 
   // ── Branch switcher ───────────────────────────────────────────────────────
   const handleBranchSelect = (newBranch: string) => {
@@ -366,12 +407,25 @@ export default function WikiPage() {
     setSyncNote(null);
     setSyncWarning(null);
     setActiveSlug(null);
-    void loadToc(newBranch);
+    void loadToc(wikiRepo, newBranch);
+  };
+
+  // ── Repo switcher ─────────────────────────────────────────────────────────
+  // The old repo stays on screen until the new one has loaded (a new repo is
+  // analysed on first open, which takes a while); a bad name leaves it as is.
+  const handleRepoSelect = (raw: string) => {
+    const next = raw.trim();
+    if (!next || next.toLowerCase() === wikiRepo) return;
+    setHeadSha(null);
+    setSyncNote(null);
+    setSyncWarning(null);
+    setStatusMenuOpen(false);
+    void loadToc(next, null);
   };
 
   // ── Poll for new commits (with exponential backoff & tab visibility check) ─
   useEffect(() => {
-    if (!wikiBranch) return;
+    if (!wikiRepo || !wikiBranch) return;
     let cancelled = false;
     let inFlight = false;
     currentDelayRef.current = SYNC_POLL_MS;
@@ -398,7 +452,7 @@ export default function WikiPage() {
         const res = await fetch('/api/wiki/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ branch: wikiBranch }),
+          body: JSON.stringify({ repo: wikiRepo, branch: wikiBranch }),
         });
 
         if (!res.ok) {
@@ -476,7 +530,7 @@ export default function WikiPage() {
       document.removeEventListener('visibilitychange', onWake);
       window.removeEventListener('focus', onWake);
     };
-  }, [wikiBranch]);
+  }, [wikiRepo, wikiBranch]);
 
   // ── highlight.js + Mermaid from CDN ──────────────────────────────────────
   useEffect(() => {
@@ -544,8 +598,14 @@ export default function WikiPage() {
     window.addEventListener('mouseup', onMouseUp);
   }, [sidebarWidth]);
 
-  const activeKey = activeSlug ? topicKey(wikiBranch, activeSlug) : GENERAL_KEY;
+  const activeKey = activeSlug ? topicKey(wikiRepo, wikiBranch, activeSlug) : generalKey(wikiRepo);
   const currentMessages = conversations[activeKey] ?? [];
+
+  // Every repo's free-form chat opens with the welcome message.
+  useEffect(() => {
+    const key = generalKey(wikiRepo);
+    setConversations((prev) => (prev[key] ? prev : { ...prev, [key]: [WELCOME_MESSAGE] }));
+  }, [wikiRepo]);
 
   // When a new question is asked, bring it to the top of the reading pane.
   // Don't follow streaming tokens — the reader starts at the top of the answer.
@@ -570,7 +630,7 @@ export default function WikiPage() {
       let next = prev;
       for (const topic of tocTopics) {
         if (topic.slug === activeSlug) continue; // the reader is viewing it: offer a banner instead
-        const key = topicKey(wikiBranch, topic.slug);
+        const key = topicKey(wikiRepo, wikiBranch, topic.slug);
         const list = prev[key];
         if (!isUntouchedOpening(list, topic.slug)) continue;
         const shown = list![1].answers;
@@ -582,7 +642,7 @@ export default function WikiPage() {
       }
       return next;
     });
-  }, [tocTopics, wikiBranch, activeSlug]);
+  }, [tocTopics, wikiRepo, wikiBranch, activeSlug]);
 
   // ── New-version banner for the page being read ────────────────────────────
   const activeTopic = activeSlug ? tocTopics.find((t) => t.slug === activeSlug) : undefined;
@@ -638,6 +698,7 @@ export default function WikiPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          repo: wikiRepo ?? undefined,
           branch: wikiBranch ?? undefined,
           mode,
           messages: history,
@@ -687,7 +748,7 @@ export default function WikiPage() {
       setLoading(false);
       inputRef.current?.focus();
     }
-  }, [wikiBranch]);
+  }, [wikiRepo, wikiBranch]);
 
   // ── Send ──────────────────────────────────────────────────────────────────
   // `key` overrides the active conversation — a topic click sends before its
@@ -730,7 +791,7 @@ export default function WikiPage() {
   // pre-generated page, or answers live if that page isn't generated yet.
   const handleTopicClick = (topic: TocTopic) => {
     setActiveSlug(topic.slug);
-    const key = topicKey(wikiBranch, topic.slug);
+    const key = topicKey(wikiRepo, wikiBranch, topic.slug);
     if (conversations[key]?.length) return;
     const opening = topicOpening(topic);
     if (opening) setConversations((prev) => ({ ...prev, [key]: opening }));
@@ -738,11 +799,12 @@ export default function WikiPage() {
   };
 
   const latestAnswer = shownAnswer(latestAssistantMsg, answerMode);
-  const parsedLatest = latestAnswer ? parseMessage(latestAnswer.content, latestAnswer.commit) : null;
+  const parsedLatest = latestAnswer ? parseMessage(latestAnswer.content, latestAnswer.commit, wikiRepo) : null;
 
   return (
     <div className="wiki-root" data-mode={answerMode} style={styles.root}>
       <AnswerModeContext.Provider value={answerMode}>
+      <RepoContext.Provider value={wikiRepo}>
       <GlobalMdStyles />
       {/* ── Header ── */}
       <header style={styles.header}>
@@ -754,7 +816,7 @@ export default function WikiPage() {
           }}
           title="Return to general chat"
         >
-          Walfly Wiki
+          Codebase Wiki
         </span>
         <span style={styles.subtitle}> — live codebase Q&A</span>
         <ModeToggle value={answerMode} onChange={changeMode} />
@@ -767,7 +829,6 @@ export default function WikiPage() {
               onClick={() => {
                 setStatusMenuOpen((prev) => {
                   const next = !prev;
-                  if (next) void fetchBranches();
                   return next;
                 });
               }}
@@ -818,12 +879,17 @@ export default function WikiPage() {
                     )}
                   </select>
                 </div>
+                <div style={styles.dropdownDivider} />
+                <RepoPicker current={wikiRepo} repos={storedRepos} error={repoError} onSubmit={handleRepoSelect} />
               </div>
             )}
           </div>
         )}
-        {wikiBranch && (
-          <WikiStatusPill branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
+        {!wikiBranch && !tocLoading && (
+          <RepoPicker current={wikiRepo} repos={storedRepos} error={repoError} onSubmit={handleRepoSelect} />
+        )}
+        {wikiRepo && wikiBranch && (
+          <WikiStatusPill repo={wikiRepo} branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
         )}
         {syncWarning && (
           <span
@@ -835,9 +901,11 @@ export default function WikiPage() {
             ⚠ {syncWarning}
           </span>
         )}
-        <a href={REPO_URL} target="_blank" rel="noreferrer" style={styles.repoLink}>
-          SonicDMG/walfly ↗
-        </a>
+        {wikiRepo && (
+          <a href={repoUrl(wikiRepo) ?? undefined} target="_blank" rel="noreferrer" style={styles.repoLink}>
+            {wikiRepo} ↗
+          </a>
+        )}
       </header>
 
       {/* ── Body ── */}
@@ -882,7 +950,7 @@ export default function WikiPage() {
                     >
                       {entry ? (
                         <a
-                          href={`/wiki/status?branch=${encodeURIComponent(wikiBranch ?? '')}&topic=${encodeURIComponent(topic.slug)}`}
+                          href={`/wiki/status?repo=${encodeURIComponent(wikiRepo ?? '')}&branch=${encodeURIComponent(wikiBranch ?? '')}&topic=${encodeURIComponent(topic.slug)}`}
                           title={`Status details for ${topic.title}`}
                           aria-label={`Status details for ${topic.title}`}
                           style={{
@@ -990,7 +1058,7 @@ export default function WikiPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about any part of the codebase… (Enter to send, Shift+Enter for newline)"
+            placeholder="Ask about any part of this codebase… (Enter to send, Shift+Enter for newline)"
             rows={2}
             disabled={loading}
             autoFocus
@@ -1005,6 +1073,7 @@ export default function WikiPage() {
         </div>
         <p style={styles.hint}>Grounded in the current GitHub source — citations open in GitHub.</p>
       </footer>
+      </RepoContext.Provider>
       </AnswerModeContext.Provider>
     </div>
   );
@@ -1030,6 +1099,7 @@ function MessageBlock({
   if (message.role === 'user') {
     return <h1 id={`msg-${message.id}`} style={styles.question}>{message.content}</h1>;
   }
+  const repo = useContext(RepoContext);
   const answer = shownAnswer(message, mode);
   const content = answer?.content ?? '';
   const streaming = !!answer?.pending;
@@ -1053,11 +1123,57 @@ function MessageBlock({
       ) : (
         <MarkdownContent
           className={proseClass}
-          content={parseMessage(content, answer?.commit).prose}
+          content={parseMessage(content, answer?.commit, repo).prose}
           commit={answer?.commit}
         />
       )}
     </article>
+  );
+}
+
+// ── RepoPicker ─────────────────────────────────────────────────────────────
+
+interface RepoPickerProps {
+  current: string | null;
+  repos: string[];
+  error: string | null;
+  onSubmit: (repo: string) => void;
+}
+
+/** Type any GitHub "owner/name" (or paste a github.com URL); repos already indexed are suggested. */
+function RepoPicker({ current, repos, error, onSubmit }: RepoPickerProps) {
+  const [value, setValue] = useState('');
+  return (
+    <form
+      style={styles.dropdownSection}
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSubmit(value);
+        setValue('');
+      }}
+    >
+      <label htmlFor="wiki-repo-input" style={styles.branchLabel}>
+        Repo
+      </label>
+      <input
+        id="wiki-repo-input"
+        list="wiki-repo-options"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder={current ?? 'owner/name or GitHub URL'}
+        style={styles.branchSelect}
+        aria-label="Open a GitHub repo"
+        autoComplete="off"
+        spellCheck={false}
+      />
+      <datalist id="wiki-repo-options">
+        {repos.map((r) => <option key={r} value={r} />)}
+      </datalist>
+      <button type="submit" disabled={!value.trim()} style={styles.repoOpenBtn}>
+        Open
+      </button>
+      {error && <span role="alert" style={styles.repoError}>{error}</span>}
+    </form>
   );
 }
 
@@ -1481,13 +1597,14 @@ interface PictureCite { url: string; label: string }
 
 const CITE_SPEC = /^\s*([^\s:]+):(\d+)(?:-(\d+))?\s*$/;
 
-function citeToRef(cite: unknown, commit: string | undefined): PictureCite | null {
-  if (!commit || typeof cite !== 'string') return null;
+function citeToRef(cite: unknown, commit: string | undefined, repo: string | null): PictureCite | null {
+  const base = repoUrl(repo);
+  if (!base || !commit || typeof cite !== 'string') return null;
   const m = cite.match(CITE_SPEC);
   if (!m) return null;
   const [, path, start, end = start] = m;
   return {
-    url: `${REPO_URL}/blob/${commit}/${path}#L${start}-L${end}`,
+    url: `${base}/blob/${commit}/${path}#L${start}-L${end}`,
     label: `${path.split('/').pop()}:${start}-${end}`,
   };
 }
@@ -1716,6 +1833,7 @@ interface PictureBlockProps {
 }
 
 function PictureBlock({ source, streaming, commit, anchor }: PictureBlockProps) {
+  const repo = useContext(RepoContext);
   // Mid-stream the JSON is partial; only repair a card once it's complete.
   let spec: Record<string, unknown> | null = null;
   try {
@@ -1731,7 +1849,7 @@ function PictureBlock({ source, streaming, commit, anchor }: PictureBlockProps) 
   }
 
   const cite = (value: unknown) => {
-    const refs = citeSpecs(value).map((c) => citeToRef(c, commit)).filter((r): r is PictureCite => !!r);
+    const refs = citeSpecs(value).map((c) => citeToRef(c, commit, repo)).filter((r): r is PictureCite => !!r);
     if (refs.length === 0) return null;
     return (
       <span className="pic-cite">
@@ -2099,24 +2217,25 @@ function isCodeCitation(url: string): boolean {
  */
 const NATIVE_CITATION = /【([^】\s]+?):(\d+)(?:-(\d+))?】/g;
 
-function linkNativeCitations(markdown: string, commit: string | undefined): string {
-  if (!commit) return markdown;
-  const base = `${REPO_URL}/blob/${commit}`;
+function linkNativeCitations(markdown: string, commit: string | undefined, repo: string | null): string {
+  const root = repoUrl(repo);
+  if (!commit || !root) return markdown;
+  const base = `${root}/blob/${commit}`;
   return markdown.replace(NATIVE_CITATION, (_, path: string, start: string, end: string = start) => {
     const file = path.split('/').pop();
     return ` [${file}:${start}-${end}](${base}/${path}#L${start}-L${end})`;
   });
 }
 
-function parseMessage(rawContent: string, commit?: string): ParsedMessage {
-  let prose = linkNativeCitations(rawContent, commit);
+function parseMessage(rawContent: string, commit: string | undefined, repo: string | null): ParsedMessage {
+  let prose = linkNativeCitations(rawContent, commit, repo);
   let tree = mdParser.parse(prose) as Root;
 
   // Despite instructions, models sometimes wrap the whole answer in one
   // ```markdown fence. If that's the only node, render its contents instead.
   const only = tree.children.length === 1 ? tree.children[0] : null;
   if (only?.type === 'code' && (only.lang === 'markdown' || only.lang === 'md')) {
-    prose = linkNativeCitations(only.value, commit);
+    prose = linkNativeCitations(only.value, commit, repo);
     tree = mdParser.parse(prose) as Root;
   }
 
@@ -2134,7 +2253,7 @@ function parseMessage(rawContent: string, commit?: string): ParsedMessage {
       const spec = parseCard(node.value);
       if (!spec) return;
       for (const value of pictureCites(spec)) {
-        const ref = citeToRef(value, commit);
+        const ref = citeToRef(value, commit, repo);
         if (ref) addRef(ref.url, ref.label);
       }
     }
@@ -2394,7 +2513,7 @@ const styles = {
     boxShadow: '0 4px 12px rgba(0, 0, 0, 0.08)',
     padding: '6px',
     zIndex: 100,
-    minWidth: '170px',
+    minWidth: '240px',
   },
   dropdownSection: {
     display: 'flex',
@@ -2409,6 +2528,16 @@ const styles = {
     textTransform: 'uppercase' as const,
     letterSpacing: '0.05em',
   },
+  repoOpenBtn: {
+    padding: '4px 8px',
+    fontSize: '12px',
+    color: w.text,
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '4px',
+    cursor: 'pointer',
+  },
+  repoError: { fontSize: '12px', color: '#c0392b' },
   branchSelect: {
     width: '100%',
     padding: '4px 8px',

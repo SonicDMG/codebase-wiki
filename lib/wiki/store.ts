@@ -13,7 +13,8 @@
 
 import type { Collection } from '@datastax/astra-db-ts';
 import { getDb, VECTOR_DIMENSION, VECTOR_MODEL, VECTORIZE_MAX_CHARS } from '@/lib/astra';
-import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult, WikiJob, WikiJobSummary } from './types';
+import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult, WikiJob, WikiJobSummary, RepoKey } from './types';
+import { snapshotId } from './types';
 
 const WIKI_TOC_COLLECTION = 'wiki_toc_v2';
 
@@ -126,9 +127,9 @@ async function ensureWikiTocCollection(): Promise<Collection<WikiTopicDoc | Wiki
  * Load all topic documents for a branch, sorted by `order` ascending.
  * Returns an empty array when none are found.
  */
-export async function getStoredTopics(branch: string): Promise<WikiTopicDoc[]> {
+export async function getStoredTopics(repo: RepoKey, branch: string): Promise<WikiTopicDoc[]> {
   const col = await ensureWikiTocCollection();
-  const cursor = col.find({ kind: 'topic', branch } as any);
+  const cursor = col.find({ kind: 'topic', repo, branch } as any);
   const docs: WikiTopicDoc[] = [];
   for await (const doc of cursor) {
     docs.push(doc as unknown as WikiTopicDoc);
@@ -140,9 +141,9 @@ export async function getStoredTopics(branch: string): Promise<WikiTopicDoc[]> {
 // ── Snapshot reads/writes ─────────────────────────────────────────────────────
 
 /** Load the snapshot document for a branch, or null if none exists. */
-export async function getSnapshot(branch: string): Promise<WikiSnapshotDoc | null> {
+export async function getSnapshot(repo: RepoKey, branch: string): Promise<WikiSnapshotDoc | null> {
   const col = await ensureWikiTocCollection();
-  const id = `${branch}:snapshot`;
+  const id = snapshotId(repo, branch);
   const doc = await col.findOne({ _id: id } as any);
   return doc ? (doc as unknown as WikiSnapshotDoc) : null;
 }
@@ -199,12 +200,12 @@ export async function updateTopicFields(id: string, fields: Partial<WikiTopicDoc
 }
 
 /**
- * Return the set of branch names that have at least one stored snapshot.
- * Used by branch seeding in sync.ts to find a donor branch.
+ * Return the branch names of a repo that have at least one stored snapshot.
+ * Used by branch seeding in sync.ts to find a donor branch (same repo only).
  */
-export async function getStoredBranches(): Promise<string[]> {
+export async function getStoredBranches(repo: RepoKey): Promise<string[]> {
   const col = await ensureWikiTocCollection();
-  const cursor = col.find({ kind: 'snapshot' } as any, { projection: { branch: 1 } as any });
+  const cursor = col.find({ kind: 'snapshot', repo } as any, { projection: { branch: 1 } as any });
   const branches: string[] = [];
   for await (const doc of cursor) {
     const snap = doc as unknown as { branch?: string };
@@ -214,24 +215,42 @@ export async function getStoredBranches(): Promise<string[]> {
 }
 
 /**
+ * Every repo that has a stored snapshot, with the branches stored for it.
+ * Backs the repo picker in the UI.
+ */
+export async function getStoredRepos(): Promise<Array<{ repo: RepoKey; branches: string[] }>> {
+  const col = await ensureWikiTocCollection();
+  const cursor = col.find({ kind: 'snapshot' } as any, { projection: { repo: 1, branch: 1 } as any });
+  const byRepo = new Map<RepoKey, string[]>();
+  for await (const doc of cursor) {
+    const snap = doc as unknown as { repo?: RepoKey; branch?: string };
+    if (!snap.repo || !snap.branch) continue; // pre-migration docs have no repo
+    byRepo.set(snap.repo, [...(byRepo.get(snap.repo) ?? []), snap.branch]);
+  }
+  return [...byRepo.entries()]
+    .map(([repo, branches]) => ({ repo, branches: branches.sort() }))
+    .sort((a, b) => a.repo.localeCompare(b.repo));
+}
+
+/**
  * Make `topics` the complete topic set for a branch: upsert them, then delete
  * every other topic stored for the branch. Writing before deleting means
  * readers never see an empty TOC, and a generation that overlaps another can't
  * leave both sets behind (slugs differ between generations, so upserts alone
  * would accumulate).
  */
-export async function replaceTopics(branch: string, topics: WikiTopicDoc[]): Promise<void> {
+export async function replaceTopics(repo: RepoKey, branch: string, topics: WikiTopicDoc[]): Promise<void> {
   await saveTopics(topics);
   const col = await ensureWikiTocCollection();
-  await col.deleteMany({ kind: 'topic', branch, _id: { $nin: topics.map((t) => t._id) } } as any);
+  await col.deleteMany({ kind: 'topic', repo, branch, _id: { $nin: topics.map((t) => t._id) } } as any);
 }
 
 /**
  * Delete all topic documents for a branch.
  */
-export async function deleteTopicsForBranch(branch: string): Promise<void> {
+export async function deleteTopicsForBranch(repo: RepoKey, branch: string): Promise<void> {
   const col = await ensureWikiTocCollection();
-  await col.deleteMany({ kind: 'topic', branch } as any);
+  await col.deleteMany({ kind: 'topic', repo, branch } as any);
 }
 
 /**
@@ -275,9 +294,9 @@ export async function saveSnapshot(snapshot: WikiSnapshotDoc): Promise<void> {
 const RECENT_JOBS_LIMIT = 10;
 
 /** Create/replace the whole `job` object (only at job start). */
-export async function updateSnapshotJob(branch: string, job: WikiJob): Promise<void> {
+export async function updateSnapshotJob(repo: RepoKey, branch: string, job: WikiJob): Promise<void> {
   const col = await ensureWikiTocCollection();
-  await col.updateOne({ _id: `${branch}:snapshot` } as any, { $set: { job } } as any);
+  await col.updateOne({ _id: snapshotId(repo, branch) } as any, { $set: { job } } as any);
 }
 
 /**
@@ -285,6 +304,7 @@ export async function updateSnapshotJob(branch: string, job: WikiJob): Promise<v
  * Never touches `job.cancelRequested`. No-op when `job.id` doesn't match.
  */
 export async function updateJobFields(
+  repo: RepoKey,
   branch: string,
   jobId: string,
   fields: Partial<Omit<WikiJob, 'id' | 'cancelRequested'>>,
@@ -295,28 +315,28 @@ export async function updateJobFields(
   }
   if (Object.keys(set).length === 0) return;
   const col = await ensureWikiTocCollection();
-  await col.updateOne({ _id: `${branch}:snapshot`, 'job.id': jobId } as any, { $set: set } as any);
+  await col.updateOne({ _id: snapshotId(repo, branch), 'job.id': jobId } as any, { $set: set } as any);
 }
 
 /** Set only `job.cancelRequested` on the running job. Returns true if a running job was flagged. */
-export async function requestJobCancel(branch: string): Promise<boolean> {
+export async function requestJobCancel(repo: RepoKey, branch: string): Promise<boolean> {
   const col = await ensureWikiTocCollection();
   const res = await col.updateOne(
-    { _id: `${branch}:snapshot`, 'job.status': 'running' } as any,
+    { _id: snapshotId(repo, branch), 'job.status': 'running' } as any,
     { $set: { 'job.cancelRequested': true } } as any,
   );
   return res.matchedCount > 0;
 }
 
 /** Prepend a finished-job summary to `recentJobs` (keeps the last 10). */
-export async function appendRecentJob(branch: string, summary: WikiJobSummary): Promise<void> {
-  const snap = await getSnapshot(branch);
+export async function appendRecentJob(repo: RepoKey, branch: string, summary: WikiJobSummary): Promise<void> {
+  const snap = await getSnapshot(repo, branch);
   const recentJobs = [summary, ...(snap?.recentJobs ?? []).filter((j) => j.id !== summary.id)].slice(
     0,
     RECENT_JOBS_LIMIT,
   );
   const col = await ensureWikiTocCollection();
-  await col.updateOne({ _id: `${branch}:snapshot` } as any, { $set: { recentJobs } } as any);
+  await col.updateOne({ _id: snapshotId(repo, branch) } as any, { $set: { recentJobs } } as any);
 }
 
 // ── Lease management ─────────────────────────────────────────────────────────
@@ -331,12 +351,12 @@ export async function appendRecentJob(branch: string, summary: WikiJobSummary): 
  * Astra does not support compare-and-swap natively, so we do a findOne + conditional
  * replace — this is advisory (not hard-locked) which is fine per the PRD.
  */
-export async function acquireLease(branch: string): Promise<boolean> {
+export async function acquireLease(repo: RepoKey, branch: string): Promise<boolean> {
   const now = Date.now();
-  const snapshotId = `${branch}:snapshot`;
+  const snapshotDocId = snapshotId(repo, branch);
   const col = await ensureWikiTocCollection();
 
-  const existing = await col.findOne({ _id: snapshotId } as any);
+  const existing = await col.findOne({ _id: snapshotDocId } as any);
   if (!existing) {
     // No snapshot yet — no lease to contest.
     return true;
@@ -351,7 +371,7 @@ export async function acquireLease(branch: string): Promise<boolean> {
   // Acquire lease by writing leaseUntil.
   const leaseUntil = now + LEASE_DURATION_MS;
   await col.updateOne(
-    { _id: snapshotId } as any,
+    { _id: snapshotDocId } as any,
     { $set: { leaseUntil } } as any,
   );
   return true;
@@ -361,11 +381,11 @@ export async function acquireLease(branch: string): Promise<boolean> {
  * Release the sync lease for a branch (set leaseUntil to null).
  * Called after sync completes (success or failure).
  */
-export async function releaseLease(branch: string): Promise<void> {
-  const snapshotId = `${branch}:snapshot`;
+export async function releaseLease(repo: RepoKey, branch: string): Promise<void> {
+  const snapshotDocId = snapshotId(repo, branch);
   const col = await ensureWikiTocCollection();
   await col.updateOne(
-    { _id: snapshotId } as any,
+    { _id: snapshotDocId } as any,
     { $set: { leaseUntil: null } } as any,
   );
 }

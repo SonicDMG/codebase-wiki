@@ -17,7 +17,8 @@
  *   5. Re-order topics by their existing order field.
  */
 
-import type { TopicScope, WikiTopicDoc } from './types';
+import { topicId } from './types';
+import type { RepoKey, TopicScope, WikiTopicDoc } from './types';
 import { isScopeEmpty, pathMatchesScope } from './scope';
 
 const CATCH_ALL_TITLE = 'Repo Config & Tooling';
@@ -82,6 +83,7 @@ function repairScope(scope: TopicScope, allPaths: string[]): TopicScope {
 export function repairGeneratedTopics(
   rawTopics: WikiTopicDoc[],
   allPaths: string[],
+  repo: RepoKey,
   branch: string,
 ): WikiTopicDoc[] {
   const now = new Date().toISOString();
@@ -126,8 +128,9 @@ export function repairGeneratedTopics(
     const description =
       'Root-level configuration files, tooling setup, CI/CD workflows, and repository conventions.';
     result.push({
-      _id: `${branch}:${CATCH_ALL_SLUG}`,
+      _id: topicId(repo, branch, CATCH_ALL_SLUG),
       kind: 'topic',
+      repo,
       branch,
       slug: CATCH_ALL_SLUG,
       order: result.length,

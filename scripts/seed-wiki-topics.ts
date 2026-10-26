@@ -1,15 +1,15 @@
 /**
  * seed-wiki-topics.ts
  *
- * Ensures wiki topics are generated and synced for a given branch.
- * Calls ensureTopics(branch) then syncBranch(branch) and prints a summary.
+ * Ensures wiki topics are generated and synced for a given repo + branch.
+ * Calls ensureTopics then syncBranch and prints a summary.
  *
  * Usage:
- *   npm run seed-wiki --workspace=apps/wiki -- [branch]
- *   npm run seed-wiki --workspace=apps/wiki -- main
+ *   npm run seed-wiki --workspace=apps/wiki -- --repo=owner/name [branch]
+ *   npm run seed-wiki --workspace=apps/wiki -- --repo=owner/name main
  *   npm run seed-wiki --workspace=apps/wiki -- --help
  *
- * branch defaults to 'main'.
+ * --repo defaults to WIKI_DEFAULT_REPO; branch defaults to 'main'.
  * Exit code 0 on success, 1 on failure.
  */
 
@@ -25,9 +25,10 @@ if (args.includes('--help') || args.includes('-h')) {
     [
       '',
       'Usage:',
-      '  npm run seed-wiki --workspace=apps/wiki -- [branch]',
+      '  npm run seed-wiki --workspace=apps/wiki -- [--repo=owner/name] [branch]',
       '',
       'Arguments:',
+      '  --repo    GitHub repo as owner/name (default: $WIKI_DEFAULT_REPO)',
       '  branch    Git branch to seed/sync (default: main)',
       '',
       'Options:',
@@ -35,9 +36,9 @@ if (args.includes('--help') || args.includes('-h')) {
       '',
       'Behaviour:',
       '  1. Loads apps/wiki/.env.local (if present).',
-      '  2. Calls ensureTopics(branch) — returns stored topics or runs initial generation.',
-      '  3. Calls syncBranch(branch) — diffs against the branch head and absorbs changes.',
-      '  4. Prints a summary: branch, topic count, titles, headSha, generated flag, sync status.',
+      '  2. Calls ensureTopics(repo, branch) — returns stored topics or runs initial generation.',
+      '  3. Calls syncBranch(repo, branch) — diffs against the branch head and absorbs changes.',
+      '  4. Prints a summary: repo, branch, topic count, titles, headSha, generated flag, sync status.',
       '',
     ].join('\n'),
   );
@@ -53,25 +54,30 @@ if (existsSync(envPath)) {
 
 // ── main (dynamic import keeps env ahead of db/llm clients) ──────────────────
 
-const branch = args[0] ?? 'main';
+const branch = args.find((a) => !a.startsWith('--')) ?? 'main';
 
 (async () => {
   const { ensureTopics, syncBranch } = await import('../lib/wiki/sync');
+  const { parseRepoKey } = await import('../lib/wiki/types');
 
-  console.log(`[seed-wiki] branch: ${branch}`);
+  const repo = parseRepoKey(args.find((a) => a.startsWith('--repo='))?.slice(7) ?? process.env.WIKI_DEFAULT_REPO);
+  if (!repo) throw new Error('Pass --repo=owner/name (or set WIKI_DEFAULT_REPO).');
+
+  console.log(`[seed-wiki] repo: ${repo}  branch: ${branch}`);
 
   // Step 1 — ensure topics exist (generates if needed).
-  const { topics, snapshot, generated } = await ensureTopics(branch);
+  const { topics, snapshot, generated } = await ensureTopics(repo, branch);
   console.log(
     `[seed-wiki] ensureTopics → ${topics.length} topic(s), generated=${generated}, headSha=${snapshot.headSha}`,
   );
 
   // Step 2 — sync against branch head.
-  const outcome = await syncBranch(branch);
+  const outcome = await syncBranch(repo, branch);
 
   // Summary
   console.log('');
   console.log('── Wiki Topic Seed Summary ──────────────────────────────────');
+  console.log(`  repo        : ${outcome.repo}`);
   console.log(`  branch      : ${outcome.branch}`);
   console.log(`  topics      : ${outcome.topics.length}`);
   console.log(`  headSha     : ${outcome.headSha}`);

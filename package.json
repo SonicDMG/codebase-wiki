@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "seed-wiki": "tsx scripts/seed-wiki-topics.ts"
+    "seed-wiki": "tsx scripts/seed-wiki-topics.ts",
+    "migrate-wiki-repo": "tsx scripts/migrate-wiki-repo.ts"
   },
   "dependencies": {
     "@datastax/astra-db-ts": "^2.3.0",

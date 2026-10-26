@@ -7,11 +7,11 @@ const POLL_MS = 45_000;
 const JOB_POLL_MS = 1_000;
 
 /**
- * Fetches /api/wiki/status for a branch on mount / branch change, then every
+ * Fetches /api/wiki/status for a repo + branch on mount / change, then every
  * 45 seconds (every 1 second while a job is running) while the document is
  * visible. Aborts and clears timers on cleanup. `refresh()` refetches now.
  */
-export function useWikiStatus(branch: string | null): {
+export function useWikiStatus(repo: string | null, branch: string | null): {
   status: WikiStatusResponse | null;
   error: string | null;
   refresh: () => void;
@@ -24,7 +24,7 @@ export function useWikiStatus(branch: string | null): {
   const jobRunning = status?.job?.status === 'running' && !status.interrupted;
 
   useEffect(() => {
-    if (!branch) return;
+    if (!repo || !branch) return;
     let controller: AbortController | null = null;
     let timer: ReturnType<typeof setInterval> | null = null;
     let disposed = false;
@@ -33,7 +33,7 @@ export function useWikiStatus(branch: string | null): {
       controller?.abort();
       controller = new AbortController();
       try {
-        const res = await fetch(`/api/wiki/status?branch=${encodeURIComponent(branch)}`, {
+        const res = await fetch(`/api/wiki/status?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch)}`, {
           signal: controller.signal,
         });
         const data = await res.json();
@@ -74,12 +74,12 @@ export function useWikiStatus(branch: string | null): {
       controller?.abort();
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [branch, jobRunning]);
+  }, [repo, branch, jobRunning]);
 
-  // Clear stale status when the branch changes.
+  // Clear stale status when the repo or branch changes.
   useEffect(() => {
     setStatus(null);
-  }, [branch]);
+  }, [repo, branch]);
 
   const refresh = useCallback(() => loadRef.current(), []);
 

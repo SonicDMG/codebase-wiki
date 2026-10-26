@@ -7,6 +7,44 @@
  *               the 2-minute sync lease.
  */
 
+// ── Repo identity ─────────────────────────────────────────────────────────────
+
+/**
+ * A GitHub repo as "owner/name", lower-cased. GitHub treats owner and repo
+ * names case-insensitively, so one canonical form keeps ids and filters stable.
+ */
+export type RepoKey = string;
+
+const REPO_KEY_RE = /^[a-z0-9](?:[a-z0-9-]{0,38})\/[a-z0-9._-]{1,100}$/;
+
+/** Parse and validate "owner/name" (also accepts a github.com URL). Returns null if invalid. */
+export function parseRepoKey(input: string | null | undefined): RepoKey | null {
+  if (!input) return null;
+  const cleaned = input
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+  return REPO_KEY_RE.test(cleaned) ? cleaned : null;
+}
+
+/** Split a RepoKey into the owner/name pair the GitHub helpers take. */
+export function splitRepo(repo: RepoKey): { owner: string; name: string } {
+  const [owner, name] = repo.split('/');
+  return { owner, name };
+}
+
+/** Astra `_id` of a topic document. Git forbids ':' in branch names, so the parts can't collide. */
+export function topicId(repo: RepoKey, branch: string, slug: string): string {
+  return `${repo}:${branch}:${slug}`;
+}
+
+/** Astra `_id` of a branch snapshot document. */
+export function snapshotId(repo: RepoKey, branch: string): string {
+  return `${repo}:${branch}:snapshot`;
+}
+
 /** Directory-prefix + explicit-file scope for one topic. */
 export interface TopicScope {
   /** Paths that must end with '/' — any file under the prefix belongs. */
@@ -21,11 +59,12 @@ export type TopicSection = (typeof TOPIC_SECTIONS)[number];
 
 /**
  * Astra document for a single wiki topic (kind = "topic").
- * _id format: `${branch}:${slug}`
+ * _id format: `${repo}:${branch}:${slug}`
  */
 export interface WikiTopicDoc {
   _id: string;
   kind: 'topic';
+  repo: RepoKey;
   branch: string;
   slug: string;
   order: number;
@@ -64,13 +103,14 @@ export interface WikiTopicDoc {
 
 /**
  * Astra document for the branch snapshot (kind = "snapshot").
- * _id format: `${branch}:snapshot`
+ * _id format: `${repo}:${branch}:snapshot`
  *
  * fileListText compact format: one line per file, `<blobSha> <path>\n`.
  */
 export interface WikiSnapshotDoc {
   _id: string;
   kind: 'snapshot';
+  repo: RepoKey;
   branch: string;
   headSha: string;
   treeSha: string;
@@ -185,6 +225,7 @@ export interface SnapshotDiff {
 export interface SyncResult {
   topics: WikiTopicDoc[];
   headSha: string;
+  repo: RepoKey;
   branch: string;
 }
 

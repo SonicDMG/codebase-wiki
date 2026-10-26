@@ -1,14 +1,14 @@
 /**
  * regen-wiki-pictures.ts
  *
- * Regenerates only the picture-book page of every stored topic on a branch —
+ * Regenerates only the picture-book page of every stored topic on a repo's branch —
  * e.g. after the picture prompt changes — at the commit its wiki page was
  * built from, so both modes keep citing the same commit.
  * Wiki pages and topics are left as they are.
  *
  * Usage:
- *   npx tsx scripts/regen-wiki-pictures.ts [branch] [--broken]
- *     branch defaults to main; --broken redoes only pages with a card that isn't valid JSON.
+ *   npx tsx scripts/regen-wiki-pictures.ts --repo=owner/name [branch] [--broken]
+ *     --repo defaults to WIKI_DEFAULT_REPO; branch defaults to main; --broken redoes only pages with a card that isn't valid JSON.
  */
 
 import { config } from 'dotenv';
@@ -30,16 +30,23 @@ const CONCURRENCY = 3;
   const { getStoredTopics, getSnapshot, saveTopics } = await import('../lib/wiki/store');
   const { generatePagesForTopic, pageFieldsToStore } = await import('../lib/wiki/generate');
   const { decodeFileList } = await import('../lib/wiki/snapshot');
+  const { parseRepoKey } = await import('../lib/wiki/types');
 
-  const [stored, snapshot] = await Promise.all([getStoredTopics(branch), getSnapshot(branch)]);
+  const repo = parseRepoKey(args.find((a) => a.startsWith('--repo='))?.slice(7) ?? process.env.WIKI_DEFAULT_REPO);
+  if (!repo) {
+    console.error('[regen-pictures] pass --repo=owner/name (or set WIKI_DEFAULT_REPO)');
+    process.exit(1);
+  }
+
+  const [stored, snapshot] = await Promise.all([getStoredTopics(repo, branch), getSnapshot(repo, branch)]);
   const topics = onlyBroken ? stored.filter((t) => hasBrokenCard(t.generatedPagePicture)) : stored;
   if (!snapshot || stored.length === 0) {
-    console.error(`[regen-pictures] no stored topics for branch "${branch}"`);
+    console.error(`[regen-pictures] no stored topics for ${repo}@${branch}`);
     process.exit(1);
   }
   const entries = decodeFileList(snapshot.fileListText);
   const allPaths = entries.map((e) => e.path);
-  console.log(`[regen-pictures] ${topics.length} topics on "${branch}" at ${snapshot.headSha.slice(0, 7)}`);
+  console.log(`[regen-pictures] ${topics.length} topics on ${repo}@${branch} at ${snapshot.headSha.slice(0, 7)}`);
 
   let failed = 0;
   const queue = [...topics];
@@ -48,7 +55,7 @@ const CONCURRENCY = 3;
       for (let topic = queue.shift(); topic; topic = queue.shift()) {
         try {
           const commit = topic.pageCommitSha ?? snapshot.headSha;
-          const pages = await generatePagesForTopic(topic, branch, commit, allPaths, ['picture'], entries);
+          const pages = await generatePagesForTopic(topic, commit, allPaths, ['picture'], entries);
           if (!pages.picture) throw new Error('empty page');
           await saveTopics([{ ...topic, ...pageFieldsToStore(pages, commit) }]);
           console.log(`[regen-pictures] ✓ ${topic.title}`);

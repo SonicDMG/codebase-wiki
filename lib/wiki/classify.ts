@@ -54,8 +54,8 @@ export async function classifyFile(
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
-        'HTTP-Referer': 'https://walfly.app',
-        'X-OpenRouter-Title': 'Walfly Wiki Classification',
+        'HTTP-Referer': 'https://github.com/SonicDMG/walfly',
+        'X-OpenRouter-Title': 'Codebase Wiki Classification',
       },
       body: JSON.stringify({
         model,

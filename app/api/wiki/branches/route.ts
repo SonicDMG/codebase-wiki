@@ -1,19 +1,24 @@
 /**
  * GET /api/wiki/branches
  *
- * Returns the list of branches for the configured repo plus the default branch.
+ * Returns the branches of a repo plus its default branch.
+ * Query: ?repo=owner/name (defaults to WIKI_DEFAULT_REPO)
  * Response: { branches: string[], defaultBranch: string }
  */
 
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { listBranches } from '@/lib/github';
-import { REPO_OWNER, REPO_NAME } from '@/lib/wiki/generate';
+import { resolveRepo } from '@/lib/wiki/repo';
+import { splitRepo } from '@/lib/wiki/types';
 
 export const runtime = 'nodejs';
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const resolved = resolveRepo(req.nextUrl.searchParams.get('repo'));
+  if (!resolved.ok) return resolved.response;
+  const { owner, name } = splitRepo(resolved.repo);
   try {
-    const result = await listBranches(REPO_OWNER, REPO_NAME);
+    const result = await listBranches(owner, name);
     return NextResponse.json(result);
   } catch (err) {
     console.error('[wiki/branches] failed:', err);

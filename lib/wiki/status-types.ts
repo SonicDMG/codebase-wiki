@@ -30,6 +30,8 @@ export interface WikiStatusResponse {
   interrupted: boolean;
   /** Last (up to 10) finished jobs, newest first. */
   recentJobs: WikiJobSummary[];
+  /** Repo as "owner/name". */
+  repo: string;
   branch: string;
   headSha: string;
   /** Current prompt template version of each mode. */

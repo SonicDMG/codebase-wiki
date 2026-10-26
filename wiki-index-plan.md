@@ -1,4 +1,4 @@
-# Walfly Wiki — Fast, Provably Fresh Code Search
+# Wiki — Fast, Provably Fresh Code Search
 
 > **Status:** draft for review. Open questions are in §10 and are being resolved
 > one at a time.

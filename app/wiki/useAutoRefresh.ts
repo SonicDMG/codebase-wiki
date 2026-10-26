@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { WikiStatusResponse } from '@/lib/wiki/status-types';
 
-const LS_KEY = 'walfly_wiki_auto_refresh';
+const LS_KEY = 'wiki_auto_refresh';
 const RECENT_FAIL_MS = 10 * 60 * 1000; // 10 minutes
 
 export interface UseAutoRefreshResult {
@@ -16,6 +16,7 @@ export interface UseAutoRefreshResult {
 }
 
 function buildSignature(
+  repo: string,
   branch: string,
   status: WikiStatusResponse,
   staleTopics: Array<{ slug: string; wikiState: string; picState: string }>
@@ -24,15 +25,17 @@ function buildSignature(
     .map((t) => `${t.slug}/${t.wikiState}/${t.picState}`)
     .sort()
     .join(',');
-  return `${branch}:${status.headSha}:${parts}`;
+  return `${repo}:${branch}:${status.headSha}:${parts}`;
 }
 
 export function useAutoRefresh({
+  repo,
   branch,
   status,
   start,
   busy,
 }: {
+  repo: string | null;
   branch: string | null;
   status: WikiStatusResponse | null;
   start: (req?: { kind: 'refresh-stale' }) => Promise<void>;
@@ -90,7 +93,7 @@ export function useAutoRefresh({
 
   // Main auto-start effect
   useEffect(() => {
-    if (!ready || !enabled || !branch || !status) return;
+    if (!ready || !enabled || !repo || !branch || !status) return;
     if (staleTopicCount < 1) {
       setPendingPrompt(false);
       return;
@@ -116,6 +119,7 @@ export function useAutoRefresh({
 
     // Compute signature
     const sig = buildSignature(
+      repo,
       branch,
       status,
       staleTopics.map((t) => ({ slug: t.slug, wikiState: t.wiki.state, picState: t.picture.state }))
@@ -142,7 +146,7 @@ export function useAutoRefresh({
     }
   // focusTick is intentionally included to re-evaluate after tab regains focus
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, enabled, branch, status, staleTopicCount, busy, focusTick]);
+  }, [ready, enabled, repo, branch, status, staleTopicCount, busy, focusTick]);
 
   const confirmPrompt = useCallback(() => {
     if (!inFlightRef.current) {

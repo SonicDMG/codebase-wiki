@@ -23,48 +23,65 @@ const STATES: Array<{ key: StalenessState; label: string }> = [
 
 function StatusPageInner() {
   const searchParams = useSearchParams();
+  const paramRepo = searchParams.get('repo') ?? '';
   const paramBranch = searchParams.get('branch') ?? '';
   const paramTopic = searchParams.get('topic') ?? '';
 
-  // Resolved branch: param or fetched default
+  // Resolved repo and branch: params, else the configured default repo and its default branch
+  const [repo, setRepo] = useState<string | null>(paramRepo || null);
   const [branch, setBranch] = useState<string | null>(paramBranch || null);
-  const [branchLoading, setBranchLoading] = useState(!paramBranch);
+  const [branchLoading, setBranchLoading] = useState(!paramRepo || !paramBranch);
 
   // Mode from localStorage
   const [mode, setMode] = useState<'wiki' | 'picture'>('wiki');
 
   useEffect(() => {
     try {
-      const stored = localStorage.getItem('walfly_wiki_mode');
+      const stored = localStorage.getItem('wiki_mode');
       if (stored === 'wiki' || stored === 'picture') setMode(stored);
     } catch {
       // localStorage unavailable
     }
   }, []);
 
-  // Fetch default branch if none supplied
+  // Fill in whatever the URL left out: the default repo, then that repo's default branch
   useEffect(() => {
-    if (paramBranch) {
+    if (paramRepo && paramBranch) {
+      setRepo(paramRepo);
       setBranch(paramBranch);
+      setBranchLoading(false);
       return;
     }
     let cancelled = false;
     setBranchLoading(true);
-    fetch('/api/wiki/branches')
-      .then((r) => r.json())
-      .then((data: { branches?: string[]; defaultBranch?: string }) => {
-        if (!cancelled && data.defaultBranch) setBranch(data.defaultBranch);
-      })
+    (async () => {
+      let resolvedRepo = paramRepo;
+      if (!resolvedRepo) {
+        const data = (await (await fetch('/api/wiki/repos')).json()) as { defaultRepo?: string | null };
+        resolvedRepo = data.defaultRepo ?? '';
+      }
+      if (!resolvedRepo) return;
+      let resolvedBranch = paramBranch;
+      if (!resolvedBranch) {
+        const data = (await (await fetch(`/api/wiki/branches?repo=${encodeURIComponent(resolvedRepo)}`)).json()) as {
+          defaultBranch?: string;
+        };
+        resolvedBranch = data.defaultBranch ?? '';
+      }
+      if (cancelled) return;
+      setRepo(resolvedRepo);
+      if (resolvedBranch) setBranch(resolvedBranch);
+    })()
       .catch(() => {/* keep null */})
       .finally(() => { if (!cancelled) setBranchLoading(false); });
     return () => { cancelled = true; };
-  }, [paramBranch]);
+  }, [paramRepo, paramBranch]);
 
   const [rebuildDialogOpen, setRebuildDialogOpen] = useState(false);
   const rebuildBtnRef = useRef<HTMLButtonElement>(null);
 
-  const { status, error, refresh } = useWikiStatus(branch);
-  const { busy, message, start, stop, resume } = useJobActions(branch ?? '', refresh);
+  const { status, error, refresh } = useWikiStatus(repo, branch);
+  const { busy, message, start, stop, resume } = useJobActions(repo ?? '', branch ?? '', refresh);
 
   // Scroll highlighted topic into view once status loads
   const highlightRef = useRef<HTMLTableRowElement | null>(null);
@@ -112,7 +129,7 @@ function StatusPageInner() {
         {/* ── Header ── */}
         <div style={{ marginBottom: '24px' }}>
           <a
-            href="/wiki"
+            href={repo ? `/wiki?repo=${encodeURIComponent(repo)}${branch ? `&branch=${encodeURIComponent(branch)}` : ''}` : '/wiki'}
             style={{ color: 'var(--w-accentText)', textDecoration: 'none', fontSize: '13px' }}
           >
             ← Back to wiki
@@ -123,8 +140,14 @@ function StatusPageInner() {
           {branchLoading && !branch && (
             <p style={{ color: 'var(--w-textMuted)', fontSize: '13px' }}>Loading branch…</p>
           )}
-          {branch && (
+          {repo && branch && (
             <div style={{ fontSize: '13px', color: 'var(--w-textMuted)', display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+              <span>
+                Repo:{' '}
+                <code style={{ fontFamily: 'ui-monospace, monospace', color: 'var(--w-text)' }}>
+                  {repo}
+                </code>
+              </span>
               <span>
                 Branch:{' '}
                 <code style={{ fontFamily: 'ui-monospace, monospace', color: 'var(--w-text)' }}>
