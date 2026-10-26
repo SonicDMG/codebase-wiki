@@ -303,7 +303,23 @@ export default function WikiPage() {
     };
   }, [statusMenuOpen]);
 
-  // ── Branches and stored repos follow the repo ──────────────────────────────
+  // ── Load stored repos on mount (for the landing screen before any repo is set) ─
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/wiki/repos');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { repos?: { repo: string }[] };
+        if (!cancelled && Array.isArray(data.repos)) setStoredRepos(data.repos.map((r) => r.repo));
+      } catch (err) {
+        console.warn('[wiki] repos load failed:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Branches (and refresh stored repos) follow the repo ──────────────────────────────
   useEffect(() => {
     if (!wikiRepo) return;
     let cancelled = false;
@@ -885,9 +901,6 @@ export default function WikiPage() {
             )}
           </div>
         )}
-        {!wikiBranch && !tocLoading && (
-          <RepoPicker current={wikiRepo} repos={storedRepos} error={repoError} onSubmit={handleRepoSelect} />
-        )}
         {wikiRepo && wikiBranch && (
           <WikiStatusPill repo={wikiRepo} branch={wikiBranch} status={wikiStatus} mode={answerMode} refresh={refreshStatus} />
         )}
@@ -911,8 +924,13 @@ export default function WikiPage() {
       {/* ── Body ── */}
       <div ref={containerRef} style={styles.body}>
 
+        {/* Landing screen when no repo is loaded yet */}
+        {!wikiRepo && !tocLoading && (
+          <RepoLanding repos={storedRepos} error={repoError} onSubmit={handleRepoSelect} />
+        )}
+
         {/* Left: TOC nav */}
-        <nav style={{ ...styles.tocPane, ...(tocCollapsed ? styles.tocPaneCollapsed : {}) }}>
+        <nav style={{ ...styles.tocPane, ...(tocCollapsed ? styles.tocPaneCollapsed : {}), ...((!wikiRepo && !tocLoading) ? { display: 'none' } : {}) }}>
           <div style={styles.panelHeader}>
             {!tocCollapsed && <span style={styles.panelHeading}>Topics</span>}
             <button
@@ -926,10 +944,13 @@ export default function WikiPage() {
             </button>
           </div>
           {!tocCollapsed && (
+            <RepoIndexInput current={wikiRepo} onSubmit={handleRepoSelect} />
+          )}
+          {!tocCollapsed && (
             tocLoading ? (
-              <div style={styles.tocLoading}>Loading topics…</div>
+              <div style={styles.tocLoading}>Loading…</div>
             ) : tocTopics.length === 0 ? (
-              <div style={styles.tocLoading}>No topics available.</div>
+              <div style={styles.tocLoading}>No topics yet — enter a repo above to index it.</div>
             ) : (
               tocTopics.map((topic, idx) => {
                 const entry = wikiStatus?.topics.find((s) => s.slug === topic.slug)?.[answerMode];
@@ -988,10 +1009,10 @@ export default function WikiPage() {
           )}
         </nav>
 
-        <div style={styles.tocDivider} />
+        {(wikiRepo || tocLoading) && <div style={styles.tocDivider} />}
 
         {/* Center: chat */}
-        <div style={styles.chatPane}>
+        <div style={{ ...styles.chatPane, ...(!wikiRepo && !tocLoading ? { display: 'none' } : {}) }}>
           {showNewVersionBanner && (
             <NewVersionBanner
               onSwitch={switchToNewVersion}
@@ -1131,6 +1152,121 @@ function MessageBlock({
   );
 }
 
+// ── RepoIndexInput ─────────────────────────────────────────────────────────
+
+/**
+ * Always-visible input at the top of the TOC sidebar.
+ * The user pastes a GitHub URL or types owner/name and presses Enter to index.
+ */
+function RepoIndexInput({ current, onSubmit }: { current: string | null; onSubmit: (repo: string) => void }) {
+  const [value, setValue] = useState('');
+  return (
+    <form
+      style={styles.repoIndexForm}
+      onSubmit={(e) => {
+        e.preventDefault();
+        const v = value.trim();
+        if (v) { onSubmit(v); setValue(''); }
+      }}
+    >
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder={current ?? 'owner/name or GitHub URL'}
+        style={styles.repoIndexInput}
+        aria-label="Index a GitHub repository"
+        autoComplete="off"
+        spellCheck={false}
+      />
+      <button
+        type="submit"
+        disabled={!value.trim()}
+        style={styles.repoIndexBtn}
+        title="Index this repo"
+      >
+        ↵
+      </button>
+    </form>
+  );
+}
+
+// ── RepoLanding ────────────────────────────────────────────────────────────
+
+interface RepoLandingProps {
+  repos: string[];
+  error: string | null;
+  onSubmit: (repo: string) => void;
+}
+
+/**
+ * Full-page centered landing shown when no repo has been loaded yet.
+ * Lets the user type or paste any GitHub URL or "owner/name", and shows
+ * previously-indexed repos as one-click chips.
+ */
+function RepoLanding({ repos, error, onSubmit }: RepoLandingProps) {
+  const [value, setValue] = useState('');
+  return (
+    <div style={styles.landing}>
+      <div style={styles.landingCard}>
+        <h2 style={styles.landingHeading}>Open a GitHub repository</h2>
+        <p style={styles.landingHint}>
+          Paste a GitHub URL or type <code style={styles.landingCode}>owner/name</code> to index and explore a codebase.
+        </p>
+        <form
+          style={styles.landingForm}
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (value.trim()) onSubmit(value.trim());
+          }}
+        >
+          <input
+            id="landing-repo-input"
+            list="landing-repo-options"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="https://github.com/owner/name  or  owner/name"
+            style={styles.landingInput}
+            aria-label="GitHub repository URL or owner/name"
+            autoFocus
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <datalist id="landing-repo-options">
+            {repos.map((r) => <option key={r} value={r} />)}
+          </datalist>
+          <button
+            type="submit"
+            disabled={!value.trim()}
+            style={{ ...styles.landingBtn, ...(!value.trim() ? styles.landingBtnDisabled : {}) }}
+          >
+            Open →
+          </button>
+        </form>
+        {error && (
+          <p role="alert" style={styles.landingError}>{error}</p>
+        )}
+        {repos.length > 0 && (
+          <div style={styles.landingPrevious}>
+            <span style={styles.landingPreviousLabel}>Previously indexed</span>
+            <div style={styles.landingChips}>
+              {repos.map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  onClick={() => onSubmit(r)}
+                  style={styles.landingChip}
+                >
+                  {r}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── RepoPicker ─────────────────────────────────────────────────────────────
 
 interface RepoPickerProps {
@@ -1142,36 +1278,41 @@ interface RepoPickerProps {
 
 /** Type any GitHub "owner/name" (or paste a github.com URL); repos already indexed are suggested. */
 function RepoPicker({ current, repos, error, onSubmit }: RepoPickerProps) {
-  const [value, setValue] = useState('');
+  const [value, setValue] = useState(current ?? '');
   return (
     <form
       style={styles.dropdownSection}
       onSubmit={(e) => {
         e.preventDefault();
-        onSubmit(value);
-        setValue('');
+        if (value.trim()) onSubmit(value.trim());
       }}
     >
       <label htmlFor="wiki-repo-input" style={styles.branchLabel}>
-        Repo
+        Switch repo
       </label>
-      <input
-        id="wiki-repo-input"
-        list="wiki-repo-options"
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        placeholder={current ?? 'owner/name or GitHub URL'}
-        style={styles.branchSelect}
-        aria-label="Open a GitHub repo"
-        autoComplete="off"
-        spellCheck={false}
-      />
+      <div style={{ display: 'flex', gap: '4px' }}>
+        <input
+          id="wiki-repo-input"
+          list="wiki-repo-options"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="owner/name or GitHub URL"
+          style={{ ...styles.branchSelect, flex: 1 }}
+          aria-label="Switch to a different GitHub repo"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          type="submit"
+          disabled={!value.trim() || value.trim().toLowerCase() === (current ?? '').toLowerCase()}
+          style={styles.repoOpenBtn}
+        >
+          Open
+        </button>
+      </div>
       <datalist id="wiki-repo-options">
-        {repos.map((r) => <option key={r} value={r} />)}
+        {repos.filter((r) => r !== current).map((r) => <option key={r} value={r} />)}
       </datalist>
-      <button type="submit" disabled={!value.trim()} style={styles.repoOpenBtn}>
-        Open
-      </button>
       {error && <span role="alert" style={styles.repoError}>{error}</span>}
     </form>
   );
@@ -2945,5 +3086,151 @@ const styles = {
     borderRadius: '8px',
     fontSize: '12.5px',
     color: w.textMuted,
+  },
+
+  // ── Repo index input (TOC sidebar) ─────────────────────────────────────────
+  repoIndexForm: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+    padding: '8px 10px',
+    borderBottom: `1px solid ${w.border}`,
+    flexShrink: 0,
+  },
+  repoIndexInput: {
+    flex: 1,
+    padding: '5px 8px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '5px',
+    fontSize: '12px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    color: w.text,
+    background: w.bg,
+    outline: 'none',
+    minWidth: 0,
+  },
+  repoIndexBtn: {
+    width: '26px',
+    height: '26px',
+    flexShrink: 0,
+    border: `1px solid ${w.border}`,
+    borderRadius: '5px',
+    background: w.amber,
+    color: w.onAccent,
+    fontSize: '14px',
+    fontWeight: 700,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 0,
+  },
+
+  // ── Landing screen ─────────────────────────────────────────────────────────
+  landing: {
+    flex: 1,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '40px 20px',
+    background: w.bg,
+  },
+  landingCard: {
+    width: '100%',
+    maxWidth: '520px',
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '20px',
+  },
+  landingHeading: {
+    fontFamily: w.fontHeading,
+    fontSize: '22px',
+    fontWeight: 700,
+    color: w.text,
+    margin: 0,
+    lineHeight: 1.3,
+  },
+  landingHint: {
+    fontSize: '14px',
+    color: w.textMuted,
+    margin: 0,
+    lineHeight: 1.6,
+  },
+  landingCode: {
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    fontSize: '13px',
+    background: w.surface,
+    border: `1px solid ${w.border}`,
+    borderRadius: '4px',
+    padding: '1px 5px',
+    color: w.text,
+  },
+  landingForm: {
+    display: 'flex',
+    gap: '8px',
+    alignItems: 'stretch',
+  },
+  landingInput: {
+    flex: 1,
+    padding: '10px 14px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '8px',
+    fontSize: '14px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    color: w.text,
+    background: w.surface,
+    outline: 'none',
+    minWidth: 0,
+  },
+  landingBtn: {
+    padding: '10px 18px',
+    border: 'none',
+    borderRadius: '8px',
+    background: w.amber,
+    color: w.onAccent,
+    fontSize: '14px',
+    fontWeight: 600,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const,
+    flexShrink: 0,
+  },
+  landingBtnDisabled: {
+    opacity: 0.45,
+    cursor: 'not-allowed',
+  },
+  landingError: {
+    margin: 0,
+    fontSize: '13px',
+    color: '#c0392b',
+  },
+  landingPrevious: {
+    display: 'flex',
+    flexDirection: 'column' as const,
+    gap: '10px',
+    paddingTop: '8px',
+    borderTop: `1px solid ${w.border}`,
+  },
+  landingPreviousLabel: {
+    fontSize: '11px',
+    fontWeight: 600,
+    color: w.textFaint,
+    textTransform: 'uppercase' as const,
+    letterSpacing: '0.08em',
+  },
+  landingChips: {
+    display: 'flex',
+    flexWrap: 'wrap' as const,
+    gap: '8px',
+  },
+  landingChip: {
+    padding: '5px 12px',
+    border: `1px solid ${w.border}`,
+    borderRadius: '999px',
+    background: w.surface,
+    color: w.textMuted,
+    fontSize: '13px',
+    fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace',
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const,
   },
 } as const;

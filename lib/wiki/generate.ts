@@ -489,8 +489,11 @@ export async function generatePagesForTopic(
       // A stored page is read many times, so retry picture pages whose cards don't parse.
       let page = await generate(mode);
       for (let retry = 0; mode === 'picture' && retry < PICTURE_RETRIES && !hasPictureCards(page); retry++) {
-        console.warn(`[wiki/generate] picture page for "${topic.title}" has a malformed card; retrying`);
+        console.warn(`[wiki/generate] picture page for "${topic.title}" has no valid cards; retrying (attempt ${retry + 1}). Output: ${page.slice(0, 300)}`);
         page = await generate(mode);
+      }
+      if (mode === 'picture' && !hasPictureCards(page)) {
+        console.warn(`[wiki/generate] all attempts exhausted for "${topic.title}" picture page. Final output: ${page.slice(0, 300)}`);
       }
       return [mode, page] as const;
     }),
