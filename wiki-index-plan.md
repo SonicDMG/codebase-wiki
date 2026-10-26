@@ -3,10 +3,10 @@
 > **Status:** draft for review. Open questions are in §10 and are being resolved
 > one at a time.
 >
-> Related code: `packages/api/lib/wiki/sync.ts` (snapshot diff + lease),
-> `packages/api/lib/wiki/store.ts` (Astra I/O), `packages/api/lib/github.ts`,
-> `packages/api/app/api/wiki/chat/route.ts` (current answer path),
-> `packages/api/scripts/seed-wiki-topics.ts` (local seeding precedent).
+> Related code: `lib/wiki/sync.ts` (snapshot diff + lease),
+> `lib/wiki/store.ts` (Astra I/O), `lib/github.ts`,
+> `app/api/wiki/chat/route.ts` (current answer path),
+> `scripts/seed-wiki-topics.ts` (local seeding precedent).
 
 ## 1. Problem
 
@@ -77,7 +77,7 @@ it ranks real code.
 |---|---|---|
 | `$lexical` size limit? | **No 8 KB limit.** 2 KB, 8 KB, 9 KB, 20 KB and 100 KB were all accepted. | `$lexical` can be generous, but keep it purposeful. |
 | 100 KB deny-listed `text`? | **Accepted** (112,000 chars written and read back intact). | Whole-file storage works; the 86 KB file fits. |
-| Tokenization of code | Case-insensitive. **camelCase and `snake_case` are NOT split**: `buildSystemPrompt` and `fetch_file_contents` match only as whole tokens; `build`, `fetch`, `file tree` and `TREE` did not match documents containing `getFileTree` / `TREE_TTL_MS` / `fetch_file_contents`. Dots and slashes do split (`llm.ts`, `packages/api/lib` matched). | **The extractor must add the split words next to each identifier** (`getFileTree` → `get file tree`; `fetch_file_contents` → `fetch file contents`) so natural-language terms match. |
+| Tokenization of code | Case-insensitive. **camelCase and `snake_case` are NOT split**: `buildSystemPrompt` and `fetch_file_contents` match only as whole tokens; `build`, `fetch`, `file tree` and `TREE` did not match documents containing `getFileTree` / `TREE_TTL_MS` / `fetch_file_contents`. Dots and slashes do split (`llm.ts`, `lib` matched). | **The extractor must add the split words next to each identifier** (`getFileTree` → `get file tree`; `fetch_file_contents` → `fetch file contents`) so natural-language terms match. |
 | Collection-count limit | Creating hybrid collections succeeded up to **10 total** and the 11th failed with `INVALID_DATABASE_QUERY` (message truncated; the cause is inferred to be the index budget, not confirmed). | 3 exist today; the index is the 4th. Roughly 6 more hybrid collections fit. Not a constraint. |
 | Array filter + `findAndRerank` | **Works.** `{ branches: "main" }` and `{ branches: "feat-x" }` each returned only matching documents. | Branch-ready schema is viable. |
 | `$addToSet` on the array | **Works**, and is idempotent (adding twice leaves one entry). | Add-a-branch needs no read. |

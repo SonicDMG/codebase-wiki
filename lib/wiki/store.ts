@@ -8,13 +8,11 @@
  *   - 2-minute lease acquire/release on the snapshot document.
  *   - Tolerant of embedding ($vectorize) write failures — logs and continues.
  *
- * Imports the shared `getDb` handle from @walfly/db. Does NOT add any exports
- * to the db package; the wiki module is self-contained.
+ * Uses the wiki's own Astra handle (lib/astra.ts); the app is self-contained.
  */
 
 import type { Collection } from '@datastax/astra-db-ts';
-import { getDb } from '@walfly/db';
-import { VECTOR_DIMENSION, VECTOR_MODEL, VECTORIZE_MAX_CHARS } from '@walfly/db';
+import { getDb, VECTOR_DIMENSION, VECTOR_MODEL, VECTORIZE_MAX_CHARS } from '@/lib/astra';
 import type { WikiTopicDoc, WikiSnapshotDoc, SyncResult, WikiJob, WikiJobSummary } from './types';
 
 const WIKI_TOC_COLLECTION = 'wiki_toc_v2';

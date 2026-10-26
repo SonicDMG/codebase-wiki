@@ -5,9 +5,9 @@
  * Calls ensureTopics(branch) then syncBranch(branch) and prints a summary.
  *
  * Usage:
- *   npm run seed-wiki --workspace=packages/api -- [branch]
- *   npm run seed-wiki --workspace=packages/api -- main
- *   npm run seed-wiki --workspace=packages/api -- --help
+ *   npm run seed-wiki --workspace=apps/wiki -- [branch]
+ *   npm run seed-wiki --workspace=apps/wiki -- main
+ *   npm run seed-wiki --workspace=apps/wiki -- --help
  *
  * branch defaults to 'main'.
  * Exit code 0 on success, 1 on failure.
@@ -25,7 +25,7 @@ if (args.includes('--help') || args.includes('-h')) {
     [
       '',
       'Usage:',
-      '  npm run seed-wiki --workspace=packages/api -- [branch]',
+      '  npm run seed-wiki --workspace=apps/wiki -- [branch]',
       '',
       'Arguments:',
       '  branch    Git branch to seed/sync (default: main)',
@@ -34,7 +34,7 @@ if (args.includes('--help') || args.includes('-h')) {
       '  --help, -h  Print this message and exit',
       '',
       'Behaviour:',
-      '  1. Loads packages/api/.env.local (if present).',
+      '  1. Loads apps/wiki/.env.local (if present).',
       '  2. Calls ensureTopics(branch) — returns stored topics or runs initial generation.',
       '  3. Calls syncBranch(branch) — diffs against the branch head and absorbs changes.',
       '  4. Prints a summary: branch, topic count, titles, headSha, generated flag, sync status.',
