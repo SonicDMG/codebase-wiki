@@ -245,6 +245,80 @@ A script alongside `seed-wiki-topics.ts`, run from a local clone:
    user runs it by hand for a while and compares against the Phase 1 baseline.
    Making it the default is a later, separate decision (§10 Q7).
 
+## Baseline
+
+**Date:** 2026-10-20
+**Branch:** `feat/39-baseline-cheap-wins`
+**Commit anchor:** `bed0d21` (xavier loop: iteration 2 — wiki phase 1 per-step timing log)
+**Server:** `npx next dev -p 3039` (worktree `packages/api`)
+**Warm-up:** 1 request discarded before timing run.
+**Questions run:** 15 (all from `scripts/wiki-questions.ts`). No failures.
+
+### Notes on tree timing
+
+`treeMs` is 0 ms for all 15 questions. The first call fetches the tree live from
+GitHub and caches it in-process (30 min TTL keyed by commit SHA). After the warm-up
+request the cache was already warm, so every bench run hit the in-process cache
+and the tree fetch cost is absorbed into the server process startup, not the
+per-question timing. This will look different on a cold server or after cache
+expiry (30 min); Phase 1 records the warm-cache steady-state.
+
+### Per-question results
+
+| Question ID | Category | Files (n) | Files chosen | branchHead ms | tree ms | selection ms | fileFetch ms | TTFT ms | Total ms |
+|---|---|---|---|---|---|---|---|---|---|
+| `where-llm-client` | where-is-x | 10 | llm.ts, pipeline.ts, enrich.ts, docling.ts, wiki/chat/route.ts, useChat.ts, ChatScreen.tsx, mobile/api.ts, whisper.ts, transcribe.ts | 234 | 0 | 6443 | 200 | 15690 | 42070 |
+| `where-upload-limits` | where-is-x | 12 | uploadLimits.ts, upload/route.ts, process/route.ts, recover/audio/route.ts, useRecordingUpload.ts, webMic.ts, localBuffer.ts, storage.ts, recoverPolicy.ts, pipeline.ts, whisper.ts, transcribe.ts | 268 | 0 | 48080 | 286 | 55865 | 71058 |
+| `where-db-collections` | where-is-x | 7 | collections.ts, constants.ts, seed-schema.ts, seed-schema-v2.ts, types.ts, client.ts, capabilities.ts | 312 | 0 | 8705 | 204 | 13946 | 19172 |
+| `where-ws-ticket` | where-is-x | 15 | wsTicket.ts, ws-ticket/route.ts, sidecar/auth.py, store.ts, recoverPolicy.ts, pipeline.ts, whisper.ts, llm.ts, transcribe.ts, enrich.ts, recover.ts, jev.ts, music.ts, docling.ts, whisper.ts | 141 | 0 | 1425 | 158 | 6380 | 8022 |
+| `how-finalize-pipeline` | how-does-x-work | 10 | pipeline.ts, finalize/route.ts, process/route.ts, segments/route.ts, transcribe.ts, whisper.ts, recover.ts, storage.ts, recoverPolicy.ts, sidecar/vad.py | 142 | 0 | 45719 | 264 | 60731 | 125505 |
+| `how-audio-recovery` | how-does-x-work | 14 | recoverClient.ts, streamClient.ts, useRecordingUpload.ts, localBuffer.ts, webMic.ts, recover.ts, recoverPolicy.ts, recover/route.ts, recover/audio/route.ts, recover/complete/route.ts, upload/route.ts, research_notes (×3) | 278 | 0 | 6596 | 258 | 24367 | 81670 |
+| `how-wiki-topics` | how-does-x-work | 15 | wiki/chat/route.ts, wiki/toc/route.ts, wiki/page.tsx, pipeline.ts, llm.ts, enrich.ts, docling.ts, store.ts, recover.ts, transcript.ts, db/text.ts, whisper.ts, jev.ts, transcribe.ts, whisper.ts | 261 | 0 | 42345 | 192 | 64529 | 137279 |
+| `how-github-cache` | how-does-x-work | 5 | github.ts, store.ts, storage.ts, pipeline.ts, docling.ts | 262 | 0 | 5362 | 164 | 26671 | 91560 |
+| `how-whisper-transcribe` | how-does-x-work | 10 | whisper.ts, transcribe.ts, transcript.ts, pipeline.ts, sidecar/asr.py, sidecar/session.py, test_asr_pool.py, test_vad_segmenter.py, db/types.ts, whisper.ts | 265 | 0 | 9484 | 201 | 20547 | 34681 |
+| `arch-walfly-overview` | architecture | 11 | archify/candidate.json, archify/finalize-summary.json, archify/finalize.json, archify/delivery.json, research_notes (×4), streaming-plan.md, walfly-plan.md, README.md | 144 | 0 | 17601 | 311 | 23173 | 37665 |
+| `arch-db-packages` | architecture | 15 | db/client.ts, db/constants.ts, db/index.ts, db/types.ts, db/collections.ts, store.ts, storage.ts, llm.ts, pipeline.ts, recover.ts, whisper.ts, transcript.ts, transcribe.ts, jev.ts, docling.ts | 241 | 0 | 6428 | 153 | 39546 | 137185 |
+| `arch-mobile-streaming` | architecture | 15 | useRecordingUpload.ts, webMic.ts, pcm.ts, streamClient.ts, mobile/api.ts, localBuffer.ts, upload/route.ts, process/route.ts, storage.ts, pipeline.ts, recover.ts, whisper.ts, research_notes (×2), llm.ts | 272 | 0 | 20993 | 222 | 29745 | 46924 |
+| `followup-recovery-failure` | follow-up | 0 | (none — selector returned 0 files) | 337 | 0 | 65389 | 0 | 67928 | 70593 |
+| `followup-github-ratelimit` | follow-up | 7 | github.ts, uploadLimits.ts, recover.ts, recoverPolicy.ts, llm.ts, store.ts, wsTicket.ts | 246 | 0 | 1944 | 0 | 11333 | 26224 |
+| `followup-wiki-lease` | follow-up | 13 | wiki/chat/route.ts, wiki/toc/route.ts, pipeline.ts, store.ts, llm.ts, docling.ts, db/collections.ts, db/constants.ts, db/client.ts, wsTicket.ts, recover.ts, enrich.ts, transcript.ts | 142 | 0 | 14704 | 1 | 17949 | 18542 |
+| **Median** | — | — | — | **261** | **0** | **9484** | **200** | **24367** | **46924** |
+| **Mean** | — | — | — | **236** | **0** | **20081** | **174** | **31893** | **63210** |
+
+### Observations
+
+Medians over 15 questions, dev server (`next dev`), warm tree cache:
+
+| Step | Median ms | Notes |
+|---|---|---|
+| branchHead | 261 | uncached call, no ETag |
+| tree | 0 | in-process cache was warm (see above) |
+| selection (file-selector LLM) | 9,484 | range 1,425–65,389 |
+| fileFetch | 200 | up to 15 GitHub fetches |
+| answer time to first token | ~8,800 | TTFT minus the four steps above; derived, not logged |
+| **TTFT** | **24,367** | |
+| **Total** | **46,924** | |
+
+- **Two costs share the wait before the first token.** The file-selector call (median
+  9.5 s) and the answer model's own first-token latency on a large prompt (median
+  about 8.8 s, range 2.2–32.7 s) are of similar size. Replacing selection removes
+  the first; it does not remove the second. A lighter prompt (fewer or smaller
+  files) is what shrinks the second, and the index design sends whole files, so
+  this must be watched in Phase 3.
+- **Selection is the most variable step.** Range 1.4–65 s; three questions took over
+  40 s. The cause was not investigated (provider queueing, a large tree prompt, or
+  both are possible).
+- **branchHead and fileFetch are small** (261 ms and 200 ms medians). The conditional
+  request saves at most the branchHead cost.
+- **`followup-recovery-failure` selected 0 files** after a 65 s selection call, so
+  the answer had no code context. A correctness failure as well as a latency one.
+- **The Astra `findAndRerank` call (~0.5–0.6 s on a tiny collection, §3)** is far
+  below the median selection time, but the collection here is toy-sized and the
+  answer's first-token latency remains. Do not assume the whole TTFT gap closes.
+- Several selections look weak on inspection (for example, `where-ws-ticket` and
+  `arch-db-packages` include many unrelated pipeline files). Quality of selection is
+  part of the case for the index, but this was judged by eye, not scored.
+
 ## 7. Failure modes and handling
 
 | Failure | Handling |
@@ -258,6 +332,35 @@ A script alongside `seed-wiki-topics.ts`, run from a local clone:
 | Truncated GitHub tree | existing guard: skip incremental sync, keep stored state |
 | Head ETag `304` but index behind | index commit ≠ head commit ⇒ treat all changed paths as stale |
 | Rate limited | existing backoff; serve from index + cached tree, mark "possibly stale" |
+
+### Phase 3 notes (issue #41)
+
+- **Where:** `lib/wiki/index-files/retriever.ts` (`retrieveFiles`), called from
+  `buildSystemPrompt` in `app/api/wiki/chat/route.ts` only when `WIKI_INDEX=1`, right after the
+  tree is fetched. Flag off: the selector path is untouched. Flag on and `usedIndex`: no selector
+  LLM call and no GitHub fetch fan-out (only live reads of stale files). Otherwise the existing
+  selector path runs unchanged. Timing log / `timings` SSE gained `source`, `retrievalMs`,
+  `liveReads`, `droppedStale`, `rerank`.
+- **Search:** `findAndRerank` with `$hybrid: { $vectorize: <full question>, $lexical: <keyword query> }`,
+  filtered to `branches: "main"` for every selected branch. The keyword query drops stop words and
+  keeps identifiers as written plus their split words (a whole sentence gave `$bm25Rank: null`).
+  `text` is included in the projection of the same query (top 8 only), so there is no second `_id $in` read.
+- **Freshness:** doc `blobSha` == tree sha -> Astra text; different -> live read at `commitSha`;
+  path absent from the tree -> dropped; a stale file whose live read fails -> dropped.
+- **Prompt size:** 120,000 chars total, 30,000 per file, rank order. Oversized files are windowed
+  around the densest keyword region with real line numbers (`[showing lines a-b of N]`).
+- **Low confidence:** `MIN_TOP_RERANK_SCORE = -12.5`. Top `$rerank` over the 15 benchmark questions:
+  12.52, 12.52, 8.53, 4.55, 3.98, 3.41, 2.56, 0.71, 0.04, -1.85, -1.85, -4.55, -11.38, -13.66, -18.20.
+  Gibberish: -13.66; off-topic (cookies, football): -18.20 each. The scores overlap at the bottom
+  (the two weakest real questions look like the junk), so those two fall back to the selector.
+  Fallback costs speed, not correctness.
+- **Degraded mode:** if the reranked search errors or exceeds 15 s, it is retried as a plain vector
+  search over `$vectorize` (`find` + `sort: { $vectorize }`; `findAndRerank` always reranks) and
+  marked `rerank: false`, using `MIN_TOP_VECTOR_SCORE = 0.655` (junk top similarity 0.58-0.65;
+  real questions' best hits >= 0.662, a thin gap). If that also fails, or results are empty / low
+  confidence / all dropped, `usedIndex: false` and the selector path runs.
+- **Verification:** `npm run verify:retriever` (offline, injected fakes). Not verified: a stale-file
+  live read against a real differing branch (pushed `main` equals the index).
 
 ## 8. Testing
 
@@ -322,3 +425,102 @@ _Resolved one at a time; answers get folded into the sections above._
    test that the deny list rejects those paths.
 9. ~~`_id` shape?~~ — resolved: `${path}@${blobSha}` plus a `branches` array, so
    branches can be added later without a migration (§4.2, §4.7). `main` only in v1.
+
+### Phase 4 notes (issue #42)
+
+**Design as built.** `lib/wiki/index-files/index-sync.ts` exposes `addIndexVersions`
+(phase A), `pruneIndexVersions` (phase B) and `combineIndexSyncResults`. `syncBranch`
+(`lib/wiki/sync.ts`) calls them via never-throwing wrappers; any failure becomes
+`index.status: 'failed'` in the outcome and never fails the topic sync. The outcome
+(and `POST /api/wiki/sync` JSON) carries `index` (`status`, counts, `warning`,
+`indexedHeadSha`). `WikiSnapshotDoc.indexedHeadSha` is the new field.
+
+**Write order (inside the existing lease try/finally, §4.6):**
+1. add: for each indexable path in the new tree, ensure a `path@blobSha` doc lists `main`
+   (existing current doc: `$addToSet`; same blob elsewhere: reuse summary, 0 LLM calls;
+   else fetch bytes at the commit, verify the git blob SHA, `indexFile`);
+2. `saveTopics` / `deleteTopicsByIds` / `saveSnapshot` (unchanged behaviour);
+3. prune: `main` is removed from docs whose path is gone from the tree, or whose path
+   changed AND the replacement is confirmed; docs left with `branches: []` are deleted
+   (`deleteMany({_id:{$in}, branches:{$size:0}})`, per-id fallback). Docs also listing
+   another branch keep that branch. If the add phase `failed`, prune is skipped entirely
+   (its target map may be incomplete);
+4. only when add+prune were fully clean: `saveSnapshot({... indexedHeadSha: head.sha})`.
+An interruption at any point leaves extra, never missing, documents.
+
+**Deferral.** If more than `WIKI_INDEX_SYNC_MAX_FILES` (default 40) files need real work,
+the add phase writes only cheap branch-adds, summarises nothing, returns `deferred` with
+a warning pointing at `npm run build-wiki-index`; prune never pulls an old version whose
+replacement is unconfirmed, so no path is lost. `indexedHeadSha` is not advanced.
+
+**Catch-up.** `reconcileIndexForSnapshot` runs on the 304 / same-sha / identical-tree
+paths when `indexedHeadSha !== headSha`: it takes the lease (skips if held), re-reads
+the snapshot, decodes `fileListText` (no sizes; `indexFile` enforces size) and runs
+add -> prune -> `indexedHeadSha`. Failed/deferred catch-ups are throttled to one attempt
+per 5 min per process so polls stay cheap. Fully caught up (`indexedHeadSha === headSha`)
+costs nothing.
+
+**Gating.** Everything is a no-op (zero Astra/GitHub calls, `index.status` 'disabled',
+`index` omitted from the outcome) unless `WIKI_INDEX=1` and `branch === 'main'`.
+
+**Deviations.** Non-main branches are not indexed in v1 (disabled, not merely
+deferred). Concurrency is guaranteed by inspection (all index work is inside the
+existing `acquireLease`/`releaseLease`), not by an automated lease test.
+
+**Offline verification:** `npm run verify:index-sync` (in-memory fake collection, fake
+summariser/fetcher; covers modify, rename, delete, interruption, deferral, failure
+isolation, SHA mismatch, shared-branch preservation, idempotency, flag/branch gating).
+
+**Live test recipe (after merge, needs `WIKI_INDEX=1`):**
+1. On a fresh clone run `npm run build-wiki-index` first, so a
+   baseline exists (the first sync after that backfills `indexedHeadSha`).
+2. Edit and push a file on `main`.
+3. `POST /api/wiki/sync` (or click Sync now); expect `status: 'synced'` and
+   `index: { status: 'ok', added: 1, pruned: 1, deleted: 1, indexedHeadSha: <head> }`.
+4. In `wiki_files` check `path@<newBlobSha>` exists with `branches: ['main']` and the
+   old `path@<oldBlobSha>` is gone. Repeat the POST: `unmodified`, no `index` (caught up).
+
+## Phase 6 — Dogfood and evaluation (issue #44)
+
+**Date:** 2026-10-21. **Setup:** `WIKI_INDEX=1 npx next dev -p 3039`, live `wiki_files` (129 docs, `main` @ `792e480`), same 15 questions and runner as the baseline (`npm run bench:wiki-chat`), one warm-up request discarded. Raw output: `/tmp/bench-index-final.log` (not committed). **No default was changed.**
+
+### Baseline vs index (15 questions, medians unless stated)
+
+| Metric | Baseline (live selector) | `WIKI_INDEX=1` | Change |
+|---|---|---|---|
+| Selection step | 9,484 ms (range 1.4–65 s) | 0 ms for 13 of 15; selector still ran for 2 fallbacks (1.3 s, 4.9 s) | removed on the index path |
+| Index retrieval (spot checks, not in the bench output) | n/a | 0.8–1.9 s with rerank; **~15.7 s when rerank times out** (see weak spots) | new cost |
+| File fetch | 200 ms | 0 ms (text comes from the index) | -200 ms |
+| Time to first token | 24,367 ms (mean 31,893) | 13,069 ms (mean 15,949) | **-46% median, -50% mean** |
+| Total | 46,924 ms (mean 63,210) | 42,235 ms (mean 62,995) | -10% median, ~flat mean |
+| Files per answer | 0–15, varied | 8 (13 questions), 13 and 15 (fallbacks) | fixed top-8 |
+| Questions with 0 files | 1 (`followup-recovery-failure`) | 0 | fixed |
+
+Total time barely moves because it is dominated by the answer model's generation, which the index does not change. TTFT is where it helps. One outlier inflates the index mean total: `followup-recovery-failure` took 346 s total (TTFT 35.8 s); that is a streaming stall, not retrieval, and was not investigated. `followup-wiki-lease` total 8.4 s is a short answer, not a speed-up to claim.
+
+Fallbacks to the old selector: `how-wiki-topics` (top rerank -13.66 < -12.5) and `followup-wiki-lease` (-18.20). Both produced a normal answer through the old path, as designed.
+
+### Freshness scenarios exercised
+
+Live Astra index (built from `origin/main`), questions asked against other branches:
+
+| Scenario | Result |
+|---|---|
+| `main` (index current) | `source=index`, 0 live reads, 0 dropped |
+| `feat/36-live-codebase-wiki` (55 files differ from `main`) | `source=index`, **2 files read live from GitHub, 1 dropped as stale**; answer cited that branch's commit `903b153` |
+| `feat/streaming-sidecar` | `source=index`, 4 stale files dropped, 0 live reads; commit `2f9326c` |
+
+Not exercised live (deliberately; they would write to the live `wiki_toc`/`wiki_files`): modify, rename and delete via real sync, concurrent syncs, interrupted sync. Those are covered offline by `verify:index-sync` and must be run live after merge (recipe in the Phase 4 notes). Correction to that recipe: a caught-up repeat POST now returns `unmodified` **with** `index: { status: 'ok', indexedHeadSha }` read from the snapshot (added in Phase 5 so the pill can show indexed vs head), not with no `index`.
+
+### Weak spots
+
+1. **Reranker latency.** 5 of the ~22 requests made during this run hit the 15 s `SEARCH_TIMEOUT_MS`, fell back to vector-only and cost ~15.7 s of retrieval; the last three spot checks in a row did. When rerank works it is 0.8–1.9 s. Recommendation: lower the timeout to about 4–5 s so a slow reranker costs less than the selector it replaces, and investigate whether the rerank service rate-limits under the bench's back-to-back load.
+2. **`$bm25Rank` is null on every query** (Phase 3 finding): the lexical leg is not demonstrably contributing; retrieval is effectively vector + rerank. Worth a separate check before claiming "hybrid".
+3. **Confidence threshold** sends the two weakest real questions to the old selector. Fine as a safety net, but 2 of 15 means the fast path covers about 87% of this question set.
+4. **Fixed top-8 files.** Broad architecture questions got 8 files, some of them noise (`SETUP.md`, `.env.example`, `research_notes` are indexed). Quality was judged by eye, not scored.
+5. **Total time is unchanged** because answer generation dominates; the visible win is first-token latency.
+6. **Index covers `main` only.** Other branches rely on live reads for every differing file; on a branch with many changes the saving shrinks.
+
+### Recommendation
+
+Keep it **opt-in** (`WIKI_INDEX=1`). Do not make it the default yet. Order of work before reconsidering: (1) fix the rerank timeout/latency, (2) run the live sync scenarios after merge, (3) re-run this benchmark and score answer quality on a sample rather than by eye. If rerank latency is fixed and quality holds, make it the default with the flag as an off switch. Per-section documents are not needed for the observed failures.
